@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QQQ Trader Alert Helper</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23101214'/%3E%3Cpath d='M7 21l5-5 4 4 8-10' fill='none' stroke='%232fd17c' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand-block">
+        <p id="brandEyebrow" class="eyebrow">QQQ alert assistant</p>
+        <h1>Technical trend alerts</h1>
+      </div>
+      <nav class="asset-switcher" aria-label="Market selector">
+        <button class="asset-button active" type="button" data-symbol="QQQ" aria-pressed="true">QQQ</button>
+        <button class="asset-button" type="button" data-symbol="BTC-USD" aria-pressed="false">BTC-USD</button>
+      </nav>
+      <div class="market-clock">
+        <span id="sessionState">Starting market feed</span>
+        <strong id="clock">--:--:--</strong>
+      </div>
+    </header>
+
+    <section class="swing-summary" aria-labelledby="bestSwingTitle">
+      <div class="swing-summary-heading">
+        <div>
+          <p class="eyebrow">Daily momentum plan</p>
+          <h2 id="bestSwingTitle">Best Swing</h2>
+        </div>
+        <div class="swing-summary-status">
+          <span id="bestSwingBadge" class="badge neutral">Scanning</span>
+          <div class="swing-score" title="Rule-based setup quality score, not a probability">
+            <span>Trade score</span>
+            <strong id="bestSwingScore">--</strong>
+          </div>
+        </div>
+      </div>
+      <div class="swing-summary-body">
+        <div class="swing-summary-copy">
+          <div id="bestSwingDetail" class="swing-callout" aria-live="polite">
+            Evaluating closed daily momentum and structure.
+          </div>
+          <p class="swing-target-rationale">
+            <strong>Target logic</strong>
+            <span id="bestSwingRationale">Waiting for a daily setup with enough structure and momentum.</span>
+          </p>
+          <button id="bestSwingView" class="text-button swing-view-button" type="button" hidden>View 1D chart</button>
+        </div>
+        <dl class="swing-levels" aria-label="Best swing price levels">
+          <div>
+            <dt id="bestSwingEntryLabel">Entry trigger</dt>
+            <dd id="bestSwingEntry">--</dd>
+          </div>
+          <div>
+            <dt id="bestSwingStopLabel">Invalidation</dt>
+            <dd id="bestSwingStop">--</dd>
+          </div>
+          <div>
+            <dt id="bestSwingTarget1Label">Target 1</dt>
+            <dd id="bestSwingTarget1">--</dd>
+          </div>
+          <div>
+            <dt id="bestSwingTarget2Label">Target 2</dt>
+            <dd id="bestSwingTarget2">--</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+
+    <main class="workspace">
+      <section class="chart-section">
+        <div class="chart-toolbar">
+          <div class="symbol-block">
+            <span id="chartSymbol" class="symbol">QQQ</span>
+            <span id="lastPrice" class="price">--</span>
+            <span id="priceChange" class="price-change neutral">--</span>
+          </div>
+
+          <div class="controls" aria-label="Chart controls">
+            <div class="segmented-control" aria-label="Candle timeframe">
+              <button class="timeframe-button active" type="button" data-timeframe="1">1m</button>
+              <button class="timeframe-button" type="button" data-timeframe="5">5m</button>
+              <button class="timeframe-button" type="button" data-timeframe="15">15m</button>
+              <button class="timeframe-button" type="button" data-timeframe="1440">1D</button>
+            </div>
+            <div class="chart-navigation" aria-label="Chart navigation">
+              <button id="panOlderButton" class="icon-button chart-nav-button" type="button" title="Show older candles" aria-label="Show older candles">&#8592;</button>
+              <button id="zoomOutButton" class="icon-button chart-nav-button" type="button" title="Zoom out" aria-label="Zoom out">&#8722;</button>
+              <button id="zoomInButton" class="icon-button chart-nav-button" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+              <button id="panNewerButton" class="icon-button chart-nav-button" type="button" title="Move candles left and add future space" aria-label="Move candles left and add future space">&#8594;</button>
+              <button id="liveViewButton" class="control-button live-view-button" type="button" title="Return to the latest candles at the default zoom">Live View</button>
+              <span id="chartWindowLabel" class="chart-window-label" aria-live="polite">Live</span>
+            </div>
+            <button id="graphRefreshButton" class="control-button graph-refresh-button" type="button" title="Fetch latest market data and redraw the chart">Graph Refresh</button>
+            <button id="patternsToggle" class="control-button" type="button" title="Toggle chart pattern overlay">Patterns</button>
+            <button id="notifyButton" class="control-button" type="button">Browser alerts</button>
+          </div>
+        </div>
+
+        <div class="chart-options" aria-label="Chart layer controls">
+          <label>
+            <input id="layerMAs" type="checkbox" checked />
+            MAs
+          </label>
+          <label id="vwapLayerControl" title="Toggle session VWAP">
+            <input id="layerVwap" type="checkbox" checked />
+            <span id="vwapLayerLabel">VWAP</span>
+          </label>
+          <label>
+            <input id="layerLevels" type="checkbox" checked />
+            Levels
+          </label>
+          <label>
+            <input id="layerMarkers" type="checkbox" checked />
+            Markers
+          </label>
+          <label>
+            <input id="layerVolume" type="checkbox" checked />
+            Volume
+          </label>
+          <label>
+            <input id="layerRsi" type="checkbox" checked />
+            RSI
+          </label>
+          <label>
+            Mode
+            <select id="tradeMode">
+              <option value="scalp">Scalp</option>
+              <option value="normal" selected>Normal</option>
+              <option value="strict">Strict</option>
+            </select>
+          </label>
+          <label>
+            Session
+            <select id="sessionMode">
+              <option value="regular" selected>Regular hours</option>
+              <option value="extended">Extended hours</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="chart-canvas-wrap">
+          <canvas id="priceChart" width="1200" height="620" aria-label="QQQ candlestick, volume, and RSI chart"></canvas>
+          <canvas id="chartOverlay" width="1200" height="620" aria-hidden="true"></canvas>
+        </div>
+
+        <div class="insights-grid" aria-label="Market context and system diagnostics">
+          <section class="insight-tile sentiment-tile">
+            <div class="section-heading">
+              <h2 id="fearGreedTitle">CNN Fear &amp; Greed</h2>
+              <span id="fearGreedBadge" class="badge neutral">Loading</span>
+            </div>
+            <div class="sentiment-reading">
+              <strong id="fearGreedScore">--</strong>
+              <span id="fearGreedRating">Waiting for CNN</span>
+            </div>
+            <div class="sentiment-scale" aria-label="Fear and greed scale from zero to one hundred">
+              <span class="extreme-fear"></span>
+              <span class="fear"></span>
+              <span class="neutral-zone"></span>
+              <span class="greed"></span>
+              <span class="extreme-greed"></span>
+              <i id="fearGreedMarker" class="sentiment-marker" hidden></i>
+            </div>
+            <div class="sentiment-scale-labels">
+              <span>Extreme fear</span>
+              <span>Neutral</span>
+              <span>Extreme greed</span>
+            </div>
+            <div class="sentiment-history">
+              <div><span>Previous close</span><strong id="fearGreedPreviousClose">--</strong></div>
+              <div><span>1 week</span><strong id="fearGreedPreviousWeek">--</strong></div>
+              <div><span>1 month</span><strong id="fearGreedPreviousMonth">--</strong></div>
+              <div><span>1 year</span><strong id="fearGreedPreviousYear">--</strong></div>
+            </div>
+            <p class="tile-footnote"><span id="fearGreedUpdated">Not loaded</span> · <a href="https://www.cnn.com/markets/fear-and-greed" target="_blank" rel="noreferrer">CNN source</a></p>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>Trend State</h2>
+              <span id="trendBadge" class="badge neutral">Loading</span>
+            </div>
+            <div class="trend-grid">
+              <div><span>1m</span><strong id="trend1m">--</strong></div>
+              <div><span>5m</span><strong id="trend5m">--</strong></div>
+              <div><span>15m</span><strong id="trend15m">--</strong></div>
+            </div>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>General Trend</h2>
+              <span id="generalTrendBadge" class="badge neutral">Loading</span>
+            </div>
+            <div class="trend-grid general-trend-grid">
+              <div><span>1m</span><strong id="generalTrend1m">--</strong></div>
+              <div><span>5m</span><strong id="generalTrend5m">--</strong></div>
+              <div><span>15m</span><strong id="generalTrend15m">--</strong></div>
+              <div><span>1D</span><strong id="generalTrend1d">--</strong></div>
+            </div>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>Market Regime</h2>
+              <span id="regimeBadge" class="badge neutral">Loading</span>
+            </div>
+            <div class="tile-readout"><span id="regimeDetail">--</span></div>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>Long / Short Bias</h2>
+              <span id="biasBadge" class="badge neutral">Mixed</span>
+            </div>
+            <div class="bias-meter" aria-label="Long short bias"><div id="biasFill" class="bias-fill"></div></div>
+            <div class="bias-labels"><span>Short</span><strong id="biasScore">0</strong><span>Long</span></div>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>Provider Health</h2>
+              <span id="providerHealthBadge" class="badge neutral">Loading</span>
+            </div>
+            <div class="diagnostic-list">
+              <div><span>Source</span><strong id="providerSource">--</strong></div>
+              <div><span>Last Tick</span><strong id="providerLastTick">--</strong></div>
+              <div><span>Errors</span><strong id="providerErrors">0</strong></div>
+              <div><span>Market</span><strong id="marketStatus">--</strong></div>
+              <div><span>Signal Bar</span><strong id="signalBarState">--</strong></div>
+              <div><span>Data Quality</span><strong id="dataQuality">--</strong></div>
+            </div>
+          </section>
+
+          <section class="insight-tile insight-wide">
+            <div class="section-heading">
+              <h2>Journal Stats</h2>
+              <span id="journalTotal" class="score">0</span>
+            </div>
+            <div class="journal-grid">
+              <div><span>Targets</span><strong id="journalTargets">--</strong></div>
+              <div><span>Stops</span><strong id="journalStops">--</strong></div>
+              <div><span>Open</span><strong id="journalOpen">--</strong></div>
+              <div><span>Waiting</span><strong id="journalWaiting">--</strong></div>
+              <div><span>Entered</span><strong id="journalEntered">--</strong></div>
+              <div><span>Expired</span><strong id="journalExpired">--</strong></div>
+              <div><span>Positive R</span><strong id="journalWinRate">--</strong></div>
+              <div><span>Expectancy</span><strong id="journalExpectancy">--</strong></div>
+              <div><span>Best Setup</span><strong id="journalBestSetup">--</strong></div>
+              <div><span>Best TF</span><strong id="journalBestTimeframe">--</strong></div>
+            </div>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>Historical Replay</h2>
+              <span id="replayBest" class="badge neutral">Building</span>
+            </div>
+            <div class="diagnostic-list">
+              <div><span>T1 before stop</span><strong id="replayAvgTarget">--</strong></div>
+              <div><span>Expected return</span><strong id="replayAvgStop">--</strong></div>
+              <div><span>Resolved samples</span><strong id="replaySamples">--</strong></div>
+              <div><span>MFE / MAE</span><strong id="replayExcursion">--</strong></div>
+            </div>
+          </section>
+
+          <section class="insight-tile insight-full alert-log-block">
+            <div class="section-heading">
+              <h2>Alert Log</h2>
+              <button id="clearLog" class="text-button" type="button">Clear</button>
+            </div>
+            <ol id="alertLog" class="alert-log"></ol>
+          </section>
+        </div>
+      </section>
+
+      <aside class="side-panel">
+        <section class="panel-block">
+          <div class="section-heading">
+            <h2>Best Day Trade</h2>
+            <span id="bestOpportunityBadge" class="badge neutral">Scanning</span>
+          </div>
+          <div id="bestOpportunityDetail" class="mini-readout" aria-live="polite">
+            Evaluating 1m, 5m, and 15m momentum setups.
+          </div>
+          <button id="bestOpportunityView" class="text-button best-opportunity-view" type="button" hidden>View chart</button>
+        </section>
+
+        <section class="panel-block">
+          <div class="section-heading">
+            <h2>Active Alert</h2>
+            <span id="confidenceScore" class="score" title="Rule-based setup quality, not a probability">--</span>
+          </div>
+          <div id="activeAlert" class="active-alert" aria-live="polite">
+            Waiting for enough candles.
+          </div>
+        </section>
+
+        <section class="panel-block">
+          <div class="section-heading">
+            <h2>Historical Edge</h2>
+            <span id="calibrationBadge" class="badge neutral">Building</span>
+          </div>
+          <div class="diagnostic-list">
+            <div><span>T1 before stop</span><strong id="calibrationProbability">--</strong></div>
+            <div><span>Expected return</span><strong id="calibrationExpectedR">--</strong></div>
+            <div><span>Replay samples</span><strong id="calibrationSamples">--</strong></div>
+            <div><span>95% range</span><strong id="calibrationRange">--</strong></div>
+          </div>
+          <p id="calibrationScope" class="tile-footnote">Waiting for comparable replay trades.</p>
+        </section>
+
+        <section class="panel-block">
+          <div class="section-heading">
+            <h2>Trade Plan</h2>
+            <span id="riskReward">--</span>
+          </div>
+          <dl class="trade-plan">
+            <div>
+              <dt>Entry trigger</dt>
+              <dd id="entryLevel">--</dd>
+            </div>
+            <div>
+              <dt>Invalidation</dt>
+              <dd id="stopLevel">--</dd>
+            </div>
+            <div>
+              <dt>Target 1</dt>
+              <dd id="targetLevel">--</dd>
+            </div>
+            <div>
+              <dt>Target 2</dt>
+              <dd id="target2Level">--</dd>
+            </div>
+            <div>
+              <dt>Exit warning</dt>
+              <dd id="exitWarning">--</dd>
+            </div>
+          </dl>
+          <div class="feedback-actions" aria-label="Trade feedback">
+            <button id="feedbackTook" class="text-button" type="button">Took</button>
+            <button id="feedbackSkipped" class="text-button" type="button">Skipped</button>
+            <button id="feedbackBad" class="text-button" type="button">Bad alert</button>
+          </div>
+        </section>
+
+        <section class="panel-block">
+          <div class="section-heading">
+            <h2>Lifecycle</h2>
+            <span id="lifecycleBadge" class="badge neutral">Idle</span>
+          </div>
+          <div class="mini-readout" aria-live="polite">
+            <span id="lifecycleDetail">No active plan is waiting for entry.</span>
+          </div>
+        </section>
+
+        <section class="panel-block">
+          <div class="section-heading">
+            <h2>Why No Trade</h2>
+            <span id="bestSideBadge" class="badge neutral">--</span>
+          </div>
+          <div id="whyRejected" class="compare-grid"></div>
+        </section>
+
+      </aside>
+    </main>
+
+    <section class="journal-band">
+      <div class="section-heading">
+        <h2>Journal</h2>
+        <select id="journalFilter">
+          <option value="all">All</option>
+          <option value="long">Long</option>
+          <option value="short">Short</option>
+          <option value="open">Open</option>
+          <option value="stopped">Stopped</option>
+          <option value="target">Targets</option>
+        </select>
+      </div>
+      <div class="journal-table-wrap">
+        <table class="journal-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>TF</th>
+              <th>Side</th>
+              <th>Setup</th>
+              <th>Score</th>
+              <th>State</th>
+              <th>Entry</th>
+              <th>T1</th>
+              <th>Stop</th>
+            </tr>
+          </thead>
+          <tbody id="journalRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="lower-band">
+      <div class="metrics">
+        <div>
+          <span>VWAP</span>
+          <strong id="vwapMetric">--</strong>
+        </div>
+        <div>
+          <span>SMA 20 / 50 / 150</span>
+          <strong id="smaMetric">--</strong>
+        </div>
+        <div>
+          <span>EMA 20 / 50 / 150</span>
+          <strong id="emaMetric">--</strong>
+        </div>
+        <div>
+          <span>RSI 14</span>
+          <strong id="rsiMetric">--</strong>
+        </div>
+        <div>
+          <span>ATR 14</span>
+          <strong id="atrMetric">--</strong>
+        </div>
+        <div>
+          <span>Relative Volume</span>
+          <strong id="rvolMetric">--</strong>
+        </div>
+      </div>
+    </section>
+
+    <footer class="disclaimer">
+      Alerts are educational decision support only. They do not place trades and do not guarantee outcomes.
+    </footer>
+
+    <script src="./market-core.js"></script>
+    <script src="./pattern-engine.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

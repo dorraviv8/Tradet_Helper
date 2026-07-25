@@ -1,0 +1,23 @@
+services:
+  trader-helper:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_USERNAME: ${APP_USERNAME:-trader}
+      APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in .env}
+      DATA_PROVIDER: ${DATA_PROVIDER:-yahoo}
+      DEBUG_ERRORS: "false"
+    ports:
+      - "127.0.0.1:${APP_PORT:-5173}:5173"
+    volumes:
+      - trader-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  trader-data:

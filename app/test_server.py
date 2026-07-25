@@ -1,0 +1,274 @@
+import base64
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+import server
+
+
+def candle(time, open_price, high, low, close, volume=100):
+  return {
+    "time": time,
+    "open": open_price,
+    "high": high,
+    "low": low,
+    "close": close,
+    "volume": volume,
+  }
+
+
+class ServerTests(unittest.TestCase):
+  def setUp(self):
+    self.tmp = tempfile.TemporaryDirectory()
+    self.old_db_path = server.DB_PATH
+    self.old_legacy_path = server.LEGACY_DB_PATH
+    self.old_app_password = server.APP_PASSWORD
+    server.DB_PATH = os.path.join(self.tmp.name, "journal.sqlite3")
+    server.LEGACY_DB_PATH = os.path.join(self.tmp.name, "missing.sqlite3")
+    server.init_db()
+
+  def tearDown(self):
+    server.DB_PATH = self.old_db_path
+    server.LEGACY_DB_PATH = self.old_legacy_path
+    server.APP_PASSWORD = self.old_app_password
+    self.tmp.cleanup()
+
+  def insert_plan(self, plan_id, **overrides):
+    row = {
+      "id": plan_id,
+      "created_at": 60_000,
+      "updated_at": 60_000,
+      "symbol": "QQQ",
+      "provider": "test",
+      "timeframe": 1,
+      "direction": "long",
+      "setup": "test setup",
+      "setup_type": "test",
+      "market_phase": "morning",
+      "status": "alert",
+      "score": 80,
+      "entry": 100.0,
+      "stop": 99.0,
+      "target1": 101.0,
+      "target2": 102.0,
+      "risk_reward": 2.0,
+      "price_at_plan": 100.0,
+      "strategy_version": server.STRATEGY_VERSION,
+      "eligible_for_learning": 1,
+    }
+    row.update(overrides)
+    with server.db() as connection:
+      connection.execute("""
+        INSERT INTO plans (
+          id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type,
+          market_phase, status, score, entry, stop, target1, target2, risk_reward, price_at_plan,
+          strategy_version, eligible_for_learning
+        ) VALUES (
+          :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type,
+          :market_phase, :status, :score, :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan,
+          :strategy_version, :eligible_for_learning
+        )
+      """, row)
+
+  def fetch_plan(self, plan_id):
+    with server.db() as connection:
+      return dict(connection.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone())
+
+  def test_yahoo_synthetic_latest_quote_is_dropped_and_bucketed(self):
+    minute = 1_800_000
+    payload = {
+      "chart": {
+        "result": [{
+          "timestamp": [minute // 1000, (minute + 37_000) // 1000],
+          "indicators": {
+            "quote": [{
+              "open": [100, 101],
+              "high": [101, 101],
+              "low": [99, 101],
+              "close": [100.5, 101],
+              "volume": [1000, 0],
+            }]
+          },
+        }]
+      }
+    }
+    candles = server.normalize_yahoo_chart(payload)
+    self.assertEqual(len(candles), 1)
+    self.assertEqual(candles[0]["time"], minute)
+    self.assertEqual(candles[0]["close"], 100.5)
+
+  def test_zero_volume_quote_outlier_is_rejected(self):
+    self.assertIsNone(server.normalized_candle(
+      candle(120_000, 100.0, 100.1, 92.0, 100.05, volume=0)
+    ))
+    self.assertIsNotNone(server.normalized_candle(
+      candle(120_000, 100.0, 100.1, 99.9, 100.05, volume=0)
+    ))
+
+  def test_daily_history_is_persisted_separately(self):
+    candles = [
+      candle(86_400_000, 100, 102, 99, 101, 1_000),
+      candle(172_800_000, 101, 103, 100, 102, 2_000),
+    ]
+    self.assertEqual(server.save_daily_candles("QQQ", "yahoo", candles, fetched_at=123_456), 2)
+    loaded, fetched_at = server.load_daily_candles("QQQ")
+    self.assertEqual(loaded, candles)
+    self.assertEqual(fetched_at, 123_456)
+
+  def test_supported_symbols_include_bitcoin(self):
+    self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")
+    with self.assertRaises(ValueError):
+      server.validate_symbol("SPY")
+
+  def test_market_runtimes_are_isolated_by_symbol(self):
+    with server.MARKET_RUNTIME_LOCK:
+      old_qqq = server.MARKET_RUNTIMES["QQQ"]
+      old_btc = server.MARKET_RUNTIMES["BTC-USD"]
+      server.MARKET_RUNTIMES["QQQ"] = server.new_market_runtime()
+      server.MARKET_RUNTIMES["BTC-USD"] = server.new_market_runtime()
+      server.MARKET_RUNTIMES["QQQ"]["candle"] = candle(60_000, 100, 101, 99, 100.5)
+      server.MARKET_RUNTIMES["BTC-USD"]["candle"] = candle(60_000, 60_000, 60_100, 59_900, 60_050)
+    try:
+      self.assertEqual(server.market_runtime_snapshot("QQQ")["candle"]["close"], 100.5)
+      self.assertEqual(server.market_runtime_snapshot("BTC-USD")["candle"]["close"], 60_050)
+    finally:
+      with server.MARKET_RUNTIME_LOCK:
+        server.MARKET_RUNTIMES["QQQ"] = old_qqq
+        server.MARKET_RUNTIMES["BTC-USD"] = old_btc
+
+  def test_backtest_result_round_trips_separately_from_journal(self):
+    result = {"generatedAt": 123_456, "summary": {"resolved": 20}, "groups": [], "trades": []}
+    with server.db() as connection:
+      server.save_backtest_result(connection, "signature", result)
+    with server.db() as connection:
+      loaded = server.load_latest_backtest(connection)
+      plan_count = connection.execute("SELECT COUNT(*) AS total FROM plans").fetchone()["total"]
+    self.assertEqual(loaded["summary"]["resolved"], 20)
+    self.assertEqual(loaded["sourceSignature"], "signature")
+    self.assertEqual(plan_count, 0)
+
+  def test_backtest_results_are_scoped_by_symbol(self):
+    with server.db() as connection:
+      server.save_backtest_result(connection, "qqq-signature", {"generatedAt": 1, "summary": {"resolved": 10}}, "QQQ")
+      server.save_backtest_result(connection, "btc-signature", {"generatedAt": 2, "summary": {"resolved": 20}}, "BTC-USD")
+    with server.db() as connection:
+      self.assertEqual(server.load_latest_backtest(connection, "QQQ")["summary"]["resolved"], 10)
+      self.assertEqual(server.load_latest_backtest(connection, "BTC-USD")["summary"]["resolved"], 20)
+
+  def test_cnn_fear_greed_payload_is_normalized(self):
+    result = server.normalize_fear_greed({
+      "fear_and_greed": {
+        "score": 37.057,
+        "rating": "fear",
+        "timestamp": "2026-07-17T23:59:50+00:00",
+        "previous_close": 41.68,
+        "previous_1_week": 46.82,
+        "previous_1_month": 32.94,
+        "previous_1_year": 74.17,
+      }
+    })
+    self.assertEqual(result["score"], 37.1)
+    self.assertEqual(result["rating"], "Fear")
+    self.assertEqual(result["previousClose"], 41.68)
+    self.assertEqual(result["source"], "CNN")
+
+  def test_cnn_fear_greed_rejects_out_of_range_score(self):
+    with self.assertRaises(ValueError):
+      server.normalize_fear_greed({"fear_and_greed": {"score": 101}})
+
+  def test_entry_and_stop_same_bar_is_ambiguous(self):
+    self.insert_plan("ambiguous")
+    with server.db() as connection:
+      updates = server.evaluate_plans(connection, "QQQ", [
+        candle(120_000, 100, 100.5, 98.8, 99.4),
+      ])
+    row = self.fetch_plan("ambiguous")
+    self.assertEqual(updates, 1)
+    self.assertEqual(row["outcome_status"], "ambiguous")
+    self.assertEqual(row["lifecycle_status"], "closed")
+
+  def test_candles_inside_signal_window_are_not_evaluated(self):
+    self.insert_plan("boundary", created_at=360_000, updated_at=360_000, timeframe=5)
+    with server.db() as connection:
+      updates = server.evaluate_plans(connection, "QQQ", [
+        candle(120_000, 99.5, 101.5, 99.4, 101.0),
+        candle(300_000, 99.5, 101.5, 99.4, 101.0),
+      ])
+    row = self.fetch_plan("boundary")
+    self.assertEqual(updates, 0)
+    self.assertEqual(row["lifecycle_status"], "waiting")
+    self.assertIsNone(row["entry_hit_at"])
+
+  def test_first_bar_at_actionable_boundary_is_evaluated_once(self):
+    self.insert_plan("first_bar", created_at=360_000, updated_at=360_000, timeframe=5)
+    boundary_candle = candle(360_000, 99.8, 100.5, 99.7, 100.2)
+    with server.db() as connection:
+      first_updates = server.evaluate_plans(connection, "QQQ", [boundary_candle])
+      duplicate_updates = server.evaluate_plans(connection, "QQQ", [boundary_candle])
+    row = self.fetch_plan("first_bar")
+    self.assertEqual(first_updates, 1)
+    self.assertEqual(duplicate_updates, 0)
+    self.assertEqual(row["entry_hit_at"], 360_000)
+    self.assertEqual(row["observations"], 1)
+
+  def test_entry_bar_does_not_receive_same_bar_target_credit(self):
+    self.insert_plan("same_bar_target")
+    with server.db() as connection:
+      server.evaluate_plans(connection, "QQQ", [
+        candle(120_000, 99.8, 102.2, 99.7, 101.5),
+      ])
+    row = self.fetch_plan("same_bar_target")
+    self.assertEqual(row["lifecycle_status"], "entered")
+    self.assertEqual(row["outcome_status"], "open")
+    self.assertIsNone(row["hit_target1_at"])
+    self.assertIsNone(row["hit_target2_at"])
+
+  def test_target1_then_stop_preserves_partial_outcome(self):
+    self.insert_plan("target1_stop")
+    with server.db() as connection:
+      server.evaluate_plans(connection, "QQQ", [
+        candle(120_000, 99.8, 100.4, 99.7, 100.2),
+        candle(180_000, 100.2, 101.2, 100.1, 101.0),
+        candle(240_000, 101.0, 101.1, 98.8, 99.0),
+      ])
+    row = self.fetch_plan("target1_stop")
+    self.assertEqual(row["outcome_status"], "target1_stop")
+    self.assertEqual(row["lifecycle_status"], "closed")
+    self.assertEqual(row["hit_target1_at"], 180_000)
+    self.assertEqual(row["hit_stop_at"], 240_000)
+    self.assertEqual(row["realized_r"], 0.0)
+
+  def test_waiting_plan_expires_without_entry(self):
+    self.insert_plan("expired", entry=110.0, stop=105.0, target1=112.0, target2=114.0)
+    with server.db() as connection:
+      server.evaluate_plans(connection, "QQQ", [
+        candle(60_000 + 4 * 60 * 60 * 1000 + 60_000, 100, 101, 99, 100.5),
+      ])
+    row = self.fetch_plan("expired")
+    self.assertEqual(row["outcome_status"], "expired")
+    self.assertEqual(row["lifecycle_status"], "expired")
+
+  def test_non_health_routes_require_configured_basic_auth(self):
+    server.APP_PASSWORD = "test-secret"
+    handler = object.__new__(server.Handler)
+    responses = []
+    headers = []
+    handler.send_response = responses.append
+    handler.send_header = lambda key, value: headers.append((key, value))
+    handler.end_headers = lambda: None
+
+    token = base64.b64encode(b"trader:test-secret").decode("ascii")
+    handler.headers = {"Authorization": f"Basic {token}"}
+    self.assertTrue(handler.require_auth())
+
+    handler.headers = {"Authorization": "Basic invalid"}
+    self.assertFalse(handler.require_auth())
+    self.assertEqual(responses[-1], 401)
+    self.assertTrue(any(key == "WWW-Authenticate" for key, _ in headers))
+
+
+if __name__ == "__main__":
+  unittest.main()

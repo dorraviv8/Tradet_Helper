@@ -1,0 +1,33 @@
+{
+  "activeTradeThreshold": 62,
+  "alertLogThreshold": 72,
+  "alertCooldownMinutes": 15,
+  "backtestSlippageBps": 0.5,
+  "backtestCommissionPerShare": 0.0,
+  "pollIntervalMs": 15000,
+  "mode": "normal",
+  "sessionMode": "regular",
+  "chartLayers": {
+    "movingAverages": true,
+    "vwap": true,
+    "levels": true,
+    "markers": true,
+    "volume": true,
+    "rsi": true,
+    "patterns": false
+  },
+  "modes": {
+    "scalp": {
+      "scoreOffset": -6,
+      "targetScale": 0.82
+    },
+    "normal": {
+      "scoreOffset": 0,
+      "targetScale": 1
+    },
+    "strict": {
+      "scoreOffset": 8,
+      "targetScale": 1.08
+    }
+  }
+}
