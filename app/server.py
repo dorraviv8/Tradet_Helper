@@ -271,6 +271,16 @@ def init_db():
       connection.execute("ALTER TABLE backtest_runs ADD COLUMN symbol TEXT NOT NULL DEFAULT 'QQQ'")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_backtest_symbol_version_time ON backtest_runs(symbol, strategy_version, generated_at DESC)")
     connection.execute("""
+      CREATE TABLE IF NOT EXISTS learning_snapshots (
+        symbol TEXT NOT NULL,
+        strategy_version TEXT NOT NULL,
+        source_signature TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        PRIMARY KEY (symbol, strategy_version)
+      )
+    """)
+    connection.execute("""
       UPDATE plans
       SET eligible_for_learning = 0
       WHERE strategy_version IS NULL OR strategy_version <> ?
@@ -811,19 +821,99 @@ def load_strategy_settings():
     return {"activeTradeThreshold": 62, "mode": "normal", "sessionMode": "regular"}
 
 
+def learning_source_signature(connection, symbol=SYMBOL):
+  row = connection.execute("""
+    SELECT COUNT(*) AS resolved,
+           COALESCE(MAX(closed_at), 0) AS last_closed_at,
+           COALESCE(MAX(updated_at), 0) AS last_updated_at
+    FROM plans
+    WHERE symbol = ? AND eligible_for_learning = 1 AND strategy_version = ? AND realized_r IS NOT NULL
+  """, (symbol, STRATEGY_VERSION)).fetchone()
+  return f"{int(row['resolved'])}:{int(row['last_closed_at'])}:{int(row['last_updated_at'])}"
+
+
+def learning_group_rows(connection, symbol, group_name, column):
+  rows = connection.execute(f"""
+    SELECT {column} AS group_key,
+           COUNT(*) AS sample_size,
+           SUM(CASE WHEN realized_r > 0 THEN 1 ELSE 0 END) AS winners,
+           SUM(CASE WHEN realized_r <= 0 THEN 1 ELSE 0 END) AS stopped,
+           SUM(CASE WHEN outcome_status IN ('target1_stop', 'target2') THEN 1 ELSE 0 END) AS target1_hits,
+           AVG(realized_r) AS expected_r,
+           MAX(closed_at) AS last_closed_at
+    FROM plans
+    WHERE symbol = ? AND eligible_for_learning = 1 AND strategy_version = ? AND realized_r IS NOT NULL
+    GROUP BY {column}
+  """, (symbol, STRATEGY_VERSION)).fetchall()
+  groups = {}
+  for row in rows:
+    value = dict(row)
+    sample_size = int(value["sample_size"] or 0)
+    winners = int(value["winners"] or 0)
+    target1_hits = int(value["target1_hits"] or 0)
+    # The neutral prior prevents a small run of outcomes from producing a large score change.
+    value["win_rate"] = (winners + 10) / (sample_size + 20) if sample_size else 0.5
+    value["target1_rate"] = (target1_hits + 10) / (sample_size + 20) if sample_size else 0.5
+    value["expected_r"] = float(value["expected_r"] or 0)
+    value["group"] = group_name
+    groups[str(value["group_key"])] = value
+  return groups
+
+
+def build_learning_snapshot(connection, symbol=SYMBOL):
+  group_definitions = (
+    ("bySetup", "setup", "COALESCE(setup_type, 'unknown')"),
+    ("byTimeframe", "timeframe", "CAST(timeframe AS TEXT)"),
+    ("byPhase", "phase", "COALESCE(market_phase, 'unknown')"),
+  )
+  groups = {key: learning_group_rows(connection, symbol, label, column) for key, label, column in group_definitions}
+  total = sum(int(item["sample_size"]) for item in groups["byTimeframe"].values())
+  return {
+    "symbol": symbol,
+    "strategyVersion": STRATEGY_VERSION,
+    "resolvedSamples": total,
+    "performance": {
+      key: {
+        group_key: {
+          "winners": item["winners"],
+          "stopped": item["stopped"],
+          "sampleSize": item["sample_size"],
+          "expectedR": item["expected_r"],
+        }
+        for group_key, item in values.items()
+      }
+      for key, values in groups.items()
+    },
+    "groups": groups,
+  }
+
+
+def load_learning_snapshot(connection, symbol=SYMBOL):
+  signature = learning_source_signature(connection, symbol)
+  row = connection.execute("""
+    SELECT source_signature, snapshot_json
+    FROM learning_snapshots
+    WHERE symbol = ? AND strategy_version = ?
+  """, (symbol, STRATEGY_VERSION)).fetchone()
+  if row and row["source_signature"] == signature:
+    try:
+      return json.loads(row["snapshot_json"])
+    except (TypeError, ValueError):
+      pass
+  snapshot = build_learning_snapshot(connection, symbol)
+  connection.execute("""
+    INSERT INTO learning_snapshots (symbol, strategy_version, source_signature, updated_at, snapshot_json)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(symbol, strategy_version) DO UPDATE SET
+      source_signature = excluded.source_signature,
+      updated_at = excluded.updated_at,
+      snapshot_json = excluded.snapshot_json
+  """, (symbol, STRATEGY_VERSION, signature, now_ms(), json.dumps(snapshot, separators=(",", ":"))))
+  return snapshot
+
+
 def load_strategy_performance(connection, symbol=SYMBOL):
-  performance = {}
-  for key, column in (("bySetup", "COALESCE(setup_type, 'unknown')"), ("byTimeframe", "CAST(timeframe AS TEXT)"), ("byPhase", "COALESCE(market_phase, 'unknown')")):
-    rows = connection.execute(f"""
-      SELECT {column} AS group_key,
-             SUM(CASE WHEN realized_r > 0 THEN 1 ELSE 0 END) AS winners,
-             SUM(CASE WHEN realized_r <= 0 THEN 1 ELSE 0 END) AS stopped
-      FROM plans
-      WHERE symbol = ? AND eligible_for_learning = 1 AND strategy_version = ? AND realized_r IS NOT NULL
-      GROUP BY {column}
-    """, (symbol, STRATEGY_VERSION)).fetchall()
-    performance[key] = {str(row["group_key"]): dict(row) for row in rows}
-  return performance
+  return load_learning_snapshot(connection, symbol).get("performance") or {}
 
 
 def load_latest_backtest(connection, symbol=SYMBOL):
@@ -895,6 +985,63 @@ def attach_signal_calibration(signal, trades):
       candidate["timeframe"] = signal.get("timeframe")
       candidate["calibration"] = backtest_engine.calibration_for_signal(trades, candidate)
   signal["calibration"] = backtest_engine.calibration_for_signal(trades, signal)
+  return signal
+
+
+def learning_confidence_for_signal(snapshot, signal):
+  if not isinstance(signal, dict) or signal.get("direction") not in {"long", "short"}:
+    return {
+      "status": "Building",
+      "sampleSize": 0,
+      "scope": "no actionable setup",
+      "expectedR": None,
+      "target1Rate": None,
+      "lastUpdated": None,
+    }
+  setup_type = signal.get("setupType") or strategy_engine.setup_type(signal.get("setup", ""))
+  candidates = (
+    ("setup", setup_type, "setup type"),
+    ("timeframe", str(signal.get("timeframe") or ""), "timeframe"),
+    ("phase", signal.get("marketPhase") or "unknown", "market phase"),
+  )
+  groups = snapshot.get("groups") or {}
+  selected = None
+  scope = "no comparable resolved plans"
+  for group_name, key, label in candidates:
+    item = (groups.get(f"by{group_name.title()}") or {}).get(str(key))
+    if item and int(item.get("sample_size") or 0) >= 8:
+      selected = item
+      scope = label
+      break
+  if selected is None:
+    return {
+      "status": "Building",
+      "sampleSize": 0,
+      "scope": scope,
+      "expectedR": None,
+      "target1Rate": None,
+      "lastUpdated": None,
+    }
+  sample_size = int(selected["sample_size"])
+  return {
+    "status": "Established" if sample_size >= 60 else "Developing" if sample_size >= 20 else "Preliminary",
+    "sampleSize": sample_size,
+    "scope": scope,
+    "expectedR": finite_or_none(selected.get("expected_r")),
+    "target1Rate": finite_or_none(selected.get("target1_rate")),
+    "lastUpdated": selected.get("last_closed_at"),
+  }
+
+
+def attach_signal_learning_confidence(signal, snapshot):
+  if not isinstance(signal, dict):
+    return signal
+  for key in ("bestLong", "bestShort"):
+    candidate = signal.get(key)
+    if isinstance(candidate, dict):
+      candidate["timeframe"] = signal.get("timeframe")
+      candidate["modelConfidence"] = learning_confidence_for_signal(snapshot, candidate)
+  signal["modelConfidence"] = learning_confidence_for_signal(snapshot, signal)
   return signal
 
 
@@ -1056,7 +1203,8 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
     return {}
   settings = load_strategy_settings()
   with db() as connection:
-    performance = load_strategy_performance(connection, symbol)
+    learning_snapshot = load_learning_snapshot(connection, symbol)
+    performance = learning_snapshot.get("performance") or {}
     recommendations = strategy_engine.analyze_all(
       candles,
       settings,
@@ -1079,6 +1227,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
     replay_trades = replay.get("trades") or []
     for timeframe, signal in recommendations.items():
       attach_signal_calibration(signal, replay_trades)
+      attach_signal_learning_confidence(signal, learning_snapshot)
       persist_generated_signal(connection, provider, int(timeframe), signal, settings, symbol)
   with MARKET_RUNTIME_LOCK:
     MARKET_RUNTIMES[symbol]["recommendations"] = recommendations

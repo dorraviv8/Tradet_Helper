@@ -2766,11 +2766,31 @@ function renderCalibration(signal) {
   const comparisonCandidates = [signal?.bestLong, signal?.bestShort].filter(Boolean).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
   const subject = signal?.direction === "long" || signal?.direction === "short" ? signal : comparisonCandidates[0];
   const calibration = subject?.calibration || {};
+  const model = subject?.modelConfidence || {};
+  const modelSamples = Number(model.sampleSize || 0);
+  const modelTargetRate = Number(model.target1Rate);
+  const modelExpectedR = Number(model.expectedR);
   const samples = Number(calibration.sampleSize || 0);
   const probability = Number(calibration.probabilityT1);
   const expectedR = Number(calibration.expectedR);
   const low = Number(calibration.confidenceLow);
   const high = Number(calibration.confidenceHigh);
+  if (modelSamples && Number.isFinite(modelTargetRate)) {
+    const established = model.status === "Established";
+    els.calibrationBadge.textContent = model.status || "Developing";
+    setTone(els.calibrationBadge, established ? "positive" : "neutral");
+    els.calibrationProbability.textContent = `${fmt(modelTargetRate * 100, 0)}%`;
+    els.calibrationExpectedR.textContent = Number.isFinite(modelExpectedR)
+      ? `${modelExpectedR >= 0 ? "+" : ""}${fmt(modelExpectedR, 2)}R`
+      : "--";
+    setTone(els.calibrationExpectedR, modelExpectedR > 0 ? "positive" : modelExpectedR < 0 ? "negative" : "neutral");
+    els.calibrationSamples.textContent = modelSamples;
+    els.calibrationRange.textContent = Number.isFinite(low) && Number.isFinite(high)
+      ? `${fmt(low * 100, 0)}-${fmt(high * 100, 0)}%`
+      : "--";
+    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model uses ${model.scope || "comparable"} outcomes with a neutral prior; replay range remains a separate historical baseline.`;
+    return;
+  }
   if (!samples || !Number.isFinite(probability)) {
     els.calibrationBadge.textContent = "Building";
     setTone(els.calibrationBadge, "neutral");
@@ -2778,10 +2798,10 @@ function renderCalibration(signal) {
     els.calibrationExpectedR.textContent = "--";
     els.calibrationSamples.textContent = samples || "--";
     els.calibrationRange.textContent = "--";
-    els.calibrationScope.textContent = "Waiting for comparable look-ahead-safe replay trades.";
+    els.calibrationScope.textContent = "Waiting for automatically resolved comparable plans and historical replay data.";
     return;
   }
-  els.calibrationBadge.textContent = calibration.calibrated ? "Calibrated" : "Preliminary";
+  els.calibrationBadge.textContent = calibration.calibrated ? "Replay baseline" : "Replay only";
   setTone(els.calibrationBadge, calibration.calibrated ? "positive" : "neutral");
   els.calibrationProbability.textContent = `${fmt(probability * 100, 0)}%`;
   els.calibrationExpectedR.textContent = Number.isFinite(expectedR) ? `${expectedR >= 0 ? "+" : ""}${fmt(expectedR, 2)}R` : "--";
@@ -2790,7 +2810,7 @@ function renderCalibration(signal) {
   els.calibrationRange.textContent = Number.isFinite(low) && Number.isFinite(high)
     ? `${fmt(low * 100, 0)}-${fmt(high * 100, 0)}%`
     : "--";
-  els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Comparable scope: ${calibration.scope || "historical replay"}. Probability includes a neutral prior; the range reflects observed outcomes.`;
+  els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.scope || "historical replay"} baseline with a neutral prior.`;
 }
 
 function render(signal, indicators) {

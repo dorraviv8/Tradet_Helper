@@ -58,6 +58,10 @@ class ServerTests(unittest.TestCase):
       "price_at_plan": 100.0,
       "strategy_version": server.STRATEGY_VERSION,
       "eligible_for_learning": 1,
+      "outcome_status": "open",
+      "lifecycle_status": "waiting",
+      "realized_r": None,
+      "closed_at": None,
     }
     row.update(overrides)
     with server.db() as connection:
@@ -65,11 +69,11 @@ class ServerTests(unittest.TestCase):
         INSERT INTO plans (
           id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type,
           market_phase, status, score, entry, stop, target1, target2, risk_reward, price_at_plan,
-          strategy_version, eligible_for_learning
+          strategy_version, eligible_for_learning, outcome_status, lifecycle_status, realized_r, closed_at
         ) VALUES (
           :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type,
           :market_phase, :status, :score, :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan,
-          :strategy_version, :eligible_for_learning
+          :strategy_version, :eligible_for_learning, :outcome_status, :lifecycle_status, :realized_r, :closed_at
         )
       """, row)
 
@@ -157,6 +161,51 @@ class ServerTests(unittest.TestCase):
     with server.db() as connection:
       self.assertEqual(server.load_latest_backtest(connection, "QQQ")["summary"]["resolved"], 10)
       self.assertEqual(server.load_latest_backtest(connection, "BTC-USD")["summary"]["resolved"], 20)
+
+  def test_learning_snapshot_persists_resolved_current_strategy_plans(self):
+    for index in range(8):
+      self.insert_plan(
+        f"learn-{index}",
+        setup_type="breakout",
+        timeframe=5,
+        market_phase="morning",
+      )
+    with server.db() as connection:
+      connection.execute("""
+        UPDATE plans
+        SET realized_r = CASE WHEN id IN ('learn-0', 'learn-1', 'learn-2', 'learn-3', 'learn-4') THEN 1.2 ELSE -1.0 END,
+            outcome_status = CASE WHEN id IN ('learn-0', 'learn-1', 'learn-2', 'learn-3', 'learn-4') THEN 'target2' ELSE 'stopped' END,
+            lifecycle_status = 'closed',
+            closed_at = 120000,
+            updated_at = 120000
+        WHERE id LIKE 'learn-%'
+      """)
+      snapshot = server.load_learning_snapshot(connection, "QQQ")
+      stored = connection.execute("SELECT snapshot_json FROM learning_snapshots WHERE symbol = 'QQQ'").fetchone()
+    self.assertEqual(snapshot["resolvedSamples"], 8)
+    self.assertEqual(snapshot["groups"]["bySetup"]["breakout"]["winners"], 5)
+    self.assertIsNotNone(stored)
+    confidence = server.learning_confidence_for_signal(snapshot, {
+      "direction": "long", "setupType": "breakout", "timeframe": 5, "marketPhase": "morning",
+    })
+    self.assertEqual(confidence["status"], "Preliminary")
+    self.assertEqual(confidence["sampleSize"], 8)
+
+  def test_learning_snapshot_excludes_unresolved_and_quarantined_plans(self):
+    self.insert_plan("resolved", realized_r=1.0, outcome_status="target2", lifecycle_status="closed", closed_at=120000)
+    self.insert_plan("open", realized_r=None, outcome_status="open", lifecycle_status="waiting")
+    self.insert_plan(
+      "old-version",
+      strategy_version="4.0.0",
+      eligible_for_learning=0,
+      realized_r=1.0,
+      outcome_status="target2",
+      lifecycle_status="closed",
+      closed_at=120000,
+    )
+    with server.db() as connection:
+      snapshot = server.load_learning_snapshot(connection, "QQQ")
+    self.assertEqual(snapshot["resolvedSamples"], 1)
 
   def test_cnn_fear_greed_payload_is_normalized(self):
     result = server.normalize_fear_greed({
