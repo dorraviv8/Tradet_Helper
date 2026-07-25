@@ -47,16 +47,16 @@ gcloud compute addresses describe trader-helper-ip \
   --format='get(address)'
 ```
 
-Create the VM. An `e2-small` is a sensible starting size for one user; scale after observing memory and CPU usage.
+Create the VM. Use an `e2-micro` in `us-central1` for the lowest ongoing cost. It fits the Compute Engine Always Free allowance when the monthly limits apply; the free allowance covers one eligible `e2-micro` VM and up to 30 GB of standard persistent disk, not a guaranteed free external IPv4 address.
 
 ```bash
 gcloud compute instances create "$GCP_INSTANCE" \
   --zone="$GCP_ZONE" \
-  --machine-type=e2-small \
+  --machine-type=e2-micro \
   --image-family=debian-12 \
   --image-project=debian-cloud \
   --boot-disk-size=30GB \
-  --boot-disk-type=pd-balanced \
+  --boot-disk-type=pd-standard \
   --address=trader-helper-ip \
   --tags=trader-helper-web \
   --shielded-secure-boot \
@@ -64,7 +64,7 @@ gcloud compute instances create "$GCP_INSTANCE" \
   --shielded-integrity-monitoring
 ```
 
-Create the DNS `A` record for `PUBLIC_HOST` using the reserved address. Wait for DNS to resolve, then connect to the VM and clone the GitHub repository.
+Create the DNS `A` record for `PUBLIC_HOST` using the reserved address. Wait for DNS to resolve, then connect to the VM and clone the GitHub repository. A domain name is required for the production profile because Caddy needs it to obtain a publicly trusted HTTPS certificate. Do not expose the password-protected app directly over plain HTTP at an IP address.
 
 On the VM, create a private `.env` file from `.env.example`. Set a unique, long `APP_PASSWORD` and the domain name in `PUBLIC_HOST`. Do not commit this file.
 
@@ -85,4 +85,4 @@ curl -u "trader:YOUR_APP_PASSWORD" https://YOUR_DOMAIN/health
 curl -u "trader:YOUR_APP_PASSWORD" https://YOUR_DOMAIN/ready
 ```
 
-Create a regular disk-snapshot policy before relying on the journal history. The Docker `trader-data` volume and Caddy certificate data live on the VM boot disk, so a VM replacement without a disk restore loses that state.
+Create a regular disk-snapshot policy before relying on the journal history. The Docker `trader-data` volume and Caddy certificate data live on the VM boot disk, so a VM replacement without a disk restore loses that state. Set a Cloud Billing budget alert before deployment; external IPv4 and network egress can still incur charges even when the VM fits the free-tier allowance.
