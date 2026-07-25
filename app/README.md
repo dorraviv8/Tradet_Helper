@@ -141,6 +141,8 @@ The container runs read-only with dropped Linux capabilities. SQLite is stored i
 
 The Docker configuration defaults to Yahoo. A container or cloud server cannot reach TWS at the desktop loopback address `127.0.0.1`. Keep the IBKR-enabled application on the same computer as TWS, or later add a private authenticated network bridge. Never expose TWS port `7496` directly to the internet.
 
+For a single-user GCP deployment, use the Compute Engine profile in [`deploy/gcp/README.md`](../deploy/gcp/README.md). It adds Caddy for automatic HTTPS while keeping the application container private behind the reverse proxy. Do not deploy the current SQLite and background-worker design to multiple replicas or a stateless Cloud Run service.
+
 ## Verification
 
 ```bash
