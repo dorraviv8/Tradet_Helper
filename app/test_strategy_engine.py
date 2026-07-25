@@ -100,6 +100,22 @@ class StrategyEngineTests(unittest.TestCase):
     self.assertGreater(bitcoin["target1MaxPct"], qqq["target1MaxPct"])
     self.assertGreater(bitcoin["maxRiskPct"], qqq["maxRiskPct"])
 
+  def test_trend_confirmation_requires_two_timeframes_for_continuation(self):
+    trends = {
+      1: {"tone": "positive"},
+      5: {"tone": "neutral"},
+      15: {"tone": "positive"},
+    }
+    confirmation = strategy.trend_confirmation(trends, 1, "long")
+    self.assertEqual(confirmation["aligned"], 2)
+    self.assertEqual(confirmation["opposed"], 0)
+    self.assertEqual(strategy.trend_confirmation(trends, 1, "short")["opposed"], 2)
+
+  def test_atr_extension_measures_price_distance_on_trade_side(self):
+    latest = {"close": 603.0, "ema20": 600.0, "atr": 2.0}
+    self.assertAlmostEqual(strategy.atr_extension(latest, "long"), 1.5)
+    self.assertAlmostEqual(strategy.atr_extension(latest, "short"), -1.5)
+
   def test_market_regime_identifies_aligned_uptrend(self):
     start = timestamp(2026, 7, 16, 9, 30)
     candles = []

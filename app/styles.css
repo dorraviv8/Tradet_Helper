@@ -992,11 +992,28 @@ h2 {
 }
 
 @media (max-width: 620px) {
+  body {
+    overflow-x: hidden;
+  }
+
   .topbar,
   .chart-toolbar,
   .swing-summary-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .topbar {
+    gap: 14px;
+    padding: 14px 16px 12px;
+  }
+
+  .brand-block {
+    min-width: 0;
+  }
+
+  h1 {
+    font-size: 27px;
   }
 
   .swing-summary {
@@ -1025,21 +1042,160 @@ h2 {
     width: 100%;
   }
 
+  .asset-button {
+    min-height: 40px;
+  }
+
+  .chart-toolbar {
+    gap: 12px;
+    padding: 14px 16px;
+  }
+
+  .symbol-block {
+    width: 100%;
+    gap: 10px;
+  }
+
+  .symbol {
+    font-size: 20px;
+  }
+
+  .price {
+    font-size: 19px;
+  }
+
   .controls {
-    justify-content: flex-start;
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+  }
+
+  .segmented-control,
+  .chart-navigation {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .segmented-control {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .chart-navigation {
+    display: grid;
+    grid-template-columns: repeat(4, 42px) minmax(0, 1fr);
+  }
+
+  .chart-nav-button,
+  .control-button {
+    min-height: 40px;
+  }
+
+  .chart-nav-button {
+    min-width: 42px;
+    padding: 0;
+  }
+
+  .live-view-button {
+    min-width: 0;
+  }
+
+  .graph-refresh-button {
+    min-width: 0;
+  }
+
+  .chart-window-label {
+    display: none;
+  }
+
+  .chart-options {
+    flex-wrap: nowrap;
+    gap: 12px;
+    padding: 9px 16px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  .chart-options::-webkit-scrollbar {
+    display: none;
+  }
+
+  .chart-options label {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .chart-canvas-wrap {
+    height: clamp(400px, 58svh, 520px);
+    min-height: 0;
+  }
+
+  .insights-grid {
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .insight-tile {
+    min-height: 0;
+    padding: 14px;
+  }
+
+  .insight-tile .section-heading {
+    margin-bottom: 12px;
+  }
+
+  .general-trend-grid,
+  .journal-grid,
+  .diagnostic-list,
+  .sentiment-history,
+  .insight-tile .alert-log {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .insight-tile .alert-log {
+    max-height: 300px;
+  }
+
+  .panel-block {
+    padding: 16px;
+  }
+
+  .compare-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .trade-plan dd {
+    max-width: 62%;
+  }
+
+  .journal-band,
+  .lower-band,
+  .disclaimer {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .journal-table-wrap {
+    margin-right: -16px;
+    border-right: 0;
   }
 
   .trend-grid,
-  .journal-grid,
   .metrics {
     grid-template-columns: 1fr;
   }
 
   .insights-grid,
-  .sentiment-history,
-  .diagnostic-list,
-  .insight-tile .alert-log {
+  .insight-tile .trend-grid {
     grid-template-columns: 1fr;
+  }
+
+  .insight-tile .general-trend-grid,
+  .insight-tile .journal-grid,
+  .insight-tile .diagnostic-list,
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .insight-wide,

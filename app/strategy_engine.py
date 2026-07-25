@@ -359,6 +359,29 @@ def setup_type(setup):
   return "other"
 
 
+def trend_confirmation(trends, timeframe, direction):
+  """Return aligned and opposing trend counts without double-counting a timeframe."""
+  tone = "positive" if direction == "long" else "negative"
+  opposing_tone = "negative" if tone == "positive" else "positive"
+  timeframes = (1, 5, 15) if timeframe == 1 else (5, 15)
+  selected = [trends.get(item, {"tone": "neutral"}).get("tone") for item in timeframes]
+  return {
+    "aligned": sum(value == tone for value in selected),
+    "opposed": sum(value == opposing_tone for value in selected),
+    "available": len(selected),
+  }
+
+
+def atr_extension(latest, direction):
+  """Measure how far price has already moved away from EMA 20 in ATR units."""
+  atr = latest.get("atr") or 0
+  ema20 = latest.get("ema20")
+  if atr <= 0 or ema20 is None:
+    return 0
+  move = latest["close"] - ema20 if direction == "long" else ema20 - latest["close"]
+  return move / atr
+
+
 def adaptive_adjustment(kind, timeframe, phase, performance, reasons):
   adjustment = 0
   groups = (
@@ -394,6 +417,10 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   phase = market_phase(latest["time"], symbol)
   tone = "positive" if long else "negative"
   regime = context.get("regime") or {"label": "Mixed", "type": "mixed"}
+  kind = setup_type(candidate["setup"])
+  confirmation = trend_confirmation(context["trends"], timeframe, direction)
+  extension = atr_extension(latest, direction)
+  continuation = kind in {"momentum", "breakout", "breakdown", "ema_pullback"}
 
   if (regime["type"] == "trend_up" and not long) or (regime["type"] == "trend_down" and long):
     score -= 16
@@ -404,6 +431,15 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   if setup_type(candidate["setup"]) in {"reversal", "vwap"} and regime["type"] in {"range", "mixed"}:
     score += 5
     reasons.append(f"{regime['label']} regime can favor tactical reversion setups")
+  if continuation and confirmation["aligned"] < 2:
+    score -= 18
+    reasons.append("Higher-timeframe momentum is not sufficiently aligned")
+  elif continuation and confirmation["opposed"]:
+    score -= 12
+    reasons.append("A monitored timeframe opposes the setup direction")
+  if continuation and extension > 1.35:
+    score -= 20
+    reasons.append(f"Price is already {extension:.1f} ATR beyond EMA 20; avoid chasing")
 
   checks = (
     (context["selectedTrend"]["tone"] == tone, 16, f"{timeframe}m trend agrees"),
@@ -459,7 +495,6 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   elif risk_reward < 1.05:
     score -= 8
     reasons.append("Reward/risk is marginal")
-  kind = setup_type(candidate["setup"])
   score += adaptive_adjustment(kind, timeframe, phase, performance, reasons)
   normalized_score = int(clamp(round(50 + (score - 50) * 0.68), 0, 95))
   exit_rules = [
@@ -479,7 +514,7 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
     "target": target,
     "target2": target2,
     "riskReward": risk_reward,
-    "watchOnly": structural_risk_too_wide or risk_reward < 0.85,
+    "watchOnly": structural_risk_too_wide or risk_reward < 0.85 or (continuation and extension > 1.8),
     "marketPhase": phase,
     "exitWarning": f"For {direction}: scale at T1, trail {'below' if long else 'above'} EMA 20/VWAP",
     "exitRules": exit_rules,
@@ -558,6 +593,8 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
   reasons = list(candidate["reasons"])
   score = candidate["baseScore"]
   shape = candle_shape(latest)
+  kind = setup_type(candidate["setup"])
+  extension = atr_extension(latest, candidate["direction"])
   ema20_rising = latest["ema20"] > prior_week["ema20"]
   five_day_return = latest["close"] / prior_week["close"] - 1
   twenty_day_return = latest["close"] / prior_month["close"] - 1
@@ -576,6 +613,9 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     if condition:
       score += points
       reasons.append(reason)
+  if kind in {"momentum", "breakout", "breakdown", "ema_pullback"} and extension > 1.75:
+    score -= 8
+    reasons.append(f"Daily close is already {extension:.1f} ATR beyond EMA 20; wait for a better location")
 
   buffer = max(0.05, latest["atr"] * 0.08)
   if long:
@@ -609,7 +649,6 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     score -= 18
     reasons.append("Swing reward/risk is below 1R")
 
-  kind = setup_type(candidate["setup"])
   score += adaptive_adjustment(kind, DAILY_TIMEFRAME, "swing", performance, reasons)
   normalized_score = int(clamp(round(50 + (score - 50) * 0.68), 0, 95))
   return {
@@ -624,7 +663,7 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     "target": target,
     "target2": target2,
     "riskReward": risk_reward,
-    "watchOnly": structural_risk_too_wide or risk_reward < 1,
+    "watchOnly": structural_risk_too_wide or risk_reward < 1 or (kind in {"momentum", "breakout", "breakdown", "ema_pullback"} and extension > 5.5),
     "marketPhase": "swing",
     "holdingPeriod": "multi-day swing",
     "exitWarning": f"For {'long' if long else 'short'} swing: reduce at T1 and trail against daily EMA 20",
@@ -780,23 +819,27 @@ def build_intraday_signal(selected, timeframe, trends, regime, session, settings
   if not levels:
     return neutral("Recent support and resistance are unavailable.", timeframe, trend_context)
   shape = candle_shape(latest)
-  bullish_context = trends[5]["tone"] == "positive" or trends[15]["tone"] == "positive"
-  bearish_context = trends[5]["tone"] == "negative" or trends[15]["tone"] == "negative"
+  long_confirmation = trend_confirmation(trends, timeframe, "long")
+  short_confirmation = trend_confirmation(trends, timeframe, "short")
+  bullish_context = long_confirmation["aligned"] >= 1
+  bearish_context = short_confirmation["aligned"] >= 1
+  bullish_continuation = long_confirmation["aligned"] >= 2
+  bearish_continuation = short_confirmation["aligned"] >= 2
   near_support = latest["low"] <= levels["support"] + latest["atr"] * 0.45
   near_resistance = latest["high"] >= levels["resistance"] - latest["atr"] * 0.45
   reclaim_vwap = previous.get("vwap") is not None and previous["close"] <= previous["vwap"] and latest["close"] > latest["vwap"]
   lose_vwap = previous.get("vwap") is not None and previous["close"] >= previous["vwap"] and latest["close"] < latest["vwap"]
   conditions = (
-    (bullish_context and latest["close"] > latest["vwap"] and latest["low"] <= latest["ema20"] < latest["close"], "long", "EMA 20 pullback", 24, "Pullback held the EMA 20/VWAP area"),
-    (latest["close"] > levels["resistance"] and bullish_context, "long", "breakout", 28, "Price broke above recent resistance"),
+    (bullish_continuation and latest["close"] > latest["vwap"] and latest["low"] <= latest["ema20"] < latest["close"], "long", "EMA 20 pullback", 24, "Pullback held the EMA 20/VWAP area"),
+    (latest["close"] > levels["resistance"] and bullish_continuation, "long", "breakout", 28, "Price broke above recent resistance with multi-timeframe confirmation"),
     (reclaim_vwap and latest["close"] > latest["ema20"], "long", "VWAP reclaim", 20, "Price reclaimed VWAP and closed above EMA 20"),
     (near_support and shape["lowerWickPct"] >= 0.35 and latest["close"] > previous["high"] and latest["rsi"] > previous["rsi"], "long", "support reversal", 18, "Price rejected support with improving RSI"),
-    (bullish_context and trends[timeframe]["tone"] == "positive" and latest["close"] > latest["ema20"] and 50 <= latest["rsi"] <= 78, "long", "momentum continuation", 18, "Current momentum is aligned for a small upside continuation"),
-    (bearish_context and latest["close"] < latest["vwap"] and latest["high"] >= latest["ema20"] > latest["close"], "short", "EMA 20 pullback", 24, "Pullback rejected the EMA 20/VWAP area"),
-    (latest["close"] < levels["support"] and bearish_context, "short", "breakdown", 28, "Price broke below recent support"),
+    (bullish_continuation and trends[timeframe]["tone"] == "positive" and latest["close"] > latest["ema20"] and 50 <= latest["rsi"] <= 78, "long", "momentum continuation", 18, "Current momentum is aligned across timeframes for a small upside continuation"),
+    (bearish_continuation and latest["close"] < latest["vwap"] and latest["high"] >= latest["ema20"] > latest["close"], "short", "EMA 20 pullback", 24, "Pullback rejected the EMA 20/VWAP area"),
+    (latest["close"] < levels["support"] and bearish_continuation, "short", "breakdown", 28, "Price broke below recent support with multi-timeframe confirmation"),
     (lose_vwap and latest["close"] < latest["ema20"], "short", "VWAP loss", 20, "Price lost VWAP and closed below EMA 20"),
     (near_resistance and shape["upperWickPct"] >= 0.35 and latest["close"] < previous["low"] and latest["rsi"] < previous["rsi"], "short", "resistance reversal", 18, "Price rejected resistance with weakening RSI"),
-    (bearish_context and trends[timeframe]["tone"] == "negative" and latest["close"] < latest["ema20"] and 18 <= latest["rsi"] <= 50, "short", "momentum continuation", 18, "Current momentum is aligned for a small downside continuation"),
+    (bearish_continuation and trends[timeframe]["tone"] == "negative" and latest["close"] < latest["ema20"] and 18 <= latest["rsi"] <= 50, "short", "momentum continuation", 18, "Current momentum is aligned across timeframes for a small downside continuation"),
   )
   candidates = []
   for enabled, direction, name, base_score, reason in conditions:
@@ -813,6 +856,7 @@ def build_intraday_signal(selected, timeframe, trends, regime, session, settings
       "trend5": trends[5],
       "trend15": trends[15],
       "selectedTrend": trends[timeframe],
+      "trends": trends,
       "regime": regime,
       "session": session,
     }
