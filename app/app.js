@@ -8,6 +8,7 @@ const SETTINGS_KEY = `trader-helper-settings:${API_SYMBOL}`;
 const STRATEGY_VERSION = "5.1.0";
 const ALERT_TIMEFRAMES = [1, 5, 15, 1440];
 const DAILY_TIMEFRAME = 1440;
+const OPTIONS_ALERT_STORAGE_KEY = `trader-helper-options-alert:${API_SYMBOL}`;
 
 const state = {
   candles: [],
@@ -47,6 +48,8 @@ const state = {
   serverOwnsSignals: false,
   analysisEngine: "unavailable",
   serverRecommendations: null,
+  optionsOpportunity: null,
+  lastOptionsAlertKey: "",
   journalRecent: [],
   journalStats: null,
   replayStats: null,
@@ -149,6 +152,19 @@ const els = {
   bestSwingTarget2Label: document.getElementById("bestSwingTarget2Label"),
   bestSwingTarget2: document.getElementById("bestSwingTarget2"),
   bestSwingView: document.getElementById("bestSwingView"),
+  optionsOpportunity: document.getElementById("optionsOpportunity"),
+  optionsBadge: document.getElementById("optionsBadge"),
+  optionsDataStatus: document.getElementById("optionsDataStatus"),
+  optionsScore: document.getElementById("optionsScore"),
+  optionsDetail: document.getElementById("optionsDetail"),
+  optionsProjection: document.getElementById("optionsProjection"),
+  optionsContract: document.getElementById("optionsContract"),
+  optionsExpiration: document.getElementById("optionsExpiration"),
+  optionsDelta: document.getElementById("optionsDelta"),
+  optionsCost: document.getElementById("optionsCost"),
+  optionsEntry: document.getElementById("optionsEntry"),
+  optionsStop: document.getElementById("optionsStop"),
+  optionsTargets: document.getElementById("optionsTargets"),
   confidenceScore: document.getElementById("confidenceScore"),
   calibrationBadge: document.getElementById("calibrationBadge"),
   calibrationProbability: document.getElementById("calibrationProbability"),
@@ -2734,6 +2750,84 @@ function renderBestSwing(analysis) {
   els.bestSwingRationale.textContent = `Daily EMA 20/50, SMA 150, RSI, volume, and 5/20-day momentum determine whether this setup qualifies and how it scores. Target 1 at $${fmt(candidate.target)} projects a ${fmt(Math.abs(target1Pct), 2)}% ${long ? "rise" : "decline"} from entry; its distance uses at least ${fmt(minTargetPct, 2)}% or 1.2 times the structure-based risk, capped near ${fmt(maxTargetPct, 2)}%. Target 2 extends the move toward $${fmt(candidate.target2)}, capped near ${fmt(maxTarget2Pct, 2)}%. These are model projections, not guaranteed prices.`;
 }
 
+function optionsDate(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp)) return "--";
+  return new Date(timestamp).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+}
+
+function renderOptionsOpportunity() {
+  const opportunity = state.optionsOpportunity;
+  if (API_SYMBOL !== "QQQ" || !opportunity || opportunity.status === "none") {
+    els.optionsOpportunity.hidden = true;
+    return;
+  }
+  els.optionsOpportunity.hidden = false;
+  const side = String(opportunity.sideLabel || opportunity.side || "").toUpperCase();
+  const long = side === "CALL";
+  const contract = opportunity.contract;
+  const underlying = opportunity.underlying || {};
+  const dte = opportunity.dte || {};
+  const delta = opportunity.delta || {};
+  const provider = opportunity.provider || {};
+
+  els.optionsBadge.textContent = `${side} ${timeframeLabel(Number(opportunity.timeframe))}`;
+  setTone(els.optionsBadge, long ? "positive" : "negative");
+  els.optionsDataStatus.textContent = contract
+    ? (provider.delayed ? "Delayed contract" : "Contract")
+    : "Strike / DTE guidance";
+  els.optionsDataStatus.classList.toggle("delayed", Boolean(provider.delayed));
+  els.optionsScore.textContent = `${Number(opportunity.score || 0)}/100`;
+  els.optionsDetail.textContent = opportunity.detail || `${side} momentum opportunity.`;
+
+  if (contract) {
+    const expiration = optionsDate(contract.expiration);
+    els.optionsContract.textContent = contract.optionSymbol || `${side} $${fmt(Number(contract.strike))}`;
+    els.optionsExpiration.textContent = `${expiration} (${Number(contract.dte)} DTE)`;
+    els.optionsDelta.textContent = fmt(Math.abs(Number(contract.delta)), 2);
+    els.optionsCost.textContent = `$${fmt(Number(contract.mid))} / $${fmt(Number(contract.costPerContract), 0)}`;
+    const scenarios = contract.scenarios;
+    els.optionsProjection.textContent = scenarios
+      ? `At QQQ T1 $${fmt(Number(underlying.target1))}, estimated option mid is $${fmt(Number(scenarios.target1.estimatedOptionMid))} (${fmt(Number(scenarios.target1.estimatedReturnPct), 1)}%). At QQQ T2 $${fmt(Number(underlying.target2))}, the estimate is $${fmt(Number(scenarios.target2.estimatedOptionMid))}. ${scenarios.method}`
+      : "Option value scenarios are unavailable for this quote; use the QQQ invalidation and targets.";
+  } else {
+    els.optionsContract.textContent = `${opportunity.strikeGuidance?.label || "ATM to 1% ITM"} $${fmt(Number(opportunity.strikeGuidance?.min))}-$${fmt(Number(opportunity.strikeGuidance?.max))}`;
+    els.optionsExpiration.textContent = `${dte.min}-${dte.max} DTE; target ${dte.target}`;
+    els.optionsDelta.textContent = `${fmt(Number(delta.min), 2)}-${fmt(Number(delta.max), 2)}; target ${fmt(Number(delta.target), 2)}`;
+    els.optionsCost.textContent = "Broker quote required";
+    els.optionsProjection.textContent = `QQQ target 1 is $${fmt(Number(underlying.target1))} and target 2 is $${fmt(Number(underlying.target2))}. Exact option-price estimates require a qualifying contract quote and Greeks.`;
+  }
+  els.optionsEntry.textContent = `$${fmt(Number(underlying.entry))}`;
+  els.optionsStop.textContent = `$${fmt(Number(underlying.stop))}`;
+  els.optionsTargets.textContent = `$${fmt(Number(underlying.target1))} / $${fmt(Number(underlying.target2))}`;
+}
+
+function maybeOptionsAlert() {
+  const opportunity = state.optionsOpportunity;
+  if (!opportunity || opportunity.status === "none" || !opportunity.signalKey) return;
+  if (opportunity.signalKey === state.lastOptionsAlertKey) return;
+  state.lastOptionsAlertKey = opportunity.signalKey;
+  try {
+    window.sessionStorage.setItem(OPTIONS_ALERT_STORAGE_KEY, opportunity.signalKey);
+  } catch (error) {
+    console.info("Options alert key could not be stored.", error);
+  }
+  const contract = opportunity.contract;
+  const contractText = contract
+    ? `${contract.optionSymbol} near $${fmt(Number(contract.mid))}`
+    : `${opportunity.strikeGuidance?.label || "ATM to 1% ITM"}, ${opportunity.dte?.min}-${opportunity.dte?.max} DTE`;
+  const item = {
+    time: new Date(),
+    text: `${opportunity.sideLabel} options candidate ${opportunity.score}/100: ${contractText}. QQQ invalidation ${fmt(Number(opportunity.underlying?.stop))}, targets ${fmt(Number(opportunity.underlying?.target1))} / ${fmt(Number(opportunity.underlying?.target2))}.`,
+  };
+  state.alerts.unshift(item);
+  state.alerts = state.alerts.slice(0, 25);
+  renderAlertLog();
+  if (state.notifyEnabled && Notification.permission === "granted") {
+    new Notification("QQQ Options Opportunity", { body: item.text });
+  }
+}
+
 function renderLifecycle(signal, confirmed) {
   const activePlanId = state.activePlanIds[state.selectedTimeframe] || "";
   const journalPlan = state.journalRecent.find((row) => row.id === activePlanId);
@@ -3140,8 +3234,12 @@ function analyzeTimeframe(timeframe) {
 
 function applyServerRecommendations(payload) {
   const recommendations = payload?.recommendations;
-  if (!recommendations || typeof recommendations !== "object") return;
-  state.serverRecommendations = recommendations;
+  if (recommendations && typeof recommendations === "object") {
+    state.serverRecommendations = recommendations;
+  }
+  if (payload?.optionsOpportunity && typeof payload.optionsOpportunity === "object") {
+    state.optionsOpportunity = payload.optionsOpportunity;
+  }
 }
 
 function selectTimeframe(timeframe) {
@@ -3172,6 +3270,8 @@ function refresh() {
   render(signal, chartIndicators);
   renderBestOpportunity(bestOpportunity);
   renderBestSwing(swingAnalysis);
+  renderOptionsOpportunity();
+  maybeOptionsAlert();
   analyses.forEach((analysis) => {
     const latest = analysis.indicators[analysis.indicators.length - 1];
     if (!latest) return;
@@ -3343,6 +3443,11 @@ function initializeAssetPage() {
   els.chartSymbol.textContent = API_SYMBOL;
   els.canvas.setAttribute("aria-label", `${API_SYMBOL} candlestick, volume, and RSI chart`);
   els.fearGreedTitle.textContent = ASSET_OPTIONS.continuous ? "CNN US Market Context" : "CNN Fear & Greed";
+  try {
+    state.lastOptionsAlertKey = window.sessionStorage.getItem(OPTIONS_ALERT_STORAGE_KEY) || "";
+  } catch (error) {
+    state.lastOptionsAlertKey = "";
+  }
   if (ASSET_OPTIONS.continuous) {
     [...els.sessionMode.options].forEach((option) => {
       option.textContent = "All hours (24/7)";
@@ -3437,6 +3542,10 @@ async function startRealFeed(config) {
   });
   state.stream.addEventListener("recommendations", (event) => {
     applyServerRecommendations(JSON.parse(event.data || "{}"));
+    refresh();
+  });
+  state.stream.addEventListener("options_opportunity", (event) => {
+    state.optionsOpportunity = JSON.parse(event.data || "{}");
     refresh();
   });
   state.stream.addEventListener("error", () => {

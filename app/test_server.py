@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -17,6 +18,29 @@ def candle(time, open_price, high, low, close, volume=100):
     "low": low,
     "close": close,
     "volume": volume,
+  }
+
+
+def option_signal(direction="long", timeframe=5):
+  long = direction == "long"
+  return {
+    "timeframe": timeframe,
+    "direction": direction,
+    "watchOnly": False,
+    "score": 88,
+    "setup": "Momentum continuation",
+    "setupType": "momentum",
+    "dataQuality": "clean",
+    "riskReward": 1.5,
+    "entry": 600,
+    "stop": 598 if long else 602,
+    "target": 603 if long else 597,
+    "target2": 605 if long else 595,
+    "signalCandleTime": 1_780_000_000_000,
+    "actionableAt": 1_780_000_300_000,
+    "trend5": {"tone": "positive" if long else "negative"},
+    "trend15": {"tone": "positive" if long else "negative"},
+    "regime": {"type": "trend_up" if long else "trend_down"},
   }
 
 
@@ -299,6 +323,167 @@ class ServerTests(unittest.TestCase):
     row = self.fetch_plan("expired")
     self.assertEqual(row["outcome_status"], "expired")
     self.assertEqual(row["lifecycle_status"], "expired")
+
+  def test_option_idea_persists_and_requires_fresh_exit_quote_for_learning(self):
+    quote_start = 1_780_000_000_000
+    quote_exit = quote_start + 60_000
+    self.insert_plan(
+      "option-plan",
+      timeframe=5,
+      lifecycle_status="closed",
+      outcome_status="target2",
+      closed_at=quote_exit,
+    )
+    opportunity = {
+      "status": "contract",
+      "symbol": "QQQ",
+      "signalKey": "option-signal",
+      "generatedAt": quote_start,
+      "planId": "option-plan",
+      "timeframe": 5,
+      "direction": "long",
+      "side": "call",
+      "score": 88,
+      "provider": {"name": "Market Data"},
+      "underlying": {"entry": 100, "stop": 99, "target1": 101, "target2": 102},
+      "contract": {
+        "optionSymbol": "QQQ260807C00100000",
+        "expiration": 1_786_061_600_000,
+        "strike": 100,
+        "dte": 10,
+        "bid": 2.0,
+        "ask": 2.2,
+        "mid": 2.1,
+        "quoteAt": quote_start,
+        "volume": 500,
+        "openInterest": 2000,
+        "iv": 0.2,
+        "delta": 0.62,
+        "gamma": 0.03,
+        "theta": -0.05,
+        "vega": 0.2,
+        "deltaBucket": "0.60-0.65",
+      },
+    }
+    with server.db() as connection:
+      idea_id = server.persist_options_opportunity(connection, opportunity)
+      connection.execute("""
+        INSERT INTO option_quote_observations (
+          idea_id, observed_at, quote_at, bid, ask, mid, volume, open_interest,
+          iv, delta, gamma, theta, vega
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      """, (idea_id, quote_exit, quote_exit, 2.8, 3.0, 2.9, 700, 2200, 0.21, 0.64, 0.03, -0.04, 0.2))
+      self.assertEqual(server.resolve_option_ideas(connection), 1)
+      idea = connection.execute("SELECT * FROM option_ideas WHERE id = ?", (idea_id,)).fetchone()
+    self.assertEqual(idea["eligible_for_learning"], 1)
+    self.assertAlmostEqual(idea["realized_return"], (2.9 - 2.1) / 2.1)
+
+  def test_options_provider_credit_ceiling_is_persistent(self):
+    with server.db() as connection:
+      connection.execute("""
+        INSERT INTO options_provider_usage (usage_day, credits, updated_at)
+        VALUES (?, ?, ?)
+      """, (server.options_usage_day(), 78, server.now_ms()))
+    reserved, used = server.reserve_options_provider_credits(4)
+    self.assertFalse(reserved)
+    self.assertEqual(used, 78)
+
+  def test_options_chain_is_cached_before_spending_more_credits(self):
+    guidance = server.options_engine.build_guidance(
+      5,
+      option_signal(),
+      generated_at=1_780_000_300_000,
+    )
+    guidance["signalKey"] = "cache-test-signal"
+    payload = {
+      "s": "ok",
+      "optionSymbol": ["QQQ260807C00600000"],
+      "side": ["call"],
+      "strike": [600],
+    }
+    with server.FETCH_CACHE_LOCK:
+      server.FETCH_CACHE.pop(("options-chain", guidance["signalKey"]), None)
+    with patch.object(server, "marketdata_get", return_value=payload) as request:
+      first, first_cached, first_error = server.fetch_options_chain(guidance, 1_780_000_300_000)
+      second, second_cached, second_error = server.fetch_options_chain(guidance, 1_780_000_300_000)
+    with server.db() as connection:
+      credits = server.options_provider_usage(connection, 1_780_000_300_000)
+    self.assertEqual(first, second)
+    self.assertFalse(first_cached)
+    self.assertTrue(second_cached)
+    self.assertIsNone(first_error)
+    self.assertIsNone(second_error)
+    self.assertEqual(request.call_count, 1)
+    self.assertEqual(credits, server.OPTIONS_PROVIDER_REQUEST_CREDITS)
+
+  def test_marketdata_get_accepts_delayed_http_203(self):
+    class Response:
+      status = 203
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *_args):
+        return False
+
+      def read(self):
+        return b'{"s":"ok","optionSymbol":[]}'
+
+    old_token = server.MARKETDATA_TOKEN
+    server.MARKETDATA_TOKEN = "test-token"
+    try:
+      with patch.object(server, "urlopen", return_value=Response()):
+        payload = server.marketdata_get("/v1/options/chain/QQQ/")
+    finally:
+      server.MARKETDATA_TOKEN = old_token
+    self.assertEqual(payload["s"], "ok")
+
+  def test_option_entry_quote_cannot_be_reused_as_exit_quote(self):
+    quote_start = 1_780_000_000_000
+    self.insert_plan(
+      "same-option-quote",
+      timeframe=5,
+      lifecycle_status="closed",
+      outcome_status="stopped",
+      closed_at=quote_start + 60_000,
+    )
+    opportunity = {
+      "status": "contract",
+      "symbol": "QQQ",
+      "signalKey": "same-option-signal",
+      "generatedAt": quote_start,
+      "planId": "same-option-quote",
+      "timeframe": 5,
+      "direction": "long",
+      "side": "call",
+      "score": 85,
+      "provider": {"name": "Market Data"},
+      "underlying": {"entry": 100, "stop": 99, "target1": 101, "target2": 102},
+      "contract": {
+        "optionSymbol": "QQQ260807C00100000",
+        "expiration": 1_786_061_600_000,
+        "strike": 100,
+        "dte": 10,
+        "bid": 2.0,
+        "ask": 2.2,
+        "mid": 2.1,
+        "quoteAt": quote_start,
+        "volume": 500,
+        "openInterest": 2000,
+        "iv": 0.2,
+        "delta": 0.62,
+        "gamma": 0.03,
+        "theta": -0.05,
+        "vega": 0.2,
+        "deltaBucket": "0.60-0.65",
+      },
+    }
+    with server.db() as connection:
+      idea_id = server.persist_options_opportunity(connection, opportunity)
+      server.resolve_option_ideas(connection)
+      idea = connection.execute("SELECT * FROM option_ideas WHERE id = ?", (idea_id,)).fetchone()
+    self.assertEqual(idea["eligible_for_learning"], 0)
+    self.assertIsNone(idea["realized_return"])
 
   def test_non_health_routes_require_configured_basic_auth(self):
     server.APP_PASSWORD = "test-secret"

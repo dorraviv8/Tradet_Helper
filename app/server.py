@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import strategy_engine
 import backtest_engine
 import ibkr_provider
+import options_engine
 
 
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -41,6 +42,8 @@ YAHOO_BASE = os.environ.get("YAHOO_BASE_URL", "https://query2.finance.yahoo.com"
 YAHOO_FALLBACK_BASE = os.environ.get("YAHOO_FALLBACK_BASE_URL", "https://query1.finance.yahoo.com")
 CNN_FEAR_GREED_PAGE = "https://edition.cnn.com/markets/fear-and-greed"
 CNN_FEAR_GREED_API = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+MARKETDATA_TOKEN = os.environ.get("MARKETDATA_TOKEN", "")
+MARKETDATA_BASE = os.environ.get("MARKETDATA_BASE_URL", "https://api.marketdata.app")
 IBKR_HOST = os.environ.get("IBKR_HOST", "127.0.0.1")
 IBKR_PORT = int(os.environ.get("IBKR_PORT", "7496"))
 IBKR_CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "17"))
@@ -65,6 +68,9 @@ STATIC_FILES = {
 MINUTE_MS = 60_000
 DAILY_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 SENTIMENT_CACHE_TTL_SECONDS = 5 * 60
+OPTIONS_CACHE_TTL_SECONDS = 30 * 60
+OPTIONS_PROVIDER_DAILY_LIMIT = 80
+OPTIONS_PROVIDER_REQUEST_CREDITS = 4
 FETCH_CACHE = {}
 FETCH_CACHE_LOCK = threading.Lock()
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
@@ -81,6 +87,8 @@ def new_market_runtime():
     "last_error": None,
     "recommendations": {},
     "recommendations_at": None,
+    "options_opportunity": options_engine.none_opportunity(),
+    "options_opportunity_at": None,
     "backtest": None,
     "backtest_status": "not_started",
     "backtest_error": None,
@@ -280,6 +288,73 @@ def init_db():
         PRIMARY KEY (symbol, strategy_version)
       )
     """)
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS option_ideas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_key TEXT NOT NULL UNIQUE,
+        plan_id TEXT,
+        symbol TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        timeframe INTEGER NOT NULL,
+        direction TEXT NOT NULL,
+        side TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        provider TEXT,
+        contract_symbol TEXT,
+        expiration INTEGER,
+        strike REAL,
+        dte INTEGER,
+        entry_bid REAL,
+        entry_ask REAL,
+        entry_mid REAL,
+        entry_quote_at INTEGER,
+        delta REAL,
+        delta_bucket TEXT,
+        underlying_entry REAL,
+        underlying_stop REAL,
+        underlying_target1 REAL,
+        underlying_target2 REAL,
+        underlying_outcome TEXT,
+        exit_mid REAL,
+        exit_quote_at INTEGER,
+        realized_return REAL,
+        eligible_for_learning INTEGER NOT NULL DEFAULT 0,
+        resolved_at INTEGER,
+        payload_json TEXT NOT NULL,
+        FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE SET NULL
+      )
+    """)
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS option_quote_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        idea_id INTEGER NOT NULL,
+        observed_at INTEGER NOT NULL,
+        quote_at INTEGER,
+        bid REAL,
+        ask REAL,
+        mid REAL,
+        volume INTEGER,
+        open_interest INTEGER,
+        iv REAL,
+        delta REAL,
+        gamma REAL,
+        theta REAL,
+        vega REAL,
+        FOREIGN KEY (idea_id) REFERENCES option_ideas(id) ON DELETE CASCADE
+      )
+    """)
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS options_provider_usage (
+        usage_day TEXT PRIMARY KEY,
+        credits INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_option_ideas_plan ON option_ideas(plan_id, resolved_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_option_ideas_learning ON option_ideas(eligible_for_learning, delta_bucket)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_option_quotes_idea_time ON option_quote_observations(idea_id, observed_at DESC)")
     connection.execute("""
       UPDATE plans
       SET eligible_for_learning = 0
@@ -753,6 +828,7 @@ def record_market_candles(symbol, provider, candles):
     if closed:
       save_candles(connection, symbol, provider, closed, is_closed=1)
       evaluate_plans(connection, symbol, closed)
+      resolve_option_ideas(connection)
     if forming:
       save_candles(connection, symbol, provider, forming, is_closed=0)
   return len(normalized)
@@ -1196,12 +1272,336 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
   return plan_id
 
 
+def realized_volatility(candles, periods=20):
+  closes = [
+    finite_number(candle.get("close"))
+    for candle in (candles or [])[-(periods + 1):]
+  ]
+  closes = [value for value in closes if value and value > 0]
+  if len(closes) < periods:
+    return None
+  returns = [math.log(closes[index] / closes[index - 1]) for index in range(1, len(closes))]
+  if len(returns) < 2:
+    return None
+  mean = sum(returns) / len(returns)
+  variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+  return math.sqrt(variance) * math.sqrt(252)
+
+
+def options_usage_day(timestamp=None):
+  moment = datetime.fromtimestamp((timestamp or now_ms()) / 1000, tz=MARKET_TIME_ZONE)
+  return moment.date().isoformat()
+
+
+def options_provider_usage(connection, timestamp=None):
+  row = connection.execute(
+    "SELECT credits FROM options_provider_usage WHERE usage_day = ?",
+    (options_usage_day(timestamp),),
+  ).fetchone()
+  return int(row["credits"] or 0) if row else 0
+
+
+def reserve_options_provider_credits(credits, timestamp=None):
+  credits = max(1, int(credits))
+  usage_day = options_usage_day(timestamp)
+  with db() as connection:
+    used = options_provider_usage(connection, timestamp)
+    if used + credits > OPTIONS_PROVIDER_DAILY_LIMIT:
+      return False, used
+    total = used + credits
+    connection.execute("""
+      INSERT INTO options_provider_usage (usage_day, credits, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(usage_day) DO UPDATE SET
+        credits = excluded.credits,
+        updated_at = excluded.updated_at
+    """, (usage_day, total, now_ms()))
+  return True, total
+
+
+def marketdata_get(path, params=None):
+  if not MARKETDATA_TOKEN:
+    raise RuntimeError("MARKETDATA_TOKEN is not set")
+  query = urlencode(params or {})
+  url = f"{MARKETDATA_BASE}{path}"
+  if query:
+    url = f"{url}?{query}"
+  request = Request(url, headers={
+    "Accept": "application/json",
+    "Authorization": f"Bearer {MARKETDATA_TOKEN}",
+    "User-Agent": "qqq-alert-helper/3.0",
+  })
+  with urlopen(request, timeout=12) as response:
+    if response.status not in {200, 203}:
+      raise RuntimeError(f"Market Data returned HTTP {response.status}")
+    payload = json.loads(response.read().decode("utf-8"))
+  if not isinstance(payload, dict) or payload.get("s") not in {"ok", "success"}:
+    raise ValueError(str((payload or {}).get("errmsg") or "Market Data returned no option chain"))
+  return payload
+
+
+def fetch_options_chain(guidance, timestamp=None):
+  cache_key = ("options-chain", guidance["signalKey"])
+  current = time.time()
+  with FETCH_CACHE_LOCK:
+    cached = FETCH_CACHE.get(cache_key)
+    if cached and current - cached["time"] < OPTIONS_CACHE_TTL_SECONDS:
+      return cached["value"], True, None
+
+  reserved, usage = reserve_options_provider_credits(OPTIONS_PROVIDER_REQUEST_CREDITS, timestamp)
+  if not reserved:
+    return None, False, f"Daily options quote allowance reached ({usage}/{OPTIONS_PROVIDER_DAILY_LIMIT})."
+  payload = marketdata_get("/v1/options/chain/QQQ/", {
+    "dte": guidance["dte"]["target"],
+    "side": guidance["side"],
+    "delta": f"{options_engine.MIN_DELTA:.2f}-{options_engine.MAX_DELTA:.2f}",
+    "strikeLimit": OPTIONS_PROVIDER_REQUEST_CREDITS,
+    "minBid": "0.01",
+    "minOpenInterest": options_engine.MIN_OPEN_INTEREST,
+    "minVolume": options_engine.MIN_VOLUME,
+    "nonstandard": "false",
+  })
+  contracts = options_engine.normalize_marketdata_chain(payload)
+  with FETCH_CACHE_LOCK:
+    FETCH_CACHE[cache_key] = {"time": current, "value": contracts}
+  return contracts, False, None
+
+
+def option_learning_profile(connection):
+  rows = connection.execute("""
+    SELECT delta_bucket,
+           COUNT(*) AS sample_size,
+           AVG(realized_return) AS average_return,
+           AVG(CASE WHEN realized_return > 0 THEN 1.0 ELSE 0.0 END) AS win_rate
+    FROM option_ideas
+    WHERE eligible_for_learning = 1
+      AND realized_return IS NOT NULL
+      AND delta_bucket IS NOT NULL
+    GROUP BY delta_bucket
+  """).fetchall()
+  return {
+    row["delta_bucket"]: {
+      "sampleSize": int(row["sample_size"] or 0),
+      "averageReturn": finite_or_none(row["average_return"]),
+      "winRate": finite_or_none(row["win_rate"]),
+    }
+    for row in rows
+  }
+
+
+def persist_options_opportunity(connection, opportunity):
+  if not isinstance(opportunity, dict) or opportunity.get("status") == "none":
+    return None
+  contract = opportunity.get("contract") or {}
+  underlying = opportunity.get("underlying") or {}
+  provider = opportunity.get("provider") or {}
+  timestamp = int(opportunity.get("generatedAt") or now_ms())
+  row = {
+    "signal_key": opportunity["signalKey"],
+    "plan_id": opportunity.get("planId"),
+    "symbol": opportunity.get("symbol", SYMBOL),
+    "created_at": timestamp,
+    "updated_at": timestamp,
+    "timeframe": int(opportunity["timeframe"]),
+    "direction": opportunity["direction"],
+    "side": opportunity["side"],
+    "score": int(opportunity.get("score") or 0),
+    "status": opportunity["status"],
+    "provider": provider.get("name"),
+    "contract_symbol": contract.get("optionSymbol"),
+    "expiration": options_engine.timestamp_ms(contract.get("expiration")),
+    "strike": finite_or_none(contract.get("strike")),
+    "dte": int(contract["dte"]) if finite_number(contract.get("dte")) is not None else None,
+    "entry_bid": finite_or_none(contract.get("bid")),
+    "entry_ask": finite_or_none(contract.get("ask")),
+    "entry_mid": finite_or_none(contract.get("mid")),
+    "entry_quote_at": options_engine.timestamp_ms(contract.get("quoteAt") or contract.get("updated")),
+    "delta": finite_or_none(contract.get("delta")),
+    "delta_bucket": contract.get("deltaBucket"),
+    "underlying_entry": finite_or_none(underlying.get("entry")),
+    "underlying_stop": finite_or_none(underlying.get("stop")),
+    "underlying_target1": finite_or_none(underlying.get("target1")),
+    "underlying_target2": finite_or_none(underlying.get("target2")),
+    "payload_json": json.dumps(opportunity, separators=(",", ":")),
+  }
+  connection.execute("""
+    INSERT INTO option_ideas (
+      signal_key, plan_id, symbol, created_at, updated_at, timeframe, direction, side, score, status,
+      provider, contract_symbol, expiration, strike, dte, entry_bid, entry_ask, entry_mid,
+      entry_quote_at, delta, delta_bucket, underlying_entry, underlying_stop,
+      underlying_target1, underlying_target2, payload_json
+    ) VALUES (
+      :signal_key, :plan_id, :symbol, :created_at, :updated_at, :timeframe, :direction, :side, :score, :status,
+      :provider, :contract_symbol, :expiration, :strike, :dte, :entry_bid, :entry_ask, :entry_mid,
+      :entry_quote_at, :delta, :delta_bucket, :underlying_entry, :underlying_stop,
+      :underlying_target1, :underlying_target2, :payload_json
+    )
+    ON CONFLICT(signal_key) DO UPDATE SET
+      plan_id = COALESCE(option_ideas.plan_id, excluded.plan_id),
+      updated_at = excluded.updated_at,
+      score = excluded.score,
+      status = excluded.status,
+      provider = excluded.provider,
+      contract_symbol = COALESCE(excluded.contract_symbol, option_ideas.contract_symbol),
+      expiration = COALESCE(excluded.expiration, option_ideas.expiration),
+      strike = COALESCE(excluded.strike, option_ideas.strike),
+      dte = COALESCE(excluded.dte, option_ideas.dte),
+      entry_bid = COALESCE(option_ideas.entry_bid, excluded.entry_bid),
+      entry_ask = COALESCE(option_ideas.entry_ask, excluded.entry_ask),
+      entry_mid = COALESCE(option_ideas.entry_mid, excluded.entry_mid),
+      entry_quote_at = COALESCE(option_ideas.entry_quote_at, excluded.entry_quote_at),
+      delta = COALESCE(excluded.delta, option_ideas.delta),
+      delta_bucket = COALESCE(excluded.delta_bucket, option_ideas.delta_bucket),
+      payload_json = excluded.payload_json
+  """, row)
+  idea = connection.execute(
+    "SELECT id FROM option_ideas WHERE signal_key = ?",
+    (row["signal_key"],),
+  ).fetchone()
+  if not idea or not contract.get("optionSymbol"):
+    return idea["id"] if idea else None
+  quote_at = row["entry_quote_at"]
+  duplicate = connection.execute("""
+    SELECT id
+    FROM option_quote_observations
+    WHERE idea_id = ? AND quote_at = ?
+    LIMIT 1
+  """, (idea["id"], quote_at)).fetchone()
+  if not duplicate:
+    connection.execute("""
+      INSERT INTO option_quote_observations (
+        idea_id, observed_at, quote_at, bid, ask, mid, volume, open_interest,
+        iv, delta, gamma, theta, vega
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+      idea["id"], timestamp, quote_at,
+      finite_or_none(contract.get("bid")), finite_or_none(contract.get("ask")),
+      finite_or_none(contract.get("mid")), int(finite_number(contract.get("volume")) or 0),
+      int(finite_number(contract.get("openInterest")) or 0), finite_or_none(contract.get("iv")),
+      finite_or_none(contract.get("delta")), finite_or_none(contract.get("gamma")),
+      finite_or_none(contract.get("theta")), finite_or_none(contract.get("vega")),
+    ))
+  return idea["id"]
+
+
+def resolve_option_ideas(connection):
+  rows = connection.execute("""
+    SELECT ideas.id, ideas.created_at, ideas.entry_mid, ideas.entry_quote_at,
+           plans.outcome_status, plans.closed_at
+    FROM option_ideas AS ideas
+    JOIN plans ON plans.id = ideas.plan_id
+    WHERE ideas.resolved_at IS NULL
+      AND ideas.status = 'contract'
+      AND plans.lifecycle_status IN ('closed', 'expired')
+  """).fetchall()
+  resolved = 0
+  for row in rows:
+    closed_at = int(row["closed_at"] or now_ms())
+    quote = connection.execute("""
+      SELECT quote_at, mid
+      FROM option_quote_observations
+      WHERE idea_id = ?
+        AND mid IS NOT NULL
+        AND COALESCE(quote_at, observed_at) > COALESCE(?, 0)
+      ORDER BY ABS(COALESCE(quote_at, observed_at) - ?) ASC
+      LIMIT 1
+    """, (row["id"], row["entry_quote_at"], closed_at)).fetchone()
+    exit_mid = finite_number(quote["mid"]) if quote else None
+    exit_quote_at = int(quote["quote_at"]) if quote and quote["quote_at"] is not None else None
+    entry_mid = finite_number(row["entry_mid"])
+    fresh_exit = (
+      exit_mid is not None
+      and exit_quote_at is not None
+      and abs(exit_quote_at - closed_at) <= options_engine.MAX_QUOTE_AGE_MS
+    )
+    entry_quote_at = int(row["entry_quote_at"]) if row["entry_quote_at"] is not None else None
+    fresh_entry = (
+      entry_mid is not None
+      and entry_mid > 0
+      and entry_quote_at is not None
+      and abs(entry_quote_at - int(row["created_at"])) <= options_engine.MAX_QUOTE_AGE_MS
+    )
+    eligible = bool(fresh_entry and fresh_exit)
+    realized_return = (exit_mid - entry_mid) / entry_mid if eligible else None
+    connection.execute("""
+      UPDATE option_ideas
+      SET underlying_outcome = ?,
+          exit_mid = ?,
+          exit_quote_at = ?,
+          realized_return = ?,
+          eligible_for_learning = ?,
+          resolved_at = ?,
+          updated_at = ?
+      WHERE id = ?
+    """, (
+      row["outcome_status"], exit_mid if fresh_exit else None, exit_quote_at if fresh_exit else None,
+      realized_return, int(eligible), closed_at, now_ms(), row["id"],
+    ))
+    resolved += 1
+  return resolved
+
+
+def build_options_opportunity(recommendations, plan_ids, runtime, timestamp=None, symbol=SYMBOL):
+  timestamp = int(timestamp or now_ms())
+  if symbol != SYMBOL:
+    return options_engine.none_opportunity(
+      "Options Opportunity is currently available for QQQ only.",
+      symbol=symbol,
+    )
+  regular_session = bool(strategy_engine.market_session(timestamp, symbol).get("regular"))
+  selected, empty = options_engine.select_underlying_signal(recommendations, regular_session)
+  if not selected:
+    return empty
+  timeframe, signal = selected
+  latest_price = finite_number((runtime.get("candle") or {}).get("close"))
+  guidance = options_engine.build_guidance(
+    timeframe,
+    signal,
+    plan_id=(plan_ids or {}).get(timeframe),
+    generated_at=timestamp,
+    underlying_price=latest_price,
+  )
+  if not MARKETDATA_TOKEN:
+    return guidance
+  guidance["provider"].update({
+    "configured": True,
+    "detail": "Exact contract selection runs during the regular QQQ session.",
+  })
+  if not regular_session:
+    return guidance
+
+  try:
+    contracts, cached, quota_detail = fetch_options_chain(guidance, timestamp)
+    if quota_detail:
+      guidance["provider"]["detail"] = quota_detail
+      return guidance
+    with db() as connection:
+      learning = option_learning_profile(connection)
+    ranked = options_engine.rank_contracts(
+      contracts,
+      guidance,
+      timestamp,
+      realized_vol=realized_volatility(runtime.get("daily_history")),
+      learning=learning,
+    )
+    if not ranked:
+      guidance["provider"]["detail"] = "No quoted contract passed the spread, liquidity, DTE, delta, and freshness gates."
+      return guidance
+    detail = "Cached delayed options quote" if cached else "15-minute delayed options quote"
+    return options_engine.attach_contract(guidance, ranked[0], detail)
+  except Exception as error:
+    guidance["provider"]["detail"] = f"Exact contract data is temporarily unavailable: {str(error)[:160]}"
+    return guidance
+
+
 def refresh_server_recommendations(provider, symbol=SYMBOL):
   runtime = market_runtime_snapshot(symbol)
   candles = merge_candle_series([*runtime["history"], *([runtime["candle"]] if runtime["candle"] else [])])
   if not candles:
     return {}
   settings = load_strategy_settings()
+  plan_ids = {}
+  generated_at = now_ms()
   with db() as connection:
     learning_snapshot = load_learning_snapshot(connection, symbol)
     performance = learning_snapshot.get("performance") or {}
@@ -1209,7 +1609,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
       candles,
       settings,
       performance,
-      now_ms(),
+      generated_at,
       five_minute_candles=runtime["five_minute_history"],
       symbol=symbol,
     )
@@ -1219,7 +1619,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
         daily,
         settings,
         performance,
-        now_ms(),
+        generated_at,
         intraday_context=recommendations.get(5),
         symbol=symbol,
       )
@@ -1228,10 +1628,19 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
     for timeframe, signal in recommendations.items():
       attach_signal_calibration(signal, replay_trades)
       attach_signal_learning_confidence(signal, learning_snapshot)
-      persist_generated_signal(connection, provider, int(timeframe), signal, settings, symbol)
+      plan_ids[int(timeframe)] = persist_generated_signal(
+        connection, provider, int(timeframe), signal, settings, symbol
+      )
+  options_opportunity = build_options_opportunity(
+    recommendations, plan_ids, runtime, generated_at, symbol
+  )
+  with db() as connection:
+    persist_options_opportunity(connection, options_opportunity)
   with MARKET_RUNTIME_LOCK:
     MARKET_RUNTIMES[symbol]["recommendations"] = recommendations
-    MARKET_RUNTIMES[symbol]["recommendations_at"] = now_ms()
+    MARKET_RUNTIMES[symbol]["recommendations_at"] = generated_at
+    MARKET_RUNTIMES[symbol]["options_opportunity"] = options_opportunity
+    MARKET_RUNTIMES[symbol]["options_opportunity_at"] = generated_at
   return recommendations
 
 
@@ -1829,6 +2238,11 @@ class Handler(SimpleHTTPRequestHandler):
         "recommendationsAt": runtime["recommendations_at"],
         "analysisEngine": "python-server",
         "backtestStatus": runtime["backtest_status"],
+        "optionsProvider": {
+          "name": "Market Data",
+          "configured": bool(MARKETDATA_TOKEN),
+          "mode": "delayed" if MARKETDATA_TOKEN else "guidance",
+        },
       })
       return
     if parsed.path == "/api/history":
@@ -1850,9 +2264,16 @@ class Handler(SimpleHTTPRequestHandler):
       self.send_json(200, {
         "generatedAt": runtime["recommendations_at"],
         "recommendations": runtime["recommendations"],
+        "optionsOpportunity": runtime["options_opportunity"],
         "analysisEngine": "python-server",
         "backtestStatus": runtime["backtest_status"],
       })
+      return
+    if parsed.path == "/api/options-opportunity":
+      params = parse_qs(parsed.query)
+      symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
+      runtime = market_runtime_snapshot(symbol)
+      self.send_json(200, runtime["options_opportunity"])
       return
     if parsed.path == "/api/backtest":
       params = parse_qs(parsed.query)
@@ -2299,6 +2720,7 @@ class Handler(SimpleHTTPRequestHandler):
     last_key = None
     last_error_count = -1
     last_recommendations_key = None
+    last_options_key = None
     while True:
       try:
         runtime = market_runtime_snapshot(symbol)
@@ -2330,7 +2752,12 @@ class Handler(SimpleHTTPRequestHandler):
           self.send_sse("recommendations", {
             "generatedAt": runtime["recommendations_at"],
             "recommendations": runtime["recommendations"],
+            "optionsOpportunity": runtime["options_opportunity"],
           })
+        options_key = json.dumps(runtime["options_opportunity"], sort_keys=True, separators=(",", ":"))
+        if options_key != last_options_key:
+          last_options_key = options_key
+          self.send_sse("options_opportunity", runtime["options_opportunity"])
       except (BrokenPipeError, ConnectionResetError):
         return
       except Exception as error:

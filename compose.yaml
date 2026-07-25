@@ -6,6 +6,7 @@ services:
       APP_USERNAME: ${APP_USERNAME:-trader}
       APP_PASSWORD: ${APP_PASSWORD:?Set APP_PASSWORD in .env}
       DATA_PROVIDER: ${DATA_PROVIDER:-yahoo}
+      MARKETDATA_TOKEN: ${MARKETDATA_TOKEN:-}
       DEBUG_ERRORS: "false"
     ports:
       - "127.0.0.1:${APP_PORT:-5173}:5173"
