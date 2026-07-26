@@ -1,4 +1,4 @@
-"""QQQ options-opportunity selection and contract ranking.
+"""Options-opportunity selection and contract ranking.
 
 This module never places trades. It converts an already-confirmed underlying
 plan into either strike/DTE guidance or a filtered contract candidate.
@@ -18,11 +18,47 @@ MIN_OPEN_INTEREST = 500
 MIN_VOLUME = 100
 MAX_QUOTE_AGE_MS = 30 * 60 * 1000
 
-DTE_PROFILES = {
-  5: {"min": 7, "max": 14, "target": 10},
-  15: {"min": 10, "max": 21, "target": 14},
-  DAILY_TIMEFRAME: {"min": 14, "max": 35, "target": 28},
+OPTION_PROFILES = {
+  "QQQ": {
+    "optionSymbol": "QQQ",
+    "underlyingLabel": "QQQ",
+    "requiresRegularSession": False,
+    "dteProfiles": {
+      5: {"min": 7, "max": 14, "target": 10},
+      15: {"min": 10, "max": 21, "target": 14},
+      DAILY_TIMEFRAME: {"min": 14, "max": 35, "target": 28},
+    },
+  },
+  "SPY": {
+    "optionSymbol": "SPY",
+    "underlyingLabel": "SPY",
+    "requiresRegularSession": False,
+    "dteProfiles": {
+      5: {"min": 7, "max": 14, "target": 10},
+      15: {"min": 10, "max": 21, "target": 14},
+      DAILY_TIMEFRAME: {"min": 14, "max": 35, "target": 28},
+    },
+  },
+  "BTC-USD": {
+    "optionSymbol": "IBIT",
+    "underlyingLabel": "BTC-USD",
+    "requiresRegularSession": True,
+    "dteProfiles": {
+      5: {"min": 10, "max": 21, "target": 14},
+      15: {"min": 14, "max": 30, "target": 21},
+      DAILY_TIMEFRAME: {"min": 21, "max": 45, "target": 35},
+    },
+  },
 }
+
+
+def option_profile(symbol):
+  return OPTION_PROFILES.get(str(symbol or "QQQ").upper())
+
+
+def option_symbol(symbol):
+  profile = option_profile(symbol)
+  return profile.get("optionSymbol") if profile else None
 
 
 def finite_number(value):
@@ -33,10 +69,16 @@ def finite_number(value):
   return number if math.isfinite(number) else None
 
 
-def none_opportunity(detail="No strong QQQ options opportunity is confirmed.", symbol="QQQ"):
+def none_opportunity(detail=None, symbol="QQQ"):
+  profile = option_profile(symbol)
+  underlying = profile.get("underlyingLabel") if profile else symbol
+  contract_symbol = profile.get("optionSymbol") if profile else None
+  detail = detail or f"No strong {underlying} options opportunity is confirmed."
   return {
     "status": "none",
     "symbol": symbol,
+    "underlyingSymbol": underlying,
+    "optionSymbol": contract_symbol,
     "detail": detail,
     "generatedAt": None,
     "signalKey": None,
@@ -59,10 +101,13 @@ def _valid_plan_prices(signal):
   return values["stop"] > values["entry"] > values["target"] >= values["target2"]
 
 
-def signal_blockers(signal, timeframe, regular_session):
+def signal_blockers(signal, timeframe, regular_session, symbol="QQQ"):
+  profile = option_profile(symbol)
   blockers = []
   direction = str(signal.get("direction") or "")
-  if timeframe not in DTE_PROFILES:
+  if not profile:
+    blockers.append("options are not configured for this asset")
+  elif timeframe not in profile["dteProfiles"]:
     blockers.append("unsupported timeframe")
   if direction not in {"long", "short"}:
     blockers.append("no directional signal")
@@ -87,6 +132,8 @@ def signal_blockers(signal, timeframe, regular_session):
   if setup_type in {"momentum", "breakout", "breakdown", "ema_pullback"} and regime_type in {"range", "chop"}:
     blockers.append("market regime does not support momentum follow-through")
 
+  if profile and profile.get("requiresRegularSession") and not regular_session:
+    blockers.append(f"{profile['optionSymbol']} options ideas require the US regular session")
   if timeframe in {5, 15}:
     if not regular_session:
       blockers.append("intraday options ideas require the regular session")
@@ -98,7 +145,7 @@ def signal_blockers(signal, timeframe, regular_session):
   return blockers
 
 
-def select_underlying_signal(recommendations, regular_session):
+def select_underlying_signal(recommendations, regular_session, symbol="QQQ"):
   candidates = []
   diagnostics = {}
   for timeframe in (5, 15, DAILY_TIMEFRAME):
@@ -108,14 +155,14 @@ def select_underlying_signal(recommendations, regular_session):
     if not isinstance(signal, dict):
       diagnostics[str(timeframe)] = ["analysis unavailable"]
       continue
-    blockers = signal_blockers(signal, timeframe, regular_session)
+    blockers = signal_blockers(signal, timeframe, regular_session, symbol)
     diagnostics[str(timeframe)] = blockers
     if blockers:
       continue
     candidates.append((timeframe, signal))
 
   if not candidates:
-    result = none_opportunity()
+    result = none_opportunity(symbol=symbol)
     result["diagnostics"] = diagnostics
     return None, result
 
@@ -141,12 +188,12 @@ def _expiration_date(generated_at, dte):
   return expiration.isoformat()
 
 
-def _signal_key(timeframe, signal):
+def _signal_key(timeframe, signal, symbol):
   entry = finite_number(signal.get("entry")) or 0
   signal_time = int(signal.get("signalCandleTime") or signal.get("actionableAt") or 0)
   setup = str(signal.get("setupType") or signal.get("setup") or "setup").replace("|", "-")
   return "|".join((
-    "QQQ-option",
+    f"{symbol}-option",
     str(timeframe),
     str(signal.get("direction")),
     setup,
@@ -155,22 +202,28 @@ def _signal_key(timeframe, signal):
   ))
 
 
-def build_guidance(timeframe, signal, plan_id=None, generated_at=None, underlying_price=None):
+def build_guidance(timeframe, signal, plan_id=None, generated_at=None, underlying_price=None, option_price=None, symbol="QQQ"):
   generated_at = int(generated_at or datetime.now(tz=timezone.utc).timestamp() * 1000)
-  profile = dict(DTE_PROFILES[timeframe])
+  asset = option_profile(symbol)
+  if not asset or timeframe not in asset["dteProfiles"]:
+    raise ValueError(f"options are not configured for {symbol} timeframe {timeframe}")
+  profile = dict(asset["dteProfiles"][timeframe])
   direction = signal["direction"]
   side = "call" if direction == "long" else "put"
   entry = finite_number(signal.get("entry"))
-  spot = finite_number(underlying_price) or entry
-  strike_low = spot * (0.99 if side == "call" else 1.0)
-  strike_high = spot * (1.0 if side == "call" else 1.01)
+  underlying_spot = finite_number(underlying_price) or entry
+  contract_spot = finite_number(option_price) or underlying_spot
+  strike_low = contract_spot * (0.99 if side == "call" else 1.0)
+  strike_high = contract_spot * (1.0 if side == "call" else 1.01)
   target1 = finite_number(signal.get("target"))
   target2 = finite_number(signal.get("target2"))
   stop = finite_number(signal.get("stop"))
   return {
     "status": "guidance",
-    "symbol": "QQQ",
-    "signalKey": _signal_key(timeframe, signal),
+    "symbol": symbol,
+    "underlyingSymbol": asset["underlyingLabel"],
+    "optionSymbol": asset["optionSymbol"],
+    "signalKey": _signal_key(timeframe, signal, symbol),
     "generatedAt": generated_at,
     "planId": plan_id,
     "timeframe": timeframe,
@@ -181,8 +234,8 @@ def build_guidance(timeframe, signal, plan_id=None, generated_at=None, underlyin
     "setup": str(signal.get("setup") or "Momentum setup"),
     "setupType": str(signal.get("setupType") or "unknown"),
     "detail": (
-      f"{side.upper()} guidance for a confirmed {timeframe if timeframe != DAILY_TIMEFRAME else '1D'}"
-      f"{'m' if timeframe != DAILY_TIMEFRAME else ''} {direction} momentum plan."
+      f"{asset['optionSymbol']} {side.upper()} guidance for a confirmed {asset['underlyingLabel']} "
+      f"{timeframe if timeframe != DAILY_TIMEFRAME else '1D'}{'m' if timeframe != DAILY_TIMEFRAME else ''} {direction} momentum plan."
     ),
     "dte": {
       **profile,
@@ -197,7 +250,7 @@ def build_guidance(timeframe, signal, plan_id=None, generated_at=None, underlyin
       "label": "ATM to about 1% ITM",
     },
     "underlying": {
-      "price": spot,
+      "price": underlying_spot,
       "entry": entry,
       "stop": stop,
       "target1": target1,
@@ -205,9 +258,9 @@ def build_guidance(timeframe, signal, plan_id=None, generated_at=None, underlyin
       "riskReward": finite_number(signal.get("riskReward")),
     },
     "exitPlan": {
-      "invalidation": f"Exit if QQQ invalidates at {stop:.2f}.",
-      "target1": f"Consider partial profit when QQQ reaches {target1:.2f}.",
-      "target2": f"Exit the remainder or trail risk near QQQ {target2:.2f}.",
+      "invalidation": f"Exit if {asset['underlyingLabel']} invalidates at {stop:.2f}.",
+      "target1": f"Consider partial profit when {asset['underlyingLabel']} reaches {target1:.2f}.",
+      "target2": f"Exit the remainder or trail risk near {asset['underlyingLabel']} {target2:.2f}.",
       "time": "Exit early if momentum fails; expiration is not the planned holding period.",
     },
     "contract": None,
@@ -217,7 +270,7 @@ def build_guidance(timeframe, signal, plan_id=None, generated_at=None, underlyin
       "configured": False,
       "delayed": False,
       "quoteAt": None,
-      "detail": "Exact contract quotes require MARKETDATA_TOKEN.",
+      "detail": f"Exact {asset['optionSymbol']} contract quotes require MARKETDATA_TOKEN.",
     },
   }
 
@@ -379,8 +432,8 @@ def option_scenarios(contract, guidance):
 
   return {
     "method": "Delta/gamma/theta estimate; IV and market conditions can materially change the result.",
-    "target1": scenario("QQQ target 1", guidance["underlying"]["target1"]),
-    "target2": scenario("QQQ target 2", guidance["underlying"]["target2"]),
+    "target1": scenario(f"{guidance['underlyingSymbol']} target 1", guidance["underlying"]["target1"]),
+    "target2": scenario(f"{guidance['underlyingSymbol']} target 2", guidance["underlying"]["target2"]),
   }
 
 

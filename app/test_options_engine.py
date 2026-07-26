@@ -95,6 +95,36 @@ class OptionsEngineTests(unittest.TestCase):
     )
     self.assertFalse(guidance["provider"]["delayed"])
 
+  def test_btc_guidance_uses_ibit_as_the_option_proxy(self):
+    guidance = options.build_guidance(
+      15,
+      signal(timeframe=15, entry=110_000, stop=109_000, target=112_000, target2=113_000),
+      generated_at=NOW,
+      underlying_price=110_500,
+      option_price=70,
+      symbol="BTC-USD",
+    )
+    self.assertEqual(guidance["symbol"], "BTC-USD")
+    self.assertEqual(guidance["underlyingSymbol"], "BTC-USD")
+    self.assertEqual(guidance["optionSymbol"], "IBIT")
+    self.assertEqual(guidance["dte"]["target"], 21)
+    self.assertLess(guidance["strikeGuidance"]["min"], 71)
+    self.assertLess(guidance["strikeGuidance"]["max"], 71)
+
+  def test_ibit_guidance_requires_the_us_regular_session(self):
+    selected, empty = options.select_underlying_signal(
+      {1440: signal(timeframe=1440)},
+      regular_session=False,
+      symbol="BTC-USD",
+    )
+    self.assertIsNone(selected)
+    self.assertIn("IBIT options ideas require the US regular session", empty["diagnostics"]["1440"])
+
+  def test_spy_guidance_uses_spy_contracts(self):
+    guidance = options.build_guidance(5, signal(), generated_at=NOW, symbol="SPY")
+    self.assertEqual(guidance["underlyingSymbol"], "SPY")
+    self.assertEqual(guidance["optionSymbol"], "SPY")
+
   def test_marketdata_column_arrays_are_normalized(self):
     payload = {
       "s": "ok",

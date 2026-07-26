@@ -146,10 +146,11 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(loaded, candles)
     self.assertEqual(fetched_at, 123_456)
 
-  def test_supported_symbols_include_bitcoin(self):
+  def test_supported_symbols_include_bitcoin_and_spy(self):
     self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")
+    self.assertEqual(server.validate_symbol("spy"), "SPY")
     with self.assertRaises(ValueError):
-      server.validate_symbol("SPY")
+      server.validate_symbol("IWM")
 
   def test_market_runtimes_are_isolated_by_symbol(self):
     with server.MARKET_RUNTIME_LOCK:
@@ -414,7 +415,47 @@ class ServerTests(unittest.TestCase):
     self.assertIsNone(first_error)
     self.assertIsNone(second_error)
     self.assertEqual(request.call_count, 1)
+    self.assertEqual(request.call_args.args[0], "/v1/options/chain/QQQ/")
     self.assertEqual(credits, server.OPTIONS_PROVIDER_REQUEST_CREDITS)
+
+  def test_btc_options_chain_requests_ibit_contracts(self):
+    guidance = server.options_engine.build_guidance(
+      15,
+      option_signal(timeframe=15),
+      generated_at=1_780_000_300_000,
+      underlying_price=100_000,
+      option_price=70,
+      symbol="BTC-USD",
+    )
+    guidance["signalKey"] = "btc-ibit-chain"
+    payload = {"s": "ok", "optionSymbol": ["IBIT260807C00070000"], "side": ["call"], "strike": [70]}
+    with server.FETCH_CACHE_LOCK:
+      server.FETCH_CACHE.pop(("options-chain", guidance["signalKey"]), None)
+    with patch.object(server, "marketdata_get", return_value=payload) as request:
+      server.fetch_options_chain(guidance, 1_780_000_300_000)
+    self.assertEqual(request.call_args.args[0], "/v1/options/chain/IBIT/")
+
+  def test_qqq_spy_confirmation_rewards_alignment_and_relative_strength(self):
+    step = 5 * 60_000
+    qqq_runtime = server.new_market_runtime()
+    spy_runtime = server.new_market_runtime()
+    qqq_runtime["five_minute_history"] = [
+      candle(index * step, 100 + index, 101 + index, 99 + index, 100 + index)
+      for index in range(8)
+    ]
+    spy_runtime["five_minute_history"] = [
+      candle(index * step, 100 + index * 0.3, 101 + index * 0.3, 99 + index * 0.3, 100 + index * 0.3)
+      for index in range(8)
+    ]
+    spy_recommendations = {
+      5: {"selectedTrend": {"label": "Up", "tone": "positive"}},
+      15: {"selectedTrend": {"label": "Up", "tone": "positive"}},
+      1440: {"selectedTrend": {"label": "Up", "tone": "positive"}},
+    }
+    confirmation = server.qqq_spy_confirmation(5, "long", qqq_runtime, spy_runtime, spy_recommendations)
+    self.assertEqual(confirmation["label"], "Confirmed")
+    self.assertGreater(confirmation["scoreAdjustment"], 0)
+    self.assertEqual(confirmation["relativeStrength"]["label"], "Leading")
 
   def test_marketdata_get_accepts_delayed_http_203(self):
     class Response:

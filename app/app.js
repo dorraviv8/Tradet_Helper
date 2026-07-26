@@ -1,11 +1,11 @@
 const Core = window.MarketCore;
 const Patterns = window.PatternEngine;
-const SUPPORTED_SYMBOLS = new Set(["QQQ", "BTC-USD"]);
+const SUPPORTED_SYMBOLS = new Set(["QQQ", "SPY", "BTC-USD"]);
 const requestedSymbol = new URLSearchParams(window.location.search).get("symbol")?.toUpperCase();
 const API_SYMBOL = SUPPORTED_SYMBOLS.has(requestedSymbol) ? requestedSymbol : "QQQ";
 const ASSET_OPTIONS = { continuous: API_SYMBOL === "BTC-USD" };
 const SETTINGS_KEY = `trader-helper-settings:${API_SYMBOL}`;
-const STRATEGY_VERSION = "5.1.0";
+const STRATEGY_VERSION = "5.2.0";
 const ALERT_TIMEFRAMES = [1, 5, 15, 1440];
 const DAILY_TIMEFRAME = 1440;
 const OPTIONS_ALERT_STORAGE_KEY = `trader-helper-options-alert:${API_SYMBOL}`;
@@ -123,6 +123,12 @@ const els = {
   generalTrend1d: document.getElementById("generalTrend1d"),
   regimeBadge: document.getElementById("regimeBadge"),
   regimeDetail: document.getElementById("regimeDetail"),
+  marketConfirmationTile: document.getElementById("marketConfirmationTile"),
+  marketConfirmationBadge: document.getElementById("marketConfirmationBadge"),
+  marketRelativeStrength: document.getElementById("marketRelativeStrength"),
+  marketSpyTrend: document.getElementById("marketSpyTrend"),
+  marketConfirmationScore: document.getElementById("marketConfirmationScore"),
+  marketConfirmationDetail: document.getElementById("marketConfirmationDetail"),
   biasBadge: document.getElementById("biasBadge"),
   biasFill: document.getElementById("biasFill"),
   biasScore: document.getElementById("biasScore"),
@@ -153,6 +159,8 @@ const els = {
   bestSwingTarget2: document.getElementById("bestSwingTarget2"),
   bestSwingView: document.getElementById("bestSwingView"),
   optionsOpportunity: document.getElementById("optionsOpportunity"),
+  optionsEyebrow: document.getElementById("optionsEyebrow"),
+  optionsOpportunityTitle: document.getElementById("optionsOpportunityTitle"),
   optionsBadge: document.getElementById("optionsBadge"),
   optionsDataStatus: document.getElementById("optionsDataStatus"),
   optionsScore: document.getElementById("optionsScore"),
@@ -163,8 +171,11 @@ const els = {
   optionsDelta: document.getElementById("optionsDelta"),
   optionsCost: document.getElementById("optionsCost"),
   optionsEntry: document.getElementById("optionsEntry"),
+  optionsEntryLabel: document.getElementById("optionsEntryLabel"),
   optionsStop: document.getElementById("optionsStop"),
+  optionsStopLabel: document.getElementById("optionsStopLabel"),
   optionsTargets: document.getElementById("optionsTargets"),
+  optionsTargetsLabel: document.getElementById("optionsTargetsLabel"),
   confidenceScore: document.getElementById("confidenceScore"),
   calibrationBadge: document.getElementById("calibrationBadge"),
   calibrationProbability: document.getElementById("calibrationProbability"),
@@ -2672,6 +2683,33 @@ function renderBias(signal) {
   setTone(els.biasBadge, label === "Long" ? "positive" : label === "Short" ? "negative" : "neutral");
 }
 
+function renderMarketConfirmation(signal) {
+  if (API_SYMBOL !== "QQQ") return;
+  const confirmation = signal.marketConfirmation || {};
+  const relative = confirmation.relativeStrength || {};
+  const spyTrends = confirmation.spyTrends || {};
+  const adjustment = Number(confirmation.scoreAdjustment || 0);
+  const trendSummary = ["5", "15", "1D"]
+    .map((timeframe) => spyTrends[timeframe]?.label)
+    .filter(Boolean)
+    .join(" / ");
+
+  els.marketConfirmationBadge.textContent = confirmation.label || "Building";
+  setTone(els.marketConfirmationBadge, confirmation.tone || "neutral");
+  els.marketRelativeStrength.textContent = relative.pct == null
+    ? relative.label || "Building"
+    : `${relative.label || "Neutral"} ${relative.pct >= 0 ? "+" : ""}${fmt(relative.pct, 2)}%`;
+  setTone(els.marketRelativeStrength, relative.tone || "neutral");
+  els.marketSpyTrend.textContent = trendSummary || "Building";
+  const trendTone = confirmation.tone === "positive" || confirmation.tone === "negative"
+    ? confirmation.tone
+    : "neutral";
+  setTone(els.marketSpyTrend, trendTone);
+  els.marketConfirmationScore.textContent = adjustment === 0 ? "0 pts" : `${adjustment > 0 ? "+" : ""}${adjustment} pts`;
+  setTone(els.marketConfirmationScore, adjustment > 0 ? "positive" : adjustment < 0 ? "negative" : "neutral");
+  els.marketConfirmationDetail.textContent = confirmation.detail || "Waiting for SPY confirmation.";
+}
+
 function isActionableSignal(signal) {
   return Boolean(
     signal
@@ -2758,11 +2796,13 @@ function optionsDate(value) {
 
 function renderOptionsOpportunity() {
   const opportunity = state.optionsOpportunity;
-  if (API_SYMBOL !== "QQQ" || !opportunity || opportunity.status === "none") {
+  if (!opportunity || opportunity.status === "none") {
     els.optionsOpportunity.hidden = true;
     return;
   }
   els.optionsOpportunity.hidden = false;
+  const underlyingSymbol = opportunity.underlyingSymbol || opportunity.symbol || API_SYMBOL;
+  const optionSymbol = opportunity.optionSymbol || underlyingSymbol;
   const side = String(opportunity.sideLabel || opportunity.side || "").toUpperCase();
   const long = side === "CALL";
   const contract = opportunity.contract;
@@ -2771,6 +2811,11 @@ function renderOptionsOpportunity() {
   const delta = opportunity.delta || {};
   const provider = opportunity.provider || {};
 
+  els.optionsEyebrow.textContent = `${underlyingSymbol} momentum via ${optionSymbol}`;
+  els.optionsOpportunityTitle.textContent = `${optionSymbol} Options Opportunity`;
+  els.optionsEntryLabel.textContent = `${underlyingSymbol} entry`;
+  els.optionsStopLabel.textContent = `${underlyingSymbol} invalidation`;
+  els.optionsTargetsLabel.textContent = `${underlyingSymbol} targets`;
   els.optionsBadge.textContent = `${side} ${timeframeLabel(Number(opportunity.timeframe))}`;
   setTone(els.optionsBadge, long ? "positive" : "negative");
   els.optionsDataStatus.textContent = contract
@@ -2788,14 +2833,14 @@ function renderOptionsOpportunity() {
     els.optionsCost.textContent = `$${fmt(Number(contract.mid))} / $${fmt(Number(contract.costPerContract), 0)}`;
     const scenarios = contract.scenarios;
     els.optionsProjection.textContent = scenarios
-      ? `At QQQ T1 $${fmt(Number(underlying.target1))}, estimated option mid is $${fmt(Number(scenarios.target1.estimatedOptionMid))} (${fmt(Number(scenarios.target1.estimatedReturnPct), 1)}%). At QQQ T2 $${fmt(Number(underlying.target2))}, the estimate is $${fmt(Number(scenarios.target2.estimatedOptionMid))}. ${scenarios.method}`
-      : "Option value scenarios are unavailable for this quote; use the QQQ invalidation and targets.";
+      ? `At ${underlyingSymbol} T1 $${fmt(Number(underlying.target1))}, estimated option mid is $${fmt(Number(scenarios.target1.estimatedOptionMid))} (${fmt(Number(scenarios.target1.estimatedReturnPct), 1)}%). At ${underlyingSymbol} T2 $${fmt(Number(underlying.target2))}, the estimate is $${fmt(Number(scenarios.target2.estimatedOptionMid))}. ${scenarios.method}`
+      : `Option value scenarios are unavailable for this quote; use the ${underlyingSymbol} invalidation and targets.`;
   } else {
     els.optionsContract.textContent = `${opportunity.strikeGuidance?.label || "ATM to 1% ITM"} $${fmt(Number(opportunity.strikeGuidance?.min))}-$${fmt(Number(opportunity.strikeGuidance?.max))}`;
     els.optionsExpiration.textContent = `${dte.min}-${dte.max} DTE; target ${dte.target}`;
     els.optionsDelta.textContent = `${fmt(Number(delta.min), 2)}-${fmt(Number(delta.max), 2)}; target ${fmt(Number(delta.target), 2)}`;
     els.optionsCost.textContent = "Broker quote required";
-    els.optionsProjection.textContent = `QQQ target 1 is $${fmt(Number(underlying.target1))} and target 2 is $${fmt(Number(underlying.target2))}. Exact option-price estimates require a qualifying contract quote and Greeks.`;
+    els.optionsProjection.textContent = `${underlyingSymbol} target 1 is $${fmt(Number(underlying.target1))} and target 2 is $${fmt(Number(underlying.target2))}. Exact ${optionSymbol} option-price estimates require a qualifying contract quote and Greeks.`;
   }
   els.optionsEntry.textContent = `$${fmt(Number(underlying.entry))}`;
   els.optionsStop.textContent = `$${fmt(Number(underlying.stop))}`;
@@ -2813,18 +2858,20 @@ function maybeOptionsAlert() {
     console.info("Options alert key could not be stored.", error);
   }
   const contract = opportunity.contract;
+  const underlyingSymbol = opportunity.underlyingSymbol || opportunity.symbol || API_SYMBOL;
+  const optionSymbol = opportunity.optionSymbol || underlyingSymbol;
   const contractText = contract
     ? `${contract.optionSymbol} near $${fmt(Number(contract.mid))}`
     : `${opportunity.strikeGuidance?.label || "ATM to 1% ITM"}, ${opportunity.dte?.min}-${opportunity.dte?.max} DTE`;
   const item = {
     time: new Date(),
-    text: `${opportunity.sideLabel} options candidate ${opportunity.score}/100: ${contractText}. QQQ invalidation ${fmt(Number(opportunity.underlying?.stop))}, targets ${fmt(Number(opportunity.underlying?.target1))} / ${fmt(Number(opportunity.underlying?.target2))}.`,
+    text: `${optionSymbol} ${opportunity.sideLabel} candidate ${opportunity.score}/100: ${contractText}. ${underlyingSymbol} invalidation ${fmt(Number(opportunity.underlying?.stop))}, targets ${fmt(Number(opportunity.underlying?.target1))} / ${fmt(Number(opportunity.underlying?.target2))}.`,
   };
   state.alerts.unshift(item);
   state.alerts = state.alerts.slice(0, 25);
   renderAlertLog();
   if (state.notifyEnabled && Notification.permission === "granted") {
-    new Notification("QQQ Options Opportunity", { body: item.text });
+    new Notification(`${optionSymbol} Options Opportunity`, { body: item.text });
   }
 }
 
@@ -2947,6 +2994,7 @@ function render(signal, indicators) {
   setTone(els.regimeBadge, signal.regime?.tone || "neutral");
   els.regimeDetail.textContent = signal.regime?.detail || "--";
   renderBias(signal);
+  renderMarketConfirmation(signal);
   renderCandidateComparison(signal);
 
   els.confidenceScore.textContent = `${Number(signal.score || 0)}/100`;
@@ -3443,6 +3491,7 @@ function initializeAssetPage() {
   els.chartSymbol.textContent = API_SYMBOL;
   els.canvas.setAttribute("aria-label", `${API_SYMBOL} candlestick, volume, and RSI chart`);
   els.fearGreedTitle.textContent = ASSET_OPTIONS.continuous ? "CNN US Market Context" : "CNN Fear & Greed";
+  els.marketConfirmationTile.hidden = API_SYMBOL !== "QQQ";
   try {
     state.lastOptionsAlertKey = window.sessionStorage.getItem(OPTIONS_ALERT_STORAGE_KEY) || "";
   } catch (error) {

@@ -15,6 +15,7 @@
       </div>
       <nav class="asset-switcher" aria-label="Market selector">
         <button class="asset-button active" type="button" data-symbol="QQQ" aria-pressed="true">QQQ</button>
+        <button class="asset-button" type="button" data-symbol="SPY" aria-pressed="false">SPY</button>
         <button class="asset-button" type="button" data-symbol="BTC-USD" aria-pressed="false">BTC-USD</button>
       </nav>
       <div class="market-clock">
@@ -72,7 +73,7 @@
     <section id="optionsOpportunity" class="options-opportunity" aria-labelledby="optionsOpportunityTitle" hidden>
       <div class="options-opportunity-heading">
         <div>
-          <p class="eyebrow">QQQ strong-momentum setup</p>
+          <p id="optionsEyebrow" class="eyebrow">Options momentum setup</p>
           <h2 id="optionsOpportunityTitle">Options Opportunity</h2>
         </div>
         <div class="options-opportunity-status">
@@ -107,15 +108,15 @@
             <dd id="optionsCost">--</dd>
           </div>
           <div>
-            <dt>QQQ entry</dt>
+            <dt id="optionsEntryLabel">Underlying entry</dt>
             <dd id="optionsEntry">--</dd>
           </div>
           <div>
-            <dt>QQQ invalidation</dt>
+            <dt id="optionsStopLabel">Underlying invalidation</dt>
             <dd id="optionsStop">--</dd>
           </div>
           <div>
-            <dt>QQQ targets</dt>
+            <dt id="optionsTargetsLabel">Underlying targets</dt>
             <dd id="optionsTargets">--</dd>
           </div>
         </dl>
@@ -271,6 +272,19 @@
             </div>
             <div class="bias-meter" aria-label="Long short bias"><div id="biasFill" class="bias-fill"></div></div>
             <div class="bias-labels"><span>Short</span><strong id="biasScore">0</strong><span>Long</span></div>
+          </section>
+
+          <section id="marketConfirmationTile" class="insight-tile" hidden>
+            <div class="section-heading">
+              <h2>QQQ vs SPY</h2>
+              <span id="marketConfirmationBadge" class="badge neutral">Building</span>
+            </div>
+            <div class="diagnostic-list">
+              <div><span>Relative strength</span><strong id="marketRelativeStrength">--</strong></div>
+              <div><span>SPY alignment</span><strong id="marketSpyTrend">--</strong></div>
+              <div><span>Score effect</span><strong id="marketConfirmationScore">--</strong></div>
+            </div>
+            <p id="marketConfirmationDetail" class="tile-footnote">Waiting for SPY confirmation.</p>
           </section>
 
           <section class="insight-tile">

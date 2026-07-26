@@ -50,8 +50,8 @@ IBKR_CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "17"))
 IBKR_REQUIRE_LIVE = os.environ.get("IBKR_REQUIRE_LIVE", "true").lower() in {"1", "true", "yes"}
 IBKR_HISTORY_DURATION = os.environ.get("IBKR_HISTORY_DURATION", "2 D")
 SYMBOL = "QQQ"
-SUPPORTED_SYMBOLS = ("QQQ", "BTC-USD")
-STRATEGY_VERSION = "5.1.0"
+SUPPORTED_SYMBOLS = ("QQQ", "SPY", "BTC-USD")
+STRATEGY_VERSION = "5.2.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 LEGACY_DB_PATH = os.path.join(APP_DIR, "trader_journal.sqlite3")
@@ -439,7 +439,7 @@ def merge_candle_series(raw_candles):
 
 
 def active_provider(symbol=SYMBOL):
-  if str(symbol).upper() == "BTC-USD":
+  if str(symbol).upper() in {"SPY", "BTC-USD"}:
     return "yahoo"
   if DATA_PROVIDER == "demo":
     return ""
@@ -1249,6 +1249,7 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
       "selectedTrend": signal.get("selectedTrend"),
       "trend5": signal.get("trend5"),
       "trend15": signal.get("trend15"),
+      "marketConfirmation": signal.get("marketConfirmation"),
       "dataQuality": signal.get("dataQuality"),
     }),
   }
@@ -1351,7 +1352,7 @@ def fetch_options_chain(guidance, timestamp=None):
   reserved, usage = reserve_options_provider_credits(OPTIONS_PROVIDER_REQUEST_CREDITS, timestamp)
   if not reserved:
     return None, False, f"Daily options quote allowance reached ({usage}/{OPTIONS_PROVIDER_DAILY_LIMIT})."
-  payload = marketdata_get("/v1/options/chain/QQQ/", {
+  payload = marketdata_get(f"/v1/options/chain/{guidance['optionSymbol']}/", {
     "dte": guidance["dte"]["target"],
     "side": guidance["side"],
     "delta": f"{options_engine.MIN_DELTA:.2f}-{options_engine.MAX_DELTA:.2f}",
@@ -1367,18 +1368,19 @@ def fetch_options_chain(guidance, timestamp=None):
   return contracts, False, None
 
 
-def option_learning_profile(connection):
+def option_learning_profile(connection, symbol=SYMBOL):
   rows = connection.execute("""
     SELECT delta_bucket,
            COUNT(*) AS sample_size,
            AVG(realized_return) AS average_return,
            AVG(CASE WHEN realized_return > 0 THEN 1.0 ELSE 0.0 END) AS win_rate
     FROM option_ideas
-    WHERE eligible_for_learning = 1
+    WHERE symbol = ?
+      AND eligible_for_learning = 1
       AND realized_return IS NOT NULL
       AND delta_bucket IS NOT NULL
     GROUP BY delta_bucket
-  """).fetchall()
+  """, (symbol,)).fetchall()
   return {
     row["delta_bucket"]: {
       "sampleSize": int(row["sample_size"] or 0),
@@ -1541,31 +1543,57 @@ def resolve_option_ideas(connection):
   return resolved
 
 
+def options_market_open(timestamp):
+  return bool(strategy_engine.market_session(timestamp, "QQQ").get("regular"))
+
+
+def option_proxy_price(symbol, runtime):
+  contract_symbol = options_engine.option_symbol(symbol)
+  if not contract_symbol:
+    return None
+  if contract_symbol == symbol:
+    return finite_number((runtime.get("candle") or {}).get("close"))
+  try:
+    candle = latest_candle("yahoo", contract_symbol)
+    return finite_number((candle or {}).get("close"))
+  except Exception:
+    return None
+
+
 def build_options_opportunity(recommendations, plan_ids, runtime, timestamp=None, symbol=SYMBOL):
   timestamp = int(timestamp or now_ms())
-  if symbol != SYMBOL:
+  profile = options_engine.option_profile(symbol)
+  if not profile:
     return options_engine.none_opportunity(
-      "Options Opportunity is currently available for QQQ only.",
+      "Options guidance is not configured for this asset.",
       symbol=symbol,
     )
-  regular_session = bool(strategy_engine.market_session(timestamp, symbol).get("regular"))
-  selected, empty = options_engine.select_underlying_signal(recommendations, regular_session)
+  regular_session = options_market_open(timestamp)
+  selected, empty = options_engine.select_underlying_signal(recommendations, regular_session, symbol)
   if not selected:
     return empty
   timeframe, signal = selected
   latest_price = finite_number((runtime.get("candle") or {}).get("close"))
+  contract_price = option_proxy_price(symbol, runtime)
+  if contract_price is None:
+    return options_engine.none_opportunity(
+      f"{profile['optionSymbol']} proxy price is unavailable; wait for a fresh listed-ETF quote.",
+      symbol=symbol,
+    )
   guidance = options_engine.build_guidance(
     timeframe,
     signal,
     plan_id=(plan_ids or {}).get(timeframe),
     generated_at=timestamp,
     underlying_price=latest_price,
+    option_price=contract_price,
+    symbol=symbol,
   )
   if not MARKETDATA_TOKEN:
     return guidance
   guidance["provider"].update({
     "configured": True,
-    "detail": "Exact contract selection runs during the regular QQQ session.",
+    "detail": f"Exact {profile['optionSymbol']} contract selection runs during the US regular session.",
   })
   if not regular_session:
     return guidance
@@ -1576,7 +1604,7 @@ def build_options_opportunity(recommendations, plan_ids, runtime, timestamp=None
       guidance["provider"]["detail"] = quota_detail
       return guidance
     with db() as connection:
-      learning = option_learning_profile(connection)
+      learning = option_learning_profile(connection, symbol)
     ranked = options_engine.rank_contracts(
       contracts,
       guidance,
@@ -1592,6 +1620,167 @@ def build_options_opportunity(recommendations, plan_ids, runtime, timestamp=None
   except Exception as error:
     guidance["provider"]["detail"] = f"Exact contract data is temporarily unavailable: {str(error)[:160]}"
     return guidance
+
+
+def candles_for_confirmation(runtime, timeframe):
+  if timeframe == strategy_engine.DAILY_TIMEFRAME:
+    return merge_candle_series(runtime.get("daily_history") or [])
+  if timeframe == 1:
+    return merge_candle_series([
+      *(runtime.get("history") or []),
+      *([runtime["candle"]] if runtime.get("candle") else []),
+    ])
+  source = runtime.get("five_minute_history") or runtime.get("history") or []
+  return strategy_engine.resample(source, timeframe)
+
+
+def return_over_bars(candles, lookback):
+  values = [
+    finite_number(candle.get("close"))
+    for candle in (candles or [])
+    if finite_number(candle.get("close")) and finite_number(candle.get("close")) > 0
+  ]
+  if len(values) <= lookback:
+    return None
+  return values[-1] / values[-1 - lookback] - 1
+
+
+def signal_for_timeframe(recommendations, timeframe):
+  return (recommendations or {}).get(timeframe) or (recommendations or {}).get(str(timeframe)) or {}
+
+
+def qqq_spy_confirmation(timeframe, direction, qqq_runtime, spy_runtime, spy_recommendations):
+  reference_timeframes = (5, 15, strategy_engine.DAILY_TIMEFRAME)
+  reference_signals = {
+    value: signal_for_timeframe(spy_recommendations, value)
+    for value in reference_timeframes
+  }
+  reference_tones = {
+    value: str((signal.get("selectedTrend") or {}).get("tone") or "neutral")
+    for value, signal in reference_signals.items()
+  }
+  lookbacks = {1: 10, 5: 6, 15: 4, strategy_engine.DAILY_TIMEFRAME: 5}
+  lookback = lookbacks.get(timeframe, 6)
+  qqq_return = return_over_bars(candles_for_confirmation(qqq_runtime, timeframe), lookback)
+  spy_return = return_over_bars(candles_for_confirmation(spy_runtime, timeframe), lookback)
+  relative_pct = (qqq_return - spy_return) * 100 if qqq_return is not None and spy_return is not None else None
+  threshold = {1: 0.05, 5: 0.08, 15: 0.10, strategy_engine.DAILY_TIMEFRAME: 0.35}.get(timeframe, 0.10)
+  expected_tone = "positive" if direction == "long" else "negative"
+  aligned = sum(tone == expected_tone for tone in reference_tones.values())
+  opposed = sum(tone in {"positive", "negative"} and tone != expected_tone for tone in reference_tones.values())
+  adjustment = 0
+  reasons = []
+
+  if direction in {"long", "short"}:
+    selected_tone = reference_tones.get(timeframe, "neutral")
+    if selected_tone == expected_tone:
+      adjustment += 4
+      reasons.append(f"SPY {timeframe if timeframe != strategy_engine.DAILY_TIMEFRAME else '1D'} trend confirms the trade direction")
+    elif selected_tone in {"positive", "negative"}:
+      adjustment -= 7
+      reasons.append(f"SPY {timeframe if timeframe != strategy_engine.DAILY_TIMEFRAME else '1D'} trend conflicts with the trade direction")
+    if aligned >= 2:
+      adjustment += 3
+      reasons.append("SPY is aligned across multiple timeframes")
+    elif opposed >= 2:
+      adjustment -= 5
+      reasons.append("SPY has broad multi-timeframe opposition")
+    if relative_pct is not None:
+      leading = relative_pct >= threshold
+      lagging = relative_pct <= -threshold
+      if (direction == "long" and leading) or (direction == "short" and lagging):
+        adjustment += 3
+        reasons.append(f"QQQ relative strength supports the {direction} thesis")
+      elif (direction == "long" and lagging) or (direction == "short" and leading):
+        adjustment -= 3
+        reasons.append(f"QQQ relative strength weakens the {direction} thesis")
+  adjustment = max(-12, min(10, adjustment))
+
+  if relative_pct is None:
+    relative_label = "Building"
+    relative_tone = "neutral"
+  elif relative_pct >= threshold:
+    relative_label = "Leading"
+    relative_tone = "positive"
+  elif relative_pct <= -threshold:
+    relative_label = "Lagging"
+    relative_tone = "negative"
+  else:
+    relative_label = "Neutral"
+    relative_tone = "neutral"
+  if adjustment >= 5:
+    label, tone = "Confirmed", "positive"
+  elif adjustment <= -5:
+    label, tone = "Conflicting", "negative"
+  else:
+    label, tone = "Mixed", "neutral"
+  scope = "Broad market"
+  if aligned == 0 or opposed:
+    scope = "Technology-led / divergent"
+  return {
+    "referenceSymbol": "SPY",
+    "label": label,
+    "tone": tone,
+    "scoreAdjustment": adjustment,
+    "detail": "; ".join(reasons) if reasons else "Waiting for enough SPY context to confirm QQQ.",
+    "scope": scope,
+    "relativeStrength": {
+      "label": relative_label,
+      "tone": relative_tone,
+      "pct": round(relative_pct, 3) if relative_pct is not None else None,
+      "lookbackBars": lookback,
+    },
+    "spyTrends": {
+      str(value if value != strategy_engine.DAILY_TIMEFRAME else "1D"): {
+        "label": (reference_signals[value].get("selectedTrend") or {}).get("label", "Building"),
+        "tone": reference_tones[value],
+      }
+      for value in reference_timeframes
+    },
+  }
+
+
+def apply_qqq_spy_confirmation(recommendations, qqq_runtime, spy_runtime, spy_recommendations, settings):
+  threshold = int(settings.get("activeTradeThreshold", 62)) + {
+    "scalp": -6, "normal": 0, "strict": 8,
+  }.get(settings.get("mode", "normal"), 0)
+  for timeframe, signal in (recommendations or {}).items():
+    timeframe = int(timeframe)
+    targets = [signal, signal.get("bestLong"), signal.get("bestShort")]
+    seen = set()
+    for candidate in targets:
+      if not isinstance(candidate, dict) or id(candidate) in seen:
+        continue
+      seen.add(id(candidate))
+      context = qqq_spy_confirmation(
+        timeframe,
+        str(candidate.get("direction") or "neutral"),
+        qqq_runtime,
+        spy_runtime,
+        spy_recommendations,
+      )
+      candidate["marketConfirmation"] = context
+      if candidate.get("direction") not in {"long", "short"}:
+        continue
+      adjustment = int(context["scoreAdjustment"])
+      if adjustment:
+        candidate["score"] = max(0, min(95, int(candidate.get("score") or 0) + adjustment))
+        if candidate.get("rawScore") is not None:
+          candidate["rawScore"] = int(candidate["rawScore"]) + adjustment
+        candidate.setdefault("reasons", []).extend(context["detail"].split("; "))
+      if candidate is signal and candidate["score"] < threshold:
+        candidate["watchOnly"] = True
+        candidate.setdefault("reasons", []).append("QQQ/SPY confirmation reduced the setup below the active threshold")
+    best_long = signal.get("bestLong")
+    best_short = signal.get("bestShort")
+    signal["biasScore"] = (
+      int(best_long.get("score") or 0) - int(best_short.get("score") or 0)
+      if best_long and best_short
+      else round(int(best_long.get("score") or 0) * 0.5) if best_long
+      else -round(int(best_short.get("score") or 0) * 0.5) if best_short
+      else 0
+    )
+  return recommendations
 
 
 def refresh_server_recommendations(provider, symbol=SYMBOL):
@@ -1622,6 +1811,15 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
         generated_at,
         intraday_context=recommendations.get(5),
         symbol=symbol,
+      )
+    if symbol == "QQQ":
+      spy_runtime = market_runtime_snapshot("SPY")
+      apply_qqq_spy_confirmation(
+        recommendations,
+        runtime,
+        spy_runtime,
+        spy_runtime.get("recommendations") or {},
+        settings,
       )
     replay = runtime.get("backtest") or {}
     replay_trades = replay.get("trades") or []
@@ -2804,7 +3002,7 @@ def main():
     mode = "Polygon/Massive data proxy"
   else:
     mode = "no market provider configured"
-  print(f"Serving QQQ and BTC-USD helper at http://{HOST}:{PORT}/ ({mode})")
+  print(f"Serving QQQ, SPY, and BTC-USD helper at http://{HOST}:{PORT}/ ({mode})")
   try:
     server.serve_forever()
   except KeyboardInterrupt:
