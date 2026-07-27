@@ -71,6 +71,9 @@ SENTIMENT_CACHE_TTL_SECONDS = 5 * 60
 OPTIONS_CACHE_TTL_SECONDS = 30 * 60
 OPTIONS_PROVIDER_DAILY_LIMIT = 80
 OPTIONS_PROVIDER_REQUEST_CREDITS = 4
+BACKTEST_MIN_REPLAY_INTERVAL_MS = 60 * 60 * 1000
+SSE_MAX_CONNECTION_SECONDS = 75
+MAX_REQUEST_THREADS = 32
 FETCH_CACHE = {}
 FETCH_CACHE_LOCK = threading.Lock()
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
@@ -92,6 +95,7 @@ def new_market_runtime():
     "backtest": None,
     "backtest_status": "not_started",
     "backtest_error": None,
+    "backtest_last_started_at": None,
   }
 
 
@@ -1125,6 +1129,10 @@ def schedule_historical_replay(symbol=SYMBOL):
   runtime = market_runtime_snapshot(symbol)
   if len(runtime["five_minute_history"]) < 160 and len(runtime["daily_history"]) < 180:
     return False
+  current_time = now_ms()
+  last_started_at = int(runtime.get("backtest_last_started_at") or 0)
+  if last_started_at and current_time - last_started_at < BACKTEST_MIN_REPLAY_INTERVAL_MS:
+    return False
   settings = load_strategy_settings()
   signature = backtest_source_signature(runtime, settings, symbol)
   current = runtime.get("backtest") or {}
@@ -1137,6 +1145,7 @@ def schedule_historical_replay(symbol=SYMBOL):
   with MARKET_RUNTIME_LOCK:
     MARKET_RUNTIMES[symbol]["backtest_status"] = "running"
     MARKET_RUNTIMES[symbol]["backtest_error"] = None
+    MARKET_RUNTIMES[symbol]["backtest_last_started_at"] = current_time
 
   def run():
     try:
@@ -2919,7 +2928,8 @@ class Handler(SimpleHTTPRequestHandler):
     last_error_count = -1
     last_recommendations_key = None
     last_options_key = None
-    while True:
+    deadline = time.monotonic() + SSE_MAX_CONNECTION_SECONDS
+    while time.monotonic() < deadline:
       try:
         runtime = market_runtime_snapshot(symbol)
         candle = runtime["candle"]
@@ -2967,6 +2977,24 @@ class AppHTTPServer(ThreadingHTTPServer):
   daemon_threads = True
   allow_reuse_address = True
   request_queue_size = 64
+
+  def __init__(self, *args, **kwargs):
+    self.request_slots = threading.BoundedSemaphore(MAX_REQUEST_THREADS)
+    super().__init__(*args, **kwargs)
+
+  def process_request(self, request, client_address):
+    if not self.request_slots.acquire(blocking=False):
+      self.shutdown_request(request)
+      return
+
+    def run_request():
+      try:
+        self.process_request_thread(request, client_address)
+      finally:
+        self.request_slots.release()
+
+    worker = threading.Thread(target=run_request, daemon=self.daemon_threads)
+    worker.start()
 
   def handle_error(self, request, client_address):
     error = sys.exc_info()[1]

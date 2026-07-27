@@ -187,6 +187,20 @@ class ServerTests(unittest.TestCase):
       self.assertEqual(server.load_latest_backtest(connection, "QQQ")["summary"]["resolved"], 10)
       self.assertEqual(server.load_latest_backtest(connection, "BTC-USD")["summary"]["resolved"], 20)
 
+  def test_historical_replay_is_throttled_after_starting(self):
+    runtime = server.new_market_runtime()
+    runtime["five_minute_history"] = [candle(index * 300_000, 100, 101, 99, 100) for index in range(160)]
+    runtime["backtest_last_started_at"] = 1_000_000
+    with server.MARKET_RUNTIME_LOCK:
+      original = server.MARKET_RUNTIMES["QQQ"]
+      server.MARKET_RUNTIMES["QQQ"] = runtime
+    try:
+      with patch.object(server, "now_ms", return_value=1_000_000 + server.BACKTEST_MIN_REPLAY_INTERVAL_MS - 1):
+        self.assertFalse(server.schedule_historical_replay("QQQ"))
+    finally:
+      with server.MARKET_RUNTIME_LOCK:
+        server.MARKET_RUNTIMES["QQQ"] = original
+
   def test_learning_snapshot_persists_resolved_current_strategy_plans(self):
     for index in range(8):
       self.insert_plan(
