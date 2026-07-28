@@ -186,6 +186,8 @@ const els = {
   calibrationExpectedR: document.getElementById("calibrationExpectedR"),
   calibrationSamples: document.getElementById("calibrationSamples"),
   calibrationRange: document.getElementById("calibrationRange"),
+  calibrationExcursion: document.getElementById("calibrationExcursion"),
+  calibrationHoldingTime: document.getElementById("calibrationHoldingTime"),
   calibrationScope: document.getElementById("calibrationScope"),
   activeAlert: document.getElementById("activeAlert"),
   riskReward: document.getElementById("riskReward"),
@@ -2938,6 +2940,11 @@ function renderCalibration(signal) {
   const modelSamples = Number(model.sampleSize || 0);
   const modelTargetRate = Number(model.target1Rate);
   const modelExpectedR = Number(model.expectedR);
+  const modelLow = Number(model.confidenceLow);
+  const modelHigh = Number(model.confidenceHigh);
+  const modelMfe = Number(model.avgMfeR);
+  const modelMae = Number(model.avgMaeR);
+  const modelHoldingMs = Number(model.avgHoldingMs);
   const samples = Number(calibration.sampleSize || 0);
   const probability = Number(calibration.probabilityT1);
   const expectedR = Number(calibration.expectedR);
@@ -2953,10 +2960,14 @@ function renderCalibration(signal) {
       : "--";
     setTone(els.calibrationExpectedR, modelExpectedR > 0 ? "positive" : modelExpectedR < 0 ? "negative" : "neutral");
     els.calibrationSamples.textContent = modelSamples;
-    els.calibrationRange.textContent = Number.isFinite(low) && Number.isFinite(high)
-      ? `${fmt(low * 100, 0)}-${fmt(high * 100, 0)}%`
+    els.calibrationRange.textContent = Number.isFinite(modelLow) && Number.isFinite(modelHigh)
+      ? `${fmt(modelLow * 100, 0)}-${fmt(modelHigh * 100, 0)}%`
       : "--";
-    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model uses ${model.scope || "comparable"} outcomes with a neutral prior; replay range remains a separate historical baseline.`;
+    els.calibrationExcursion.textContent = Number.isFinite(modelMfe) && Number.isFinite(modelMae)
+      ? `${fmt(modelMfe, 2)}R / ${fmt(modelMae, 2)}R`
+      : "--";
+    els.calibrationHoldingTime.textContent = fmtDuration(modelHoldingMs);
+    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model uses ${model.scope || "comparable"} outcomes, with a neutral prior and conservative range until the sample grows.`;
     return;
   }
   if (!samples || !Number.isFinite(probability)) {
@@ -2966,6 +2977,8 @@ function renderCalibration(signal) {
     els.calibrationExpectedR.textContent = "--";
     els.calibrationSamples.textContent = samples || "--";
     els.calibrationRange.textContent = "--";
+    els.calibrationExcursion.textContent = "--";
+    els.calibrationHoldingTime.textContent = "--";
     els.calibrationScope.textContent = "Waiting for automatically resolved comparable plans and historical replay data.";
     return;
   }
@@ -2978,6 +2991,8 @@ function renderCalibration(signal) {
   els.calibrationRange.textContent = Number.isFinite(low) && Number.isFinite(high)
     ? `${fmt(low * 100, 0)}-${fmt(high * 100, 0)}%`
     : "--";
+  els.calibrationExcursion.textContent = "--";
+  els.calibrationHoldingTime.textContent = "--";
   els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.scope || "historical replay"} baseline with a neutral prior.`;
 }
 
@@ -3130,6 +3145,7 @@ function savePlanToJournal(signal, latest, timeframe = state.selectedTimeframe) 
     provider: state.providerLabel,
     timeframe,
     marketPhase: signal.marketPhase || marketPhase(latest.time),
+    marketRegime: signal.regime?.type || "unknown",
     strategyVersion: STRATEGY_VERSION,
     settings: {
       mode: state.settings.mode,

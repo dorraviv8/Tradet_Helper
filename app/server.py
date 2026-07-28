@@ -72,6 +72,7 @@ OPTIONS_CACHE_TTL_SECONDS = 30 * 60
 OPTIONS_PROVIDER_DAILY_LIMIT = 80
 OPTIONS_PROVIDER_REQUEST_CREDITS = 4
 BACKTEST_MIN_REPLAY_INTERVAL_MS = 60 * 60 * 1000
+LEARNING_SNAPSHOT_VERSION = 2
 SSE_MAX_CONNECTION_SECONDS = 75
 MAX_REQUEST_THREADS = 32
 FETCH_CACHE = {}
@@ -155,6 +156,7 @@ def init_db():
         setup TEXT NOT NULL,
         setup_type TEXT,
         market_phase TEXT,
+        market_regime TEXT,
         status TEXT NOT NULL,
         score INTEGER NOT NULL,
         entry REAL NOT NULL,
@@ -205,6 +207,7 @@ def init_db():
     for column, definition in {
       "setup_type": "TEXT",
       "market_phase": "TEXT",
+      "market_regime": "TEXT",
       "user_feedback": "TEXT",
       "lifecycle_status": "TEXT NOT NULL DEFAULT 'waiting'",
       "entry_hit_at": "INTEGER",
@@ -911,7 +914,17 @@ def learning_source_signature(connection, symbol=SYMBOL):
     FROM plans
     WHERE symbol = ? AND eligible_for_learning = 1 AND strategy_version = ? AND realized_r IS NOT NULL
   """, (symbol, STRATEGY_VERSION)).fetchone()
-  return f"{int(row['resolved'])}:{int(row['last_closed_at'])}:{int(row['last_updated_at'])}"
+  return f"v{LEARNING_SNAPSHOT_VERSION}:{int(row['resolved'])}:{int(row['last_closed_at'])}:{int(row['last_updated_at'])}"
+
+
+def wilson_interval(successes, total, z=1.96):
+  if total <= 0:
+    return None, None
+  proportion = successes / total
+  denominator = 1 + z ** 2 / total
+  centre = (proportion + z ** 2 / (2 * total)) / denominator
+  spread = z * math.sqrt((proportion * (1 - proportion) + z ** 2 / (4 * total)) / total) / denominator
+  return max(0.0, centre - spread), min(1.0, centre + spread)
 
 
 def learning_group_rows(connection, symbol, group_name, column):
@@ -922,6 +935,9 @@ def learning_group_rows(connection, symbol, group_name, column):
            SUM(CASE WHEN realized_r <= 0 THEN 1 ELSE 0 END) AS stopped,
            SUM(CASE WHEN outcome_status IN ('target1_stop', 'target2') THEN 1 ELSE 0 END) AS target1_hits,
            AVG(realized_r) AS expected_r,
+           AVG(CASE WHEN ABS(entry - stop) > 0 THEN max_favorable / ABS(entry - stop) END) AS avg_mfe_r,
+           AVG(CASE WHEN ABS(entry - stop) > 0 THEN max_adverse / ABS(entry - stop) END) AS avg_mae_r,
+           AVG(CASE WHEN entry_hit_at IS NOT NULL AND closed_at IS NOT NULL THEN closed_at - entry_hit_at END) AS avg_holding_ms,
            MAX(closed_at) AS last_closed_at
     FROM plans
     WHERE symbol = ? AND eligible_for_learning = 1 AND strategy_version = ? AND realized_r IS NOT NULL
@@ -937,6 +953,11 @@ def learning_group_rows(connection, symbol, group_name, column):
     value["win_rate"] = (winners + 10) / (sample_size + 20) if sample_size else 0.5
     value["target1_rate"] = (target1_hits + 10) / (sample_size + 20) if sample_size else 0.5
     value["expected_r"] = float(value["expected_r"] or 0)
+    value["calibrated_expected_r"] = value["expected_r"] * sample_size / (sample_size + 20) if sample_size else 0
+    value["avg_mfe_r"] = finite_or_none(value["avg_mfe_r"])
+    value["avg_mae_r"] = finite_or_none(value["avg_mae_r"])
+    value["avg_holding_ms"] = int(value["avg_holding_ms"]) if value["avg_holding_ms"] is not None else None
+    value["confidence_low"], value["confidence_high"] = wilson_interval(target1_hits + 10, sample_size + 20)
     value["group"] = group_name
     groups[str(value["group_key"])] = value
   return groups
@@ -944,6 +965,9 @@ def learning_group_rows(connection, symbol, group_name, column):
 
 def build_learning_snapshot(connection, symbol=SYMBOL):
   group_definitions = (
+    ("byComparable", "comparable", "COALESCE(setup_type, 'unknown') || '|' || CAST(timeframe AS TEXT) || '|' || COALESCE(market_phase, 'unknown') || '|' || direction || '|' || COALESCE(market_regime, 'unknown')"),
+    ("bySetupTimeframeDirection", "setup/timeframe/direction", "COALESCE(setup_type, 'unknown') || '|' || CAST(timeframe AS TEXT) || '|' || direction"),
+    ("bySetupTimeframe", "setup/timeframe", "COALESCE(setup_type, 'unknown') || '|' || CAST(timeframe AS TEXT)"),
     ("bySetup", "setup", "COALESCE(setup_type, 'unknown')"),
     ("byTimeframe", "timeframe", "CAST(timeframe AS TEXT)"),
     ("byPhase", "phase", "COALESCE(market_phase, 'unknown')"),
@@ -1078,20 +1102,34 @@ def learning_confidence_for_signal(snapshot, signal):
       "scope": "no actionable setup",
       "expectedR": None,
       "target1Rate": None,
+      "confidenceLow": None,
+      "confidenceHigh": None,
+      "avgMfeR": None,
+      "avgMaeR": None,
+      "avgHoldingMs": None,
       "lastUpdated": None,
     }
   setup_type = signal.get("setupType") or strategy_engine.setup_type(signal.get("setup", ""))
+  timeframe = str(signal.get("timeframe") or "")
+  phase = signal.get("marketPhase") or "unknown"
+  direction = signal.get("direction") or "unknown"
+  regime = (signal.get("regime") or {}).get("type") or signal.get("marketRegime") or "unknown"
+  comparable_key = "|".join((setup_type, timeframe, phase, direction, regime))
+  setup_timeframe_direction_key = "|".join((setup_type, timeframe, direction))
+  setup_timeframe_key = "|".join((setup_type, timeframe))
   candidates = (
-    ("setup", setup_type, "setup type"),
-    ("timeframe", str(signal.get("timeframe") or ""), "timeframe"),
-    ("phase", signal.get("marketPhase") or "unknown", "market phase"),
+    ("comparable", comparable_key, "comparable setup, timeframe, phase, direction, and regime", 8),
+    ("setupTimeframeDirection", setup_timeframe_direction_key, "setup, timeframe, and direction", 12),
+    ("setupTimeframe", setup_timeframe_key, "setup and timeframe", 15),
+    ("setup", setup_type, "setup type", 20),
+    ("timeframe", timeframe, "timeframe", 30),
   )
   groups = snapshot.get("groups") or {}
   selected = None
   scope = "no comparable resolved plans"
-  for group_name, key, label in candidates:
-    item = (groups.get(f"by{group_name.title()}") or {}).get(str(key))
-    if item and int(item.get("sample_size") or 0) >= 8:
+  for group_name, key, label, minimum_samples in candidates:
+    item = (groups.get(f"by{group_name[0].upper()}{group_name[1:]}") or {}).get(str(key))
+    if item and int(item.get("sample_size") or 0) >= minimum_samples:
       selected = item
       scope = label
       break
@@ -1102,6 +1140,11 @@ def learning_confidence_for_signal(snapshot, signal):
       "scope": scope,
       "expectedR": None,
       "target1Rate": None,
+      "confidenceLow": None,
+      "confidenceHigh": None,
+      "avgMfeR": None,
+      "avgMaeR": None,
+      "avgHoldingMs": None,
       "lastUpdated": None,
     }
   sample_size = int(selected["sample_size"])
@@ -1109,8 +1152,13 @@ def learning_confidence_for_signal(snapshot, signal):
     "status": "Established" if sample_size >= 60 else "Developing" if sample_size >= 20 else "Preliminary",
     "sampleSize": sample_size,
     "scope": scope,
-    "expectedR": finite_or_none(selected.get("expected_r")),
+    "expectedR": finite_or_none(selected.get("calibrated_expected_r")),
     "target1Rate": finite_or_none(selected.get("target1_rate")),
+    "confidenceLow": finite_or_none(selected.get("confidence_low")),
+    "confidenceHigh": finite_or_none(selected.get("confidence_high")),
+    "avgMfeR": finite_or_none(selected.get("avg_mfe_r")),
+    "avgMaeR": finite_or_none(selected.get("avg_mae_r")),
+    "avgHoldingMs": selected.get("avg_holding_ms"),
     "lastUpdated": selected.get("last_closed_at"),
   }
 
@@ -1226,6 +1274,7 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
     "setup": signal["setup"],
     "setup_type": signal.get("setupType", "unknown"),
     "market_phase": signal.get("marketPhase", "unknown"),
+    "market_regime": (signal.get("regime") or {}).get("type", "unknown"),
     "status": "alert",
     "score": int(signal["score"]),
     "entry": entry,
@@ -1266,13 +1315,13 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
   }
   cursor = connection.execute("""
     INSERT OR IGNORE INTO plans (
-      id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type, market_phase, status, score,
+      id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type, market_phase, market_regime, status, score,
       entry, stop, target1, target2, risk_reward, price_at_plan, rsi, atr, vwap,
       ema20, ema50, ema150, sma20, sma50, sma150, selected_trend, trend_5, trend_15,
       reasons_json, exit_rules_json, last_price, strategy_version, signal_candle_time, settings_json, data_quality, eligible_for_learning,
       calibration_json, feature_snapshot_json
     ) VALUES (
-      :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type, :market_phase, :status, :score,
+      :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type, :market_phase, :market_regime, :status, :score,
       :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan, :rsi, :atr, :vwap,
       :ema20, :ema50, :ema150, :sma20, :sma50, :sma150, :selected_trend, :trend_5, :trend_15,
       :reasons_json, :exit_rules_json, :price_at_plan, :strategy_version, :signal_candle_time, :settings_json, :data_quality, :eligible_for_learning,
@@ -2707,6 +2756,7 @@ class Handler(SimpleHTTPRequestHandler):
         "setup": str(plan.get("setup") or "unknown")[:160],
         "setup_type": str(plan.get("setupType") or "unknown")[:40],
         "market_phase": str(payload.get("marketPhase") or "unknown")[:40],
+        "market_regime": str(payload.get("marketRegime") or "unknown")[:40],
         "status": "watch" if plan.get("watchOnly") else "alert",
         "score": max(0, min(100, int(plan.get("score") or 0))),
         "entry": prices["entry"],
@@ -2772,12 +2822,12 @@ class Handler(SimpleHTTPRequestHandler):
 
         connection.execute("""
           INSERT INTO plans (
-            id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type, market_phase, status, score,
+            id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type, market_phase, market_regime, status, score,
             entry, stop, target1, target2, risk_reward, price_at_plan, rsi, atr, vwap,
             ema20, ema50, ema150, sma20, sma50, sma150, selected_trend, trend_5, trend_15,
             reasons_json, exit_rules_json, last_price, strategy_version, signal_candle_time, settings_json, data_quality, eligible_for_learning
           ) VALUES (
-            :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type, :market_phase, :status, :score,
+            :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type, :market_phase, :market_regime, :status, :score,
             :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan, :rsi, :atr, :vwap,
             :ema20, :ema50, :ema150, :sma20, :sma50, :sma150, :selected_trend, :trend_5, :trend_15,
             :reasons_json, :exit_rules_json, :price_at_plan, :strategy_version, :signal_candle_time, :settings_json, :data_quality, :eligible_for_learning

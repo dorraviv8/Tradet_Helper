@@ -278,7 +278,10 @@ class ServerTests(unittest.TestCase):
         SET realized_r = CASE WHEN id IN ('learn-0', 'learn-1', 'learn-2', 'learn-3', 'learn-4') THEN 1.2 ELSE -1.0 END,
             outcome_status = CASE WHEN id IN ('learn-0', 'learn-1', 'learn-2', 'learn-3', 'learn-4') THEN 'target2' ELSE 'stopped' END,
             lifecycle_status = 'closed',
+            entry_hit_at = 60000,
             closed_at = 120000,
+            max_favorable = 1.5,
+            max_adverse = 0.5,
             updated_at = 120000
         WHERE id LIKE 'learn-%'
       """)
@@ -286,12 +289,20 @@ class ServerTests(unittest.TestCase):
       stored = connection.execute("SELECT snapshot_json FROM learning_snapshots WHERE symbol = 'QQQ'").fetchone()
     self.assertEqual(snapshot["resolvedSamples"], 8)
     self.assertEqual(snapshot["groups"]["bySetup"]["breakout"]["winners"], 5)
+    self.assertIn("breakout|5|morning|long|unknown", snapshot["groups"]["byComparable"])
     self.assertIsNotNone(stored)
     confidence = server.learning_confidence_for_signal(snapshot, {
       "direction": "long", "setupType": "breakout", "timeframe": 5, "marketPhase": "morning",
     })
     self.assertEqual(confidence["status"], "Preliminary")
     self.assertEqual(confidence["sampleSize"], 8)
+    self.assertEqual(confidence["scope"], "comparable setup, timeframe, phase, direction, and regime")
+    self.assertAlmostEqual(confidence["target1Rate"], 15 / 28)
+    self.assertLess(confidence["confidenceLow"], confidence["target1Rate"])
+    self.assertGreater(confidence["confidenceHigh"], confidence["target1Rate"])
+    self.assertAlmostEqual(confidence["avgMfeR"], 1.5)
+    self.assertAlmostEqual(confidence["avgMaeR"], 0.5)
+    self.assertEqual(confidence["avgHoldingMs"], 60_000)
 
   def test_learning_snapshot_excludes_unresolved_and_quarantined_plans(self):
     self.insert_plan("resolved", realized_r=1.0, outcome_status="target2", lifecycle_status="closed", closed_at=120000)
