@@ -147,6 +147,15 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(loaded, candles)
     self.assertEqual(fetched_at, 123_456)
 
+  def test_history_uses_persisted_cache_when_provider_fetch_fails(self):
+    cached = [candle(60_000, 100, 101, 99, 100.5, 1_000)]
+    with server.db() as connection:
+      server.save_candles(connection, "BTC-USD", "yahoo", cached)
+    with patch.object(server, "fetch_history_candles", side_effect=server.URLError("temporary outage")):
+      candles, degraded = server.history_candles_with_fallback("yahoo", "BTC-USD", {"history": []})
+    self.assertEqual(candles, cached)
+    self.assertTrue(degraded)
+
   def test_supported_symbols_include_bitcoin_and_spy(self):
     self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")
     self.assertEqual(server.validate_symbol("spy"), "SPY")

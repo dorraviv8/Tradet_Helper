@@ -855,6 +855,19 @@ def load_cached_candles(symbol, limit=2500):
   return merge_candle_series(dict(row) for row in reversed(rows))
 
 
+def history_candles_with_fallback(provider, symbol, runtime=None):
+  live = (runtime or {}).get("history") or []
+  if live:
+    return live, False
+  try:
+    return fetch_history_candles(provider, symbol), False
+  except (HTTPError, URLError, TimeoutError, ValueError):
+    cached = load_cached_candles(symbol)
+    if cached:
+      return cached, True
+    raise
+
+
 def save_daily_candles(symbol, provider, candles, fetched_at=None):
   normalized = merge_candle_series(candles)
   if not normalized:
@@ -3016,13 +3029,14 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(503, {"error": "missing_provider", "detail": "No live provider is configured"})
         return
       runtime = market_runtime_snapshot(symbol)
-      candles = runtime["history"] or fetch_history_candles(provider, symbol)
+      candles, degraded = history_candles_with_fallback(provider, symbol, runtime)
       record_market_candles(symbol, provider, candles)
       self.send_json(200, {
         "symbol": symbol,
         "candles": candles[-2500:],
         "providerErrors": runtime["error_count"],
         "lastSuccessAt": runtime["last_success_at"],
+        "degraded": degraded,
         "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
       })
     except Exception as error:
