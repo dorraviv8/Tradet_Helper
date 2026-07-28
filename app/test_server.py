@@ -156,6 +156,23 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(candles, cached)
     self.assertTrue(degraded)
 
+  def test_monitoring_incidents_open_update_and_resolve_without_repeat_alerts(self):
+    notifications = []
+    notifier = lambda event, incident: notifications.append((event, incident["incident_key"])) or True
+    findings = {"QQQ:provider_errors": ("warning", "QQQ: provider has errors")}
+    with server.db() as connection:
+      opened = server.reconcile_monitoring_incidents(connection, findings, timestamp=1_000, notifier=notifier)
+      updated = server.reconcile_monitoring_incidents(connection, findings, timestamp=2_000, notifier=notifier)
+      resolved = server.reconcile_monitoring_incidents(connection, {}, timestamp=3_000, notifier=notifier)
+      row = connection.execute("SELECT status, occurrences, resolved_at FROM system_incidents WHERE incident_key = ?", ("QQQ:provider_errors",)).fetchone()
+    self.assertEqual(opened[0]["event"], "opened")
+    self.assertEqual(updated, [])
+    self.assertEqual(resolved[0]["event"], "resolved")
+    self.assertEqual(notifications, [("INCIDENT", "QQQ:provider_errors"), ("RECOVERED", "QQQ:provider_errors")])
+    self.assertEqual(row["status"], "resolved")
+    self.assertEqual(row["occurrences"], 2)
+    self.assertEqual(row["resolved_at"], 3_000)
+
   def test_supported_symbols_include_bitcoin_and_spy(self):
     self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")
     self.assertEqual(server.validate_symbol("spy"), "SPY")

@@ -73,6 +73,9 @@ OPTIONS_PROVIDER_DAILY_LIMIT = 80
 OPTIONS_PROVIDER_REQUEST_CREDITS = 4
 BACKTEST_MIN_REPLAY_INTERVAL_MS = 60 * 60 * 1000
 LEARNING_SNAPSHOT_VERSION = 2
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+MONITOR_INTERVAL_SECONDS = max(30, int(os.environ.get("MONITOR_INTERVAL_SECONDS", "60")))
+MONITOR_FAILURE_THRESHOLD = max(1, int(os.environ.get("MONITOR_FAILURE_THRESHOLD", "3")))
 SSE_MAX_CONNECTION_SECONDS = 75
 MAX_REQUEST_THREADS = 32
 FETCH_CACHE = {}
@@ -104,6 +107,7 @@ def new_market_runtime():
 
 MARKET_RUNTIMES = {symbol: new_market_runtime() for symbol in SUPPORTED_SYMBOLS}
 MARKET_STOP_EVENT = threading.Event()
+MONITOR_FAILURE_COUNTS = {}
 BACKTEST_JOB_LOCK = threading.Lock()
 BACKTEST_JOBS_ACTIVE = set()
 IBKR_CLIENT = None
@@ -364,6 +368,20 @@ def init_db():
     connection.execute("CREATE INDEX IF NOT EXISTS idx_option_ideas_plan ON option_ideas(plan_id, resolved_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_option_ideas_learning ON option_ideas(eligible_for_learning, delta_bucket)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_option_quotes_idea_time ON option_quote_observations(idea_id, observed_at DESC)")
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS system_incidents (
+        incident_key TEXT PRIMARY KEY,
+        severity TEXT NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        occurrences INTEGER NOT NULL DEFAULT 1,
+        last_notified_at INTEGER
+      )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_system_incidents_status ON system_incidents(status, last_seen_at DESC)")
     connection.execute("""
       UPDATE plans
       SET eligible_for_learning = 0
@@ -2072,6 +2090,128 @@ def market_runtime_snapshot(symbol=SYMBOL):
     }
 
 
+def monitoring_findings(timestamp=None):
+  timestamp = int(timestamp or now_ms())
+  findings = {}
+  for symbol in SUPPORTED_SYMBOLS:
+    runtime = market_runtime_snapshot(symbol)
+    health = runtime.get("data_health") or evaluate_data_health(symbol, runtime, timestamp)
+    provider_age = health.get("providerAgeMs")
+    if not runtime.get("history") and not runtime.get("candle"):
+      findings[f"{symbol}:no_market_data"] = ("critical", f"{symbol}: no market candles are available")
+    if int(runtime.get("error_count") or 0) >= 2:
+      findings[f"{symbol}:provider_errors"] = ("warning", f"{symbol}: market-data provider has {runtime['error_count']} consecutive errors")
+    if health.get("session") in {"regular", "continuous"} and provider_age is not None:
+      limit = 5 * MINUTE_MS if strategy_engine.is_continuous_market(symbol) else 7 * MINUTE_MS
+      if provider_age > limit:
+        findings[f"{symbol}:stale_data"] = ("critical", f"{symbol}: market data is stale for {round(provider_age / MINUTE_MS)} minutes")
+    if health.get("tradeAllowed") is False and health.get("blockers"):
+      findings[f"{symbol}:data_health"] = ("warning", f"{symbol}: trade alerts paused - {'; '.join(health['blockers'])}")
+  return findings
+
+
+def send_monitor_notification(event, incident):
+  if not ALERT_WEBHOOK_URL:
+    return False
+  text = f"Trader Helper {event}: {incident['severity'].upper()} - {incident['message']}"
+  payload = {
+    "text": text,
+    "content": text,
+    "event": event,
+    "incident": incident,
+  }
+  request = Request(
+    ALERT_WEBHOOK_URL,
+    data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+    headers={"Content-Type": "application/json", "User-Agent": "TraderHelperMonitor/1.0"},
+    method="POST",
+  )
+  try:
+    with urlopen(request, timeout=10) as response:
+      response.read(1)
+    return True
+  except (HTTPError, URLError, TimeoutError, ValueError):
+    return False
+
+
+def reconcile_monitoring_incidents(connection, findings, timestamp=None, notifier=send_monitor_notification):
+  timestamp = int(timestamp or now_ms())
+  active_rows = {
+    row["incident_key"]: dict(row)
+    for row in connection.execute("SELECT * FROM system_incidents WHERE status = 'open'").fetchall()
+  }
+  changed = []
+  for key, (severity, message) in findings.items():
+    row = active_rows.pop(key, None)
+    if row:
+      connection.execute("""
+        UPDATE system_incidents
+        SET severity = ?, message = ?, last_seen_at = ?, occurrences = occurrences + 1
+        WHERE incident_key = ?
+      """, (severity, message, timestamp, key))
+      continue
+    incident = {
+      "incident_key": key, "severity": severity, "message": message, "status": "open",
+      "first_seen_at": timestamp, "last_seen_at": timestamp, "resolved_at": None, "occurrences": 1,
+    }
+    connection.execute("""
+      INSERT INTO system_incidents (incident_key, severity, message, status, first_seen_at, last_seen_at, resolved_at, occurrences)
+      VALUES (:incident_key, :severity, :message, :status, :first_seen_at, :last_seen_at, :resolved_at, :occurrences)
+      ON CONFLICT(incident_key) DO UPDATE SET severity = excluded.severity, message = excluded.message,
+        status = 'open', first_seen_at = excluded.first_seen_at, last_seen_at = excluded.last_seen_at,
+        resolved_at = NULL, occurrences = 1, last_notified_at = NULL
+    """, incident)
+    if notifier("INCIDENT", incident):
+      connection.execute("UPDATE system_incidents SET last_notified_at = ? WHERE incident_key = ?", (timestamp, key))
+    changed.append({"event": "opened", **incident})
+  for key, row in active_rows.items():
+    connection.execute("UPDATE system_incidents SET status = 'resolved', resolved_at = ? WHERE incident_key = ?", (timestamp, key))
+    incident = {**row, "status": "resolved", "resolved_at": timestamp}
+    notifier("RECOVERED", incident)
+    changed.append({"event": "resolved", **incident})
+  return changed
+
+
+def system_health_snapshot():
+  timestamp = now_ms()
+  findings = monitoring_findings(timestamp)
+  with db() as connection:
+    incidents = [dict(row) for row in connection.execute("""
+      SELECT incident_key, severity, message, status, first_seen_at, last_seen_at, resolved_at, occurrences
+      FROM system_incidents ORDER BY status = 'open' DESC, last_seen_at DESC LIMIT 30
+    """).fetchall()]
+  return {
+    "status": "degraded" if findings else "healthy",
+    "generatedAt": timestamp,
+    "webhookConfigured": bool(ALERT_WEBHOOK_URL),
+    "findings": [{"key": key, "severity": value[0], "message": value[1]} for key, value in findings.items()],
+    "incidents": incidents,
+  }
+
+
+def monitoring_loop():
+  while not MARKET_STOP_EVENT.is_set():
+    try:
+      findings = monitoring_findings()
+      for key in list(MONITOR_FAILURE_COUNTS):
+        if key not in findings:
+          MONITOR_FAILURE_COUNTS.pop(key, None)
+      for key in findings:
+        MONITOR_FAILURE_COUNTS[key] = MONITOR_FAILURE_COUNTS.get(key, 0) + 1
+      confirmed = {key: value for key, value in findings.items() if MONITOR_FAILURE_COUNTS.get(key, 0) >= MONITOR_FAILURE_THRESHOLD}
+      with db() as connection:
+        reconcile_monitoring_incidents(connection, confirmed)
+    except Exception as error:
+      print(f"monitoring error: {error}", flush=True)
+    MARKET_STOP_EVENT.wait(MONITOR_INTERVAL_SECONDS)
+
+
+def start_monitoring_worker():
+  worker = threading.Thread(target=monitoring_loop, name="system-monitor", daemon=True)
+  worker.start()
+  return worker
+
+
 def market_data_loop(symbol):
   provider = active_provider(symbol)
   if not provider:
@@ -2629,6 +2769,9 @@ class Handler(SimpleHTTPRequestHandler):
       self.send_json(200 if ready else 503, {"status": status, "symbols": list(SUPPORTED_SYMBOLS)})
       return
     if not self.require_auth():
+      return
+    if parsed.path == "/api/system-health":
+      self.send_json(200, system_health_snapshot())
       return
     if parsed.path == "/api/config":
       params = parse_qs(parsed.query)
@@ -3236,6 +3379,7 @@ def main():
         MARKET_RUNTIMES[symbol]["backtest_status"] = "ready"
   server = AppHTTPServer((HOST, PORT), Handler)
   start_market_data_workers()
+  start_monitoring_worker()
   provider = active_provider(SYMBOL)
   if provider == "alpaca":
     mode = f"Alpaca {ALPACA_FEED} data proxy"

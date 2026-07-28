@@ -94,6 +94,12 @@ sudo docker-compose -f compose.yaml -f compose.production.yaml up --build -d
 
 Caddy receives ports 80 and 443, obtains and renews the TLS certificate for `PUBLIC_HOST`, and proxies traffic to the application over the private Docker network. The base Compose configuration keeps port 5173 bound to loopback only. Debian 12 ships the `docker-compose` command; on systems with Compose v2, use `docker compose` instead.
 
+## Monitoring Alerts
+
+Set `ALERT_WEBHOOK_URL` in the private `.env` file to an incoming Slack, Discord, or Google Chat webhook. The server checks every symbol once per minute and opens an incident only after three consecutive failures. It monitors missing candles, repeated provider errors, stale active-session data, and data-health blocks. Each incident is stored in SQLite, notified once, and sends a recovery notification when it clears.
+
+The authenticated endpoint `/api/system-health` returns the current findings and recent incident history. Without a webhook URL, monitoring remains active and persistent, but no external message is sent.
+
 ## Post-deploy Checks
 
 ```bash
