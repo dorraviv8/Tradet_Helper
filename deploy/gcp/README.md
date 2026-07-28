@@ -100,6 +100,10 @@ Set `ALERT_WEBHOOK_URL` in the private `.env` file to an incoming Slack, Discord
 
 The authenticated endpoint `/api/system-health` returns the current findings and recent incident history. Without a webhook URL, monitoring remains active and persistent, but no external message is sent.
 
+## Grafana Operations Dashboard
+
+The Compose stack includes private Prometheus and Node Exporter services plus Grafana at `https://PUBLIC_HOST/grafana/`. Grafana has its own login; set `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` in the private `.env` file. Prometheus scrapes the application's private `/metrics` endpoint and VM resource metrics every 30 seconds. Caddy blocks public access to `/metrics`; only Grafana is exposed through HTTPS.
+
 ## Post-deploy Checks
 
 ```bash

@@ -2189,6 +2189,39 @@ def system_health_snapshot():
   }
 
 
+def prometheus_metrics():
+  timestamp = now_ms()
+  findings = monitoring_findings(timestamp)
+  with db() as connection:
+    open_incidents = int(connection.execute("SELECT COUNT(*) AS total FROM system_incidents WHERE status = 'open'").fetchone()["total"])
+  lines = [
+    "# HELP trader_helper_up Whether the application process is responding.",
+    "# TYPE trader_helper_up gauge",
+    "trader_helper_up 1",
+    "# HELP trader_helper_open_incidents Number of currently open monitoring incidents.",
+    "# TYPE trader_helper_open_incidents gauge",
+    f"trader_helper_open_incidents {open_incidents}",
+    "# HELP trader_helper_active_findings Number of current unconfirmed monitoring findings.",
+    "# TYPE trader_helper_active_findings gauge",
+    f"trader_helper_active_findings {len(findings)}",
+    "# HELP trader_helper_provider_errors Consecutive market-data provider errors by symbol.",
+    "# TYPE trader_helper_provider_errors gauge",
+    "# HELP trader_helper_provider_age_seconds Age of the most recent successful provider refresh.",
+    "# TYPE trader_helper_provider_age_seconds gauge",
+    "# HELP trader_helper_trade_alerts_allowed Whether new trade alerts are permitted by data health.",
+    "# TYPE trader_helper_trade_alerts_allowed gauge",
+  ]
+  for symbol in SUPPORTED_SYMBOLS:
+    runtime = market_runtime_snapshot(symbol)
+    health = runtime.get("data_health") or evaluate_data_health(symbol, runtime, timestamp)
+    age = health.get("providerAgeMs")
+    labels = f'symbol="{symbol}"'
+    lines.append(f"trader_helper_provider_errors{{{labels}}} {int(runtime.get('error_count') or 0)}")
+    lines.append(f"trader_helper_provider_age_seconds{{{labels}}} {(float(age) / 1000) if age is not None else -1}")
+    lines.append(f"trader_helper_trade_alerts_allowed{{{labels}}} {1 if health.get('tradeAllowed') else 0}")
+  return "\n".join(lines) + "\n"
+
+
 def monitoring_loop():
   while not MARKET_STOP_EVENT.is_set():
     try:
@@ -2671,6 +2704,15 @@ class Handler(SimpleHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(body)
 
+  def send_text(self, status, body, content_type="text/plain; version=0.0.4; charset=utf-8"):
+    payload = body.encode("utf-8")
+    self.send_response(status)
+    self.send_header("Content-Type", content_type)
+    self.send_header("Content-Length", str(len(payload)))
+    self.send_header("Cache-Control", "no-store")
+    self.end_headers()
+    self.wfile.write(payload)
+
   def read_json_body(self):
     try:
       length = int(self.headers.get("Content-Length", "0"))
@@ -2767,6 +2809,9 @@ class Handler(SimpleHTTPRequestHandler):
       degraded = any(runtime["error_count"] for runtime in runtimes.values())
       status = "degraded" if ready and degraded else "ready" if ready else "starting"
       self.send_json(200 if ready else 503, {"status": status, "symbols": list(SUPPORTED_SYMBOLS)})
+      return
+    if parsed.path == "/metrics":
+      self.send_text(200, prometheus_metrics())
       return
     if not self.require_auth():
       return

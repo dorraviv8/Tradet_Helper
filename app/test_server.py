@@ -173,6 +173,12 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(row["occurrences"], 2)
     self.assertEqual(row["resolved_at"], 3_000)
 
+  def test_prometheus_metrics_expose_symbol_health_and_incidents(self):
+    metrics = server.prometheus_metrics()
+    self.assertIn("trader_helper_up 1", metrics)
+    self.assertIn('trader_helper_provider_errors{symbol="QQQ"}', metrics)
+    self.assertIn('trader_helper_trade_alerts_allowed{symbol="BTC-USD"}', metrics)
+
   def test_supported_symbols_include_bitcoin_and_spy(self):
     self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")
     self.assertEqual(server.validate_symbol("spy"), "SPY")
