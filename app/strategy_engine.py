@@ -157,6 +157,8 @@ def indicators(raw_candles, symbol=DEFAULT_SYMBOL):
   ranges = []
   volume_history = {}
   relative_volumes = []
+  rolling_relative_volumes = []
+  rolling_volumes = []
   for index, candle in enumerate(candles):
     previous = candles[index - 1] if index else None
     change = candle["close"] - previous["close"] if previous else 0
@@ -170,9 +172,13 @@ def indicators(raw_candles, symbol=DEFAULT_SYMBOL):
     samples = volume_history.setdefault(minute, [])
     average = sum(samples) / len(samples) if samples else None
     relative_volumes.append(candle["volume"] / average if average and candle["volume"] else None)
+    rolling_average = sum(rolling_volumes) / len(rolling_volumes) if rolling_volumes else None
+    rolling_relative_volumes.append(candle["volume"] / rolling_average if rolling_average and candle["volume"] else None)
     if candle["volume"]:
       samples.append(candle["volume"])
       del samples[:-10]
+      rolling_volumes.append(candle["volume"])
+      del rolling_volumes[:-20]
 
   average_gains = wilder(gains, 14)
   average_losses = wilder(losses, 14)
@@ -202,7 +208,9 @@ def indicators(raw_candles, symbol=DEFAULT_SYMBOL):
       "vwap": cumulative_pv / cumulative_volume if cumulative_volume else None,
       "rsi": rsi,
       "atr": atrs[index],
-      "relativeVolume": relative_volumes[index],
+      "timeRelativeVolume": relative_volumes[index],
+      "rollingRelativeVolume": rolling_relative_volumes[index],
+      "relativeVolume": relative_volumes[index] or rolling_relative_volumes[index],
     }
     for name, values in averages.items():
       enriched[name] = values[index]
@@ -339,21 +347,114 @@ def bounds(timeframe, mode, symbol=DEFAULT_SYMBOL):
 
 
 def session_levels(candles, bar_minutes=1, symbol=DEFAULT_SYMBOL):
-  regular = [candle for candle in today_candles(candles, symbol) if market_session(candle["time"], symbol)["regular"]]
-  opening = regular[:max(1, math.ceil(30 / max(1, bar_minutes)))]
-  if not opening:
+  current = today_candles(candles, symbol)
+  regular = [candle for candle in current if market_session(candle["time"], symbol)["regular"]]
+  premarket = [candle for candle in current if market_session(candle["time"], symbol)["phase"] == "premarket"]
+  if not regular:
     return {}
-  return {
-    "openingHigh": max(candle["high"] for candle in opening),
-    "openingLow": min(candle["low"] for candle in opening),
+  result = {
     "sessionHigh": max(candle["high"] for candle in regular),
     "sessionLow": min(candle["low"] for candle in regular),
+  }
+  for minutes in (5, 15, 30):
+    count = math.ceil(minutes / max(1, bar_minutes))
+    opening = regular[:count]
+    if len(opening) >= count:
+      result[f"opening{minutes}High"] = max(candle["high"] for candle in opening)
+      result[f"opening{minutes}Low"] = min(candle["low"] for candle in opening)
+  if premarket:
+    result["premarketHigh"] = max(candle["high"] for candle in premarket)
+    result["premarketLow"] = min(candle["low"] for candle in premarket)
+  return result
+
+
+def prior_session_levels(candles, symbol=DEFAULT_SYMBOL):
+  values = merge_candles(candles)
+  if not values:
+    return {}
+  current_day = market_parts(values[-1]["time"], symbol)[0]
+  sessions = {}
+  for candle in values:
+    session = market_session(candle["time"], symbol)
+    if session["regular"] and session["date"] != current_day:
+      sessions.setdefault(session["date"], []).append(candle)
+  if not sessions:
+    return {}
+  previous = sessions[sorted(sessions)[-1]]
+  return {
+    "priorDayHigh": max(candle["high"] for candle in previous),
+    "priorDayLow": min(candle["low"] for candle in previous),
+  }
+
+
+def compression_breakout(values, direction):
+  """Identify a compact six-bar 5m range that has just expanded through its boundary."""
+  if len(values) < 8:
+    return False
+  prior = values[-7:-1]
+  latest = values[-1]
+  atr = latest.get("atr") or 0
+  if atr <= 0:
+    return False
+  high = max(candle["high"] for candle in prior)
+  low = min(candle["low"] for candle in prior)
+  compressed = high - low <= atr * 2.2
+  return compressed and (latest["close"] > high if direction == "long" else latest["close"] < low)
+
+
+def five_minute_no_trade_filters(latest, regime, symbol=DEFAULT_SYMBOL):
+  phase = market_phase(latest["time"], symbol)
+  reasons = []
+  atr = latest.get("atr") or 0
+  close = latest.get("close") or 0
+  relative_volume = latest.get("relativeVolume")
+  if not is_continuous_market(symbol) and phase == "open":
+    reasons.append("Wait for the 15-minute opening range to complete")
+  if atr > 0 and close > 0 and atr / close < 0.00035:
+    reasons.append("5m volatility is too compressed for a reliable target")
+  if phase == "midday" and relative_volume is not None and relative_volume < 0.6:
+    reasons.append("Midday volume is too light for a momentum trade")
+  if regime.get("type") == "chop" and atr > 0 and abs(latest["close"] - (latest.get("vwap") or latest["close"])) < atr * 0.35:
+    reasons.append("Choppy price action is too close to VWAP")
+  return reasons
+
+
+def execution_confirmation(values, direction):
+  """Use closed 1m bars to validate that a 5m idea has an execution trigger."""
+  if len(values or []) < 8:
+    return {"available": False, "aligned": None, "detail": "1m execution bars are still building"}
+  latest = values[-1]
+  previous = values[-2]
+  required = (latest.get("ema20"), latest.get("vwap"), latest.get("rsi"), previous.get("ema20"))
+  if any(value is None for value in required):
+    return {"available": False, "aligned": None, "detail": "1m execution indicators are still building"}
+  shape = candle_shape(latest)
+  if direction == "long":
+    aligned = (
+      latest["close"] > latest["ema20"]
+      and latest["close"] > latest["vwap"]
+      and latest["rsi"] >= 50
+      and latest["close"] >= previous["close"]
+      and (shape["bullish"] or latest["low"] <= latest["ema20"])
+    )
+  else:
+    aligned = (
+      latest["close"] < latest["ema20"]
+      and latest["close"] < latest["vwap"]
+      and latest["rsi"] <= 50
+      and latest["close"] <= previous["close"]
+      and (shape["bearish"] or latest["high"] >= latest["ema20"])
+    )
+  return {
+    "available": True,
+    "aligned": aligned,
+    "detail": "1m execution confirms the 5m direction" if aligned else "1m execution does not yet confirm the 5m direction",
   }
 
 
 def setup_type(setup):
   value = setup.lower()
-  for needle, label in (("momentum", "momentum"), ("pullback", "ema_pullback"), ("vwap", "vwap"), ("breakout", "breakout"), ("breakdown", "breakdown"), ("reversal", "reversal")):
+  for needle, label in (("failed", "failed_breakout"), ("compression", "compression"), ("opening range", "opening_range"), ("premarket", "premarket"), ("momentum", "momentum"), ("pullback", "ema_pullback"), ("vwap", "vwap"), ("breakout", "breakout"), ("breakdown", "breakdown"), ("reversal", "reversal")):
     if needle in value:
       return label
   return "other"
@@ -421,6 +522,8 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   confirmation = trend_confirmation(context["trends"], timeframe, direction)
   extension = atr_extension(latest, direction)
   continuation = kind in {"momentum", "breakout", "breakdown", "ema_pullback"}
+  execution = context.get("execution") or {"available": False, "aligned": None}
+  relative_volume = latest.get("relativeVolume") or 0
 
   if (regime["type"] == "trend_up" and not long) or (regime["type"] == "trend_down" and long):
     score -= 16
@@ -440,6 +543,13 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   if continuation and extension > 1.35:
     score -= 20
     reasons.append(f"Price is already {extension:.1f} ATR beyond EMA 20; avoid chasing")
+  if timeframe == 5 and execution["available"]:
+    if execution["aligned"]:
+      score += 10
+      reasons.append(execution["detail"])
+    elif continuation:
+      score -= 18
+      reasons.append(execution["detail"])
 
   checks = (
     (context["selectedTrend"]["tone"] == tone, 16, f"{timeframe}m trend agrees"),
@@ -450,7 +560,7 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
     ((latest["close"] > latest["vwap"]) if long else (latest["close"] < latest["vwap"]), 8, "VWAP is on the correct side"),
     ((45 <= latest["rsi"] <= 68) if long else (32 <= latest["rsi"] <= 55), 10, "RSI is in a tradable momentum zone"),
     ((shape["bullish"] if long else shape["bearish"]) and shape["bodyPct"] >= 0.35, 10, "Confirmation candle has a real body"),
-    (((latest.get("relativeVolume") or 0) >= 1.15) or shape["body"] >= latest["atr"] * 0.35, 8, "Volume or candle expansion supports the move"),
+    ((relative_volume >= (1.1 if timeframe == 5 else 1.15)) or shape["body"] >= latest["atr"] * 0.35, 8, "Relative volume or candle expansion supports the move"),
     ((local["supportTouches"] if long else local["resistanceTouches"]) >= 2, 4, "Nearby level has repeated touches"),
   )
   if phase in {"morning", "afternoon", "power_hour"}:
@@ -465,7 +575,7 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
       reasons.append(reason)
 
   current_bounds = bounds(timeframe, settings.get("mode", "normal"), symbol)
-  buffer = max(0.03, latest["atr"] * 0.08)
+  buffer = max(0.03, latest["atr"] * (0.1 if timeframe == 5 else 0.08))
   if long:
     entry = max(latest["high"] + buffer, latest["close"] + 0.01)
     stop = min(latest["low"], latest["ema20"], local["support"]) - latest["atr"] * 0.2
@@ -481,8 +591,13 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   minimum = entry * current_bounds["target1MinPct"]
   maximum = entry * current_bounds["target1MaxPct"]
   maximum2 = entry * current_bounds["target2MaxPct"]
-  target_move = clamp(max(risk * 1.05, minimum), minimum, maximum)
-  target2_move = clamp(max(risk * 1.5, maximum), maximum, maximum2)
+  if timeframe == 5:
+    # Keep 5m targets tied to current volatility while retaining the configured QQQ move limits.
+    target_move = clamp(max(risk * 1.15, latest["atr"] * 0.75, minimum), minimum, maximum)
+    target2_move = clamp(max(risk * 1.7, latest["atr"] * 1.15, target_move * 1.35), target_move, maximum2)
+  else:
+    target_move = clamp(max(risk * 1.05, minimum), minimum, maximum)
+    target2_move = clamp(max(risk * 1.5, maximum), maximum, maximum2)
   target = entry + target_move if long else entry - target_move
   target2 = entry + target2_move if long else entry - target2_move
   risk_reward = target_move / risk if risk else 0
@@ -514,8 +629,9 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
     "target": target,
     "target2": target2,
     "riskReward": risk_reward,
-    "watchOnly": structural_risk_too_wide or risk_reward < 0.85 or (continuation and extension > 1.8),
+    "watchOnly": structural_risk_too_wide or risk_reward < 0.85 or (continuation and extension > 1.8) or (timeframe == 5 and continuation and execution["available"] and not execution["aligned"]),
     "marketPhase": phase,
+    "executionConfirmation": execution,
     "exitWarning": f"For {direction}: scale at T1, trail {'below' if long else 'above'} EMA 20/VWAP",
     "exitRules": exit_rules,
   }
@@ -793,11 +909,14 @@ def analyze_all(raw_candles, settings=None, performance=None, now=None, five_min
   for timeframe in TIMEFRAMES:
     source = five_minute_candles if timeframe in {5, 15} and five_minute_candles else candles
     selected = indicators(closed_for_timeframe(source, timeframe, now), symbol)
-    output[timeframe] = build_intraday_signal(selected, timeframe, trends, regime, session, settings, performance, quality_issues, symbol)
+    output[timeframe] = build_intraday_signal(
+      selected, timeframe, trends, regime, session, settings, performance, quality_issues, symbol,
+      execution_values=trend_values[1],
+    )
   return output
 
 
-def build_intraday_signal(selected, timeframe, trends, regime, session, settings=None, performance=None, quality_issues=None, symbol=DEFAULT_SYMBOL):
+def build_intraday_signal(selected, timeframe, trends, regime, session, settings=None, performance=None, quality_issues=None, symbol=DEFAULT_SYMBOL, execution_values=None):
   settings = settings or {}
   performance = performance or {}
   quality_issues = quality_issues or []
@@ -819,6 +938,11 @@ def build_intraday_signal(selected, timeframe, trends, regime, session, settings
   if not levels:
     return neutral("Recent support and resistance are unavailable.", timeframe, trend_context)
   shape = candle_shape(latest)
+  reference_levels = prior_session_levels(selected, symbol) if timeframe == 5 else {}
+  session = {**session, **reference_levels}
+  five_minute_filters = five_minute_no_trade_filters(latest, regime, symbol) if timeframe == 5 else []
+  execution_long = execution_confirmation(execution_values, "long") if timeframe == 5 else {"available": False, "aligned": None}
+  execution_short = execution_confirmation(execution_values, "short") if timeframe == 5 else {"available": False, "aligned": None}
   long_confirmation = trend_confirmation(trends, timeframe, "long")
   short_confirmation = trend_confirmation(trends, timeframe, "short")
   bullish_context = long_confirmation["aligned"] >= 1
@@ -829,12 +953,32 @@ def build_intraday_signal(selected, timeframe, trends, regime, session, settings
   near_resistance = latest["high"] >= levels["resistance"] - latest["atr"] * 0.45
   reclaim_vwap = previous.get("vwap") is not None and previous["close"] <= previous["vwap"] and latest["close"] > latest["vwap"]
   lose_vwap = previous.get("vwap") is not None and previous["close"] >= previous["vwap"] and latest["close"] < latest["vwap"]
+  opening_high = session.get("opening15High")
+  opening_low = session.get("opening15Low")
+  opening_range_long = timeframe == 5 and opening_high is not None and previous["close"] <= opening_high < latest["close"]
+  opening_range_short = timeframe == 5 and opening_low is not None and previous["close"] >= opening_low > latest["close"]
+  prior_day_high = session.get("priorDayHigh")
+  prior_day_low = session.get("priorDayLow")
+  premarket_high = session.get("premarketHigh")
+  premarket_low = session.get("premarketLow")
+  failed_breakout_short = timeframe == 5 and latest["high"] > levels["resistance"] and latest["close"] < levels["resistance"] and shape["upperWickPct"] >= 0.35
+  failed_breakdown_long = timeframe == 5 and latest["low"] < levels["support"] and latest["close"] > levels["support"] and shape["lowerWickPct"] >= 0.35
   conditions = (
+    (opening_range_long and bullish_continuation, "long", "15m opening range breakout", 30, "Price closed above the completed 15-minute opening range with aligned momentum"),
+    (timeframe == 5 and prior_day_high is not None and previous["close"] <= prior_day_high < latest["close"] and bullish_continuation, "long", "prior day high breakout", 28, "Price closed above prior-day resistance with aligned momentum"),
+    (timeframe == 5 and premarket_high is not None and previous["close"] <= premarket_high < latest["close"] and bullish_continuation, "long", "premarket high breakout", 26, "Price closed above the premarket high with aligned momentum"),
+    (compression_breakout(selected, "long") and bullish_continuation, "long", "compression breakout", 26, "A compact 5m range expanded upward with aligned momentum"),
+    (failed_breakdown_long and bullish_context, "long", "failed breakdown reversal", 24, "Price reclaimed broken support after a failed downside break"),
     (bullish_continuation and latest["close"] > latest["vwap"] and latest["low"] <= latest["ema20"] < latest["close"], "long", "EMA 20 pullback", 24, "Pullback held the EMA 20/VWAP area"),
     (latest["close"] > levels["resistance"] and bullish_continuation, "long", "breakout", 28, "Price broke above recent resistance with multi-timeframe confirmation"),
     (reclaim_vwap and latest["close"] > latest["ema20"], "long", "VWAP reclaim", 20, "Price reclaimed VWAP and closed above EMA 20"),
     (near_support and shape["lowerWickPct"] >= 0.35 and latest["close"] > previous["high"] and latest["rsi"] > previous["rsi"], "long", "support reversal", 18, "Price rejected support with improving RSI"),
     (bullish_continuation and trends[timeframe]["tone"] == "positive" and latest["close"] > latest["ema20"] and 50 <= latest["rsi"] <= 78, "long", "momentum continuation", 18, "Current momentum is aligned across timeframes for a small upside continuation"),
+    (opening_range_short and bearish_continuation, "short", "15m opening range breakdown", 30, "Price closed below the completed 15-minute opening range with aligned momentum"),
+    (timeframe == 5 and prior_day_low is not None and previous["close"] >= prior_day_low > latest["close"] and bearish_continuation, "short", "prior day low breakdown", 28, "Price closed below prior-day support with aligned momentum"),
+    (timeframe == 5 and premarket_low is not None and previous["close"] >= premarket_low > latest["close"] and bearish_continuation, "short", "premarket low breakdown", 26, "Price closed below the premarket low with aligned momentum"),
+    (compression_breakout(selected, "short") and bearish_continuation, "short", "compression breakdown", 26, "A compact 5m range expanded downward with aligned momentum"),
+    (failed_breakout_short and bearish_context, "short", "failed breakout reversal", 24, "Price rejected broken resistance after a failed upside break"),
     (bearish_continuation and latest["close"] < latest["vwap"] and latest["high"] >= latest["ema20"] > latest["close"], "short", "EMA 20 pullback", 24, "Pullback rejected the EMA 20/VWAP area"),
     (latest["close"] < levels["support"] and bearish_continuation, "short", "breakdown", 28, "Price broke below recent support with multi-timeframe confirmation"),
     (lose_vwap and latest["close"] < latest["ema20"], "short", "VWAP loss", 20, "Price lost VWAP and closed below EMA 20"),
@@ -859,8 +1003,13 @@ def build_intraday_signal(selected, timeframe, trends, regime, session, settings
       "trends": trends,
       "regime": regime,
       "session": session,
+      "execution": execution_long if direction == "long" else execution_short,
     }
     candidates.append(score_candidate(candidate, context, settings, performance, symbol))
+  if five_minute_filters:
+    for candidate in candidates:
+      candidate["watchOnly"] = True
+      candidate["reasons"].extend(five_minute_filters)
   candidates.sort(key=lambda item: (item["score"], item["riskReward"]), reverse=True)
   best_long = next((item for item in candidates if item["direction"] == "long"), None)
   best_short = next((item for item in candidates if item["direction"] == "short"), None)
@@ -869,7 +1018,7 @@ def build_intraday_signal(selected, timeframe, trends, regime, session, settings
   market = market_session(latest["time"], symbol)
   outside_session = settings.get("sessionMode", "regular") == "regular" and not market["regular"]
   if not best or best["watchOnly"] or best["score"] < threshold or outside_session or quality_issues:
-    reason = "Alerts are paused outside regular market hours" if outside_session else f"Alerts are paused until data quality is clean: {', '.join(quality_issues)}" if quality_issues else "No long or short setup is confirmed right now"
+    reason = "Alerts are paused outside regular market hours" if outside_session else f"Alerts are paused until data quality is clean: {', '.join(quality_issues)}" if quality_issues else "; ".join(five_minute_filters) if five_minute_filters else "No long or short setup is confirmed right now"
     signal = neutral(reason, timeframe, trend_context)
   else:
     signal = {**best, "timeframe": timeframe, **trend_context}
@@ -911,4 +1060,5 @@ def analyze_intraday_timeframe(raw_candles, timeframe, settings=None, performanc
     performance,
     [],
     symbol,
+    execution_values=trend_values[1],
   )

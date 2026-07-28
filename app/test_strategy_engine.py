@@ -166,6 +166,102 @@ class StrategyEngineTests(unittest.TestCase):
     self.assertEqual(result[5]["latestIndicator"]["time"], five_minute[-1]["time"])
     self.assertAlmostEqual(result[5]["latestIndicator"]["close"], five_minute[-1]["close"])
 
+  def test_session_levels_only_expose_completed_opening_ranges(self):
+    start = timestamp(2026, 7, 17, 9, 30)
+    candles = [
+      candle(start + index * strategy.MINUTE_MS, 100 + index * 0.1, 100.2 + index * 0.1, 99.9 + index * 0.1, 100.1 + index * 0.1)
+      for index in range(20)
+    ]
+    levels = strategy.session_levels(candles)
+    self.assertIn("opening5High", levels)
+    self.assertIn("opening15High", levels)
+    self.assertNotIn("opening30High", levels)
+    self.assertAlmostEqual(levels["opening15High"], candles[14]["high"])
+    self.assertAlmostEqual(levels["sessionHigh"], candles[-1]["high"])
+
+  def test_relative_volume_uses_rolling_baseline_when_time_of_day_history_is_short(self):
+    start = timestamp(2026, 7, 17, 9, 30)
+    candles = [
+      candle(start + index * 5 * strategy.MINUTE_MS, 100, 100.2, 99.8, 100.1, 1_000)
+      for index in range(21)
+    ]
+    candles[-1]["volume"] = 2_000
+    values = strategy.indicators(candles)
+    self.assertIsNone(values[-1]["timeRelativeVolume"])
+    self.assertAlmostEqual(values[-1]["rollingRelativeVolume"], 2.0)
+    self.assertAlmostEqual(values[-1]["relativeVolume"], 2.0)
+
+  def test_five_minute_continuation_requires_available_one_minute_execution_alignment(self):
+    latest = {
+      "time": timestamp(2026, 7, 17, 10, 30), "open": 100.0, "high": 100.2, "low": 99.9, "close": 100.1,
+      "volume": 2_000, "ema20": 100.0, "ema50": 99.8, "sma20": 100.0, "sma50": 99.8,
+      "vwap": 99.9, "rsi": 60.0, "atr": 1.0, "relativeVolume": 1.3,
+    }
+    previous = {**latest, "time": latest["time"] - 5 * strategy.MINUTE_MS, "close": 99.95, "high": 100.0, "low": 99.8}
+    context = {
+      "latest": latest,
+      "previous": previous,
+      "direction": "long",
+      "shape": strategy.candle_shape(latest),
+      "levels": {"support": 99.7, "resistance": 100.15, "supportTouches": 2, "resistanceTouches": 2},
+      "timeframe": 5,
+      "trend5": {"tone": "positive"},
+      "trend15": {"tone": "positive"},
+      "selectedTrend": {"tone": "positive"},
+      "trends": {1: {"tone": "positive"}, 5: {"tone": "positive"}, 15: {"tone": "positive"}},
+      "regime": {"type": "trend_up", "label": "Trend Up"},
+      "execution": {"available": True, "aligned": False, "detail": "1m execution does not yet confirm the 5m direction"},
+    }
+    candidate = strategy.score_candidate({
+      "setup": "Long 5m momentum continuation", "baseScore": 45, "reasons": ["test"],
+    }, context, {"mode": "normal"}, {})
+    self.assertTrue(candidate["watchOnly"])
+    self.assertIn("1m execution does not yet confirm", " ".join(candidate["reasons"]))
+
+  def test_prior_session_levels_use_the_last_completed_regular_session(self):
+    previous = timestamp(2026, 7, 16, 15, 55)
+    current = timestamp(2026, 7, 17, 10, 0)
+    levels = strategy.prior_session_levels([
+      candle(previous - 5 * strategy.MINUTE_MS, 100, 102, 99, 101),
+      candle(previous, 101, 103, 100, 102),
+      candle(current, 104, 105, 103, 104.5),
+    ])
+    self.assertEqual(levels, {"priorDayHigh": 103, "priorDayLow": 99})
+
+  def test_compression_breakout_requires_a_compact_range_then_close_outside_it(self):
+    start = timestamp(2026, 7, 17, 11, 0)
+    values = []
+    for index in range(8):
+      base = 100 + (0.03 if index % 2 else 0)
+      values.append({
+        "time": start + index * 5 * strategy.MINUTE_MS,
+        "open": base,
+        "high": base + 0.12,
+        "low": base - 0.12,
+        "close": base + 0.01,
+        "atr": 0.5,
+      })
+    values[-1]["close"] = 100.45
+    values[-1]["high"] = 100.5
+    self.assertTrue(strategy.compression_breakout(values, "long"))
+    self.assertFalse(strategy.compression_breakout(values, "short"))
+
+  def test_five_minute_no_trade_filters_cover_open_low_volatility_and_midday_volume(self):
+    open_candle = {"time": timestamp(2026, 7, 17, 9, 35), "close": 600, "atr": 0.4, "vwap": 600, "relativeVolume": 1.0}
+    open_filters = strategy.five_minute_no_trade_filters(open_candle, {"type": "mixed"})
+    self.assertIn("Wait for the 15-minute opening range to complete", open_filters)
+    midday_candle = {"time": timestamp(2026, 7, 17, 12, 0), "close": 600, "atr": 0.1, "vwap": 600, "relativeVolume": 0.5}
+    midday_filters = strategy.five_minute_no_trade_filters(midday_candle, {"type": "chop"})
+    self.assertIn("5m volatility is too compressed for a reliable target", midday_filters)
+    self.assertIn("Midday volume is too light for a momentum trade", midday_filters)
+    self.assertIn("Choppy price action is too close to VWAP", midday_filters)
+
+  def test_new_five_minute_setup_types_remain_distinct_for_learning_and_replay(self):
+    self.assertEqual(strategy.setup_type("Long 5m failed breakout reversal"), "failed_breakout")
+    self.assertEqual(strategy.setup_type("Long 5m compression breakout"), "compression")
+    self.assertEqual(strategy.setup_type("Long 5m 15m opening range breakout"), "opening_range")
+    self.assertEqual(strategy.setup_type("Long 5m premarket high breakout"), "premarket")
+
 
 if __name__ == "__main__":
   unittest.main()

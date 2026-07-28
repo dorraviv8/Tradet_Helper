@@ -99,6 +99,16 @@ class BacktestEngineTests(unittest.TestCase):
     self.assertEqual(result["sampleSize"], 0)
     self.assertIsNone(result["probabilityT1"])
 
+  def test_timeframe_summaries_keep_five_minute_results_separate(self):
+    trades = [
+      {"timeframe": 1, "enteredAt": 1, "outcome": "target2", "realizedR": 1.0, "target1Hit": True, "mfeR": 1.2, "maeR": 0.2, "timeToTarget1Ms": 60_000},
+      {"timeframe": 5, "enteredAt": 1, "outcome": "stopped", "realizedR": -1.0, "target1Hit": False, "mfeR": 0.2, "maeR": 1.0, "timeToTarget1Ms": None},
+    ]
+    summary = backtest.timeframe_summaries(trades)
+    self.assertEqual(summary["1"]["resolved"], 1)
+    self.assertEqual(summary["5"]["resolved"], 1)
+    self.assertEqual(summary["5"]["expectedR"], -1.0)
+
 
 if __name__ == "__main__":
   unittest.main()

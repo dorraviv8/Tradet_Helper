@@ -3253,7 +3253,7 @@ async function refreshReplayStats() {
 }
 
 function renderReplaySummary(data) {
-  const summary = data.summary || {};
+  const summary = (data.byTimeframe || {})[String(state.selectedTimeframe)] || data.summary || {};
   const resolved = Number(summary.resolved || 0);
   if (!resolved) {
     els.replayBest.textContent = data.status === "error" ? "Error" : "Building";
@@ -3264,7 +3264,7 @@ function renderReplaySummary(data) {
     els.replayExcursion.textContent = "--";
     return;
   }
-  els.replayBest.textContent = "Ready";
+  els.replayBest.textContent = `${timeframeLabel()} Ready`;
   setTone(els.replayBest, "positive");
   els.replayAvgTarget.textContent = Number.isFinite(Number(summary.probabilityT1)) ? `${fmt(Number(summary.probabilityT1) * 100, 0)}%` : "--";
   const expectedR = Number(summary.expectedR);
@@ -3339,6 +3339,7 @@ function selectTimeframe(timeframe) {
   els.timeframeButtons.forEach((item) => item.classList.toggle("active", Number(item.dataset.timeframe) === state.selectedTimeframe));
   syncVwapControl();
   refresh();
+  if (state.replayStats) renderReplaySummary(state.replayStats);
 }
 
 function refresh() {

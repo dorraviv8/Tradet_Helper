@@ -268,6 +268,7 @@ def run_replay(one_minute=None, five_minute=None, daily=None, settings=None, sym
   return {
     "symbol": symbol,
     "summary": summarize(trades),
+    "byTimeframe": timeframe_summaries(trades),
     "groups": grouped_summaries(trades),
     "trades": trades,
     "method": {
@@ -318,6 +319,13 @@ def grouped_summaries(trades):
       **summarize(rows),
     })
   return sorted(output, key=lambda row: (row["timeframe"], row["setupType"], row["marketPhase"], row["direction"]))
+
+
+def timeframe_summaries(trades):
+  return {
+    str(timeframe): summarize([trade for trade in trades if int(trade["timeframe"]) == timeframe])
+    for timeframe in sorted({int(trade["timeframe"]) for trade in trades})
+  }
 
 
 def wilson_interval(successes, total, z=1.96):
