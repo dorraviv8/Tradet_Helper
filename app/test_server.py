@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -200,6 +201,42 @@ class ServerTests(unittest.TestCase):
     finally:
       with server.MARKET_RUNTIME_LOCK:
         server.MARKET_RUNTIMES["QQQ"] = original
+
+  def test_data_health_blocks_missing_intraday_bars_during_market_hours(self):
+    now = int(datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    runtime = server.new_market_runtime()
+    minute = 60_000
+    runtime["history"] = [
+      candle(now - (24 - index) * minute, 100, 101, 99, 100.5, 1_000)
+      for index in range(24)
+      if index != 12
+    ]
+    runtime["candle"] = candle(now, 100, 101, 99, 100.5, 1_000)
+    runtime["five_minute_history"] = [
+      candle(now - (36 - index) * 5 * minute, 100, 101, 99, 100.5, 2_000)
+      for index in range(36)
+    ]
+    runtime["daily_history"] = [
+      candle(now - (220 - index) * 86_400_000, 100, 101, 99, 100.5, 2_000)
+      for index in range(220)
+    ]
+    runtime["last_success_at"] = now
+    health = server.evaluate_data_health("QQQ", runtime, now)
+    self.assertEqual(health["status"], "Blocked")
+    self.assertFalse(health["tradeAllowed"])
+    self.assertIn("missing-bar gap", " ".join(health["blockers"]))
+
+  def test_data_health_marks_directional_candidates_watch_only(self):
+    candidate = {"direction": "long", "watchOnly": False, "reasons": []}
+    recommendations = {5: {**candidate, "bestLong": candidate, "bestShort": None}}
+    health = {
+      "tradeAllowed": False,
+      "blockers": ["provider refresh is stale"],
+      "timeframes": {"5": {"tradeAllowed": False, "detail": "bar is stale"}},
+    }
+    result = server.apply_data_health(recommendations, health)
+    self.assertTrue(result[5]["watchOnly"])
+    self.assertIn("provider refresh is stale", result[5]["dataQuality"])
 
   def test_learning_snapshot_persists_resolved_current_strategy_plans(self):
     for index in range(8):

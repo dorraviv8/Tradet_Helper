@@ -24,6 +24,8 @@ const state = {
   lastStreamAt: null,
   marketCandleAt: null,
   dataQualityIssues: [],
+  localDataQualityIssues: [],
+  dataHealth: null,
   selectedTimeframe: 1,
   settings: {
     activeTradeThreshold: 62,
@@ -112,6 +114,8 @@ const els = {
   marketStatus: document.getElementById("marketStatus"),
   signalBarState: document.getElementById("signalBarState"),
   dataQuality: document.getElementById("dataQuality"),
+  tradePermission: document.getElementById("tradePermission"),
+  barContinuity: document.getElementById("barContinuity"),
   trendBadge: document.getElementById("trendBadge"),
   trend1m: document.getElementById("trend1m"),
   trend5m: document.getElementById("trend5m"),
@@ -330,14 +334,15 @@ function syncVwapControl() {
 }
 
 function renderProviderHealth() {
+  const dataHealth = state.dataHealth;
   const marketAgeMs = state.marketCandleAt ? Date.now() - state.marketCandleAt : null;
   const refreshAgeMs = state.lastTickAt ? Date.now() - state.lastTickAt : null;
   const session = Core.marketSession(Date.now(), ASSET_OPTIONS);
   const marketOpen = session.regular;
   const stale = state.feedMode === "real" && marketOpen && (marketAgeMs === null || marketAgeMs > 4 * 60_000);
-  const healthy = state.feedMode === "real" && !stale && state.providerErrors === 0;
-  els.providerHealthBadge.textContent = stale ? "Stale" : healthy ? (marketOpen ? "Live" : "Connected") : state.feedMode === "real" ? "Issue" : "Demo";
-  setTone(els.providerHealthBadge, healthy ? "positive" : stale || state.providerErrors ? "negative" : "neutral");
+  const healthy = state.feedMode === "real" && !stale && state.providerErrors === 0 && dataHealth?.status !== "Blocked";
+  els.providerHealthBadge.textContent = dataHealth?.status || (stale ? "Stale" : healthy ? (marketOpen ? "Live" : "Connected") : state.feedMode === "real" ? "Issue" : "Demo");
+  setTone(els.providerHealthBadge, dataHealth?.tone || (healthy ? "positive" : stale || state.providerErrors ? "negative" : "neutral"));
   els.providerSource.textContent = state.providerLabel;
   const refreshAge = refreshAgeMs === null ? "--" : `${Math.max(0, Math.round(refreshAgeMs / 1000))}s refresh`;
   const candleAge = marketAgeMs === null ? "--" : `${Math.max(0, Math.round(marketAgeMs / 1000))}s candle`;
@@ -358,8 +363,19 @@ function renderProviderHealth() {
   els.signalBarState.textContent = latestSignalBar && latestMarketBar && latestSignalBar.time === latestMarketBar.time
     ? "Closed"
     : "Forming excluded";
-  els.dataQuality.textContent = state.dataQualityIssues.length ? state.dataQualityIssues.join(", ") : "Clean";
-  setTone(els.dataQuality, state.dataQualityIssues.length ? "negative" : "positive");
+  const blockers = dataHealth?.blockers || [];
+  const warnings = dataHealth?.warnings || [];
+  const qualityDetail = blockers.length ? blockers.join(", ") : warnings.length ? warnings.join(", ") : state.dataQualityIssues.length ? state.dataQualityIssues.join(", ") : "Clean";
+  els.dataQuality.textContent = qualityDetail;
+  setTone(els.dataQuality, blockers.length || state.dataQualityIssues.length ? "negative" : warnings.length ? "neutral" : "positive");
+  const tradeAllowed = dataHealth?.tradeAllowed;
+  els.tradePermission.textContent = tradeAllowed === false ? "Blocked" : marketOpen || ASSET_OPTIONS.continuous ? "Allowed" : "Session closed";
+  setTone(els.tradePermission, tradeAllowed === false ? "negative" : marketOpen || ASSET_OPTIONS.continuous ? "positive" : "neutral");
+  const timeframes = dataHealth?.timeframes || {};
+  const continuity = ["1", "5", "15"].map((timeframe) => timeframes[timeframe]).filter(Boolean);
+  const gaps = continuity.reduce((total, item) => total + Number(item.gaps || 0), 0);
+  els.barContinuity.textContent = continuity.length ? gaps ? `${gaps} gap${gaps === 1 ? "" : "s"}` : "Clean" : "Building";
+  setTone(els.barContinuity, gaps ? "negative" : continuity.length ? "positive" : "neutral");
 }
 
 function renderFearGreed(data) {
@@ -449,7 +465,17 @@ function assessDataQuality() {
   const issues = [];
   if (gaps >= (ASSET_OPTIONS.continuous ? 2 : 1)) issues.push(`${gaps} gap${gaps === 1 ? "" : "s"}`);
   if (!ASSET_OPTIONS.continuous && regular.slice(-5).some((candle) => candle.volume <= 0)) issues.push("zero volume");
-  state.dataQualityIssues = issues;
+  state.localDataQualityIssues = issues;
+  state.dataQualityIssues = [...new Set([
+    ...issues,
+    ...(state.dataHealth?.blockers || []),
+  ])];
+}
+
+function applyDataHealth(dataHealth) {
+  if (!dataHealth || typeof dataHealth !== "object") return;
+  state.dataHealth = dataHealth;
+  assessDataQuality();
 }
 
 function calculateIndicators(candles) {
@@ -2715,7 +2741,8 @@ function isActionableSignal(signal) {
     signal
     && signal.direction !== "neutral"
     && !signal.watchOnly
-    && signal.score >= activeTradeThreshold(),
+    && signal.score >= activeTradeThreshold()
+    && state.dataHealth?.tradeAllowed !== false,
   );
 }
 
@@ -3281,6 +3308,7 @@ function analyzeTimeframe(timeframe) {
 }
 
 function applyServerRecommendations(payload) {
+  applyDataHealth(payload?.dataHealth);
   const recommendations = payload?.recommendations;
   if (recommendations && typeof recommendations === "object") {
     state.serverRecommendations = recommendations;
@@ -3345,6 +3373,7 @@ async function fetchLatestCandle() {
     const response = await fetch(`/api/latest?symbol=${API_SYMBOL}&t=${Date.now()}`);
     if (!response.ok) throw new Error(`latest failed: ${response.status}`);
     const data = await response.json();
+    applyDataHealth(data.dataHealth);
     if (data.candle) {
       state.providerErrors = Number(data.providerErrors || 0);
       state.lastTickAt = Number(data.lastSuccessAt || Date.now());
@@ -3372,6 +3401,7 @@ async function syncIntradayHistory() {
     const response = await fetch(`/api/history?symbol=${API_SYMBOL}&t=${Date.now()}`);
     if (!response.ok) throw new Error(`History sync failed: ${response.status}`);
     const data = await response.json();
+    applyDataHealth(data.dataHealth);
     const incoming = cleanCandles(data.candles || []);
     if (!incoming.length) return false;
     state.candles = Core.mergeCandles([...state.candles, ...incoming]).slice(-2500);
@@ -3527,6 +3557,7 @@ async function startRealFeed(config) {
   state.providerLabel = providerLabel(config);
   state.providerErrors = Number(config.providerErrors || 0);
   state.providerMessage = String(config.providerMessage || "");
+  applyDataHealth(config.dataHealth);
   state.pollIntervalMs = config.pollIntervalMs || 15000;
   state.pollIntervalMs = Number(state.settings.pollIntervalMs || state.pollIntervalMs);
   els.sessionState.textContent = `Loading ${state.providerLabel}`;
@@ -3537,6 +3568,7 @@ async function startRealFeed(config) {
   }
 
   const history = await historyResponse.json();
+  applyDataHealth(history.dataHealth);
   if (!history.candles || history.candles.length < 60) {
     throw new Error("Not enough provider minute candles returned");
   }
@@ -3581,6 +3613,7 @@ async function startRealFeed(config) {
     state.lastStreamAt = Date.now();
     state.lastTickAt = Number(status.lastSuccessAt || Date.now());
     state.providerErrors = Number(status.providerErrors || 0);
+    applyDataHealth(status.dataHealth);
   });
   state.stream.addEventListener("provider_error", (event) => {
     const status = JSON.parse(event.data || "{}");

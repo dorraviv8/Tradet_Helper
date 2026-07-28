@@ -92,6 +92,8 @@ def new_market_runtime():
     "recommendations_at": None,
     "options_opportunity": options_engine.none_opportunity(),
     "options_opportunity_at": None,
+    "data_health": None,
+    "data_health_at": None,
     "backtest": None,
     "backtest_status": "not_started",
     "backtest_error": None,
@@ -1792,6 +1794,139 @@ def apply_qqq_spy_confirmation(recommendations, qqq_runtime, spy_runtime, spy_re
   return recommendations
 
 
+def health_candles(runtime, timeframe):
+  if timeframe == strategy_engine.DAILY_TIMEFRAME:
+    return merge_candle_series(runtime.get("daily_history") or [])
+  if timeframe == 1:
+    return merge_candle_series([
+      *(runtime.get("history") or []),
+      *([runtime["candle"]] if runtime.get("candle") else []),
+    ])
+  source = runtime.get("five_minute_history") or runtime.get("history") or []
+  return strategy_engine.resample(source, timeframe)
+
+
+def health_window(candles, symbol, interval_ms, timestamp, regular_only=True):
+  current_session = strategy_engine.market_session(timestamp, symbol)
+  values = merge_candle_series(candles)
+  if regular_only and not strategy_engine.is_continuous_market(symbol):
+    values = [
+      candle for candle in values
+      if strategy_engine.market_session(candle["time"], symbol).get("regular")
+      and strategy_engine.market_session(candle["time"], symbol).get("date") == current_session.get("date")
+    ]
+  elif strategy_engine.is_continuous_market(symbol):
+    values = values[-45:]
+  values = values[-45:]
+  gaps = sum(
+    values[index]["time"] - values[index - 1]["time"] > interval_ms * 1.5
+    for index in range(1, len(values))
+  )
+  latest = values[-1] if values else None
+  return values, int(gaps), latest
+
+
+def evaluate_data_health(symbol, runtime, timestamp=None):
+  timestamp = int(timestamp or now_ms())
+  market = strategy_engine.market_session(timestamp, symbol)
+  continuous = strategy_engine.is_continuous_market(symbol)
+  active_session = bool(market.get("regular"))
+  provider_age = timestamp - int(runtime.get("last_success_at") or 0) if runtime.get("last_success_at") else None
+  provider_limit = 90_000 if continuous else 180_000
+  blockers = []
+  warnings = []
+  if int(runtime.get("error_count") or 0) > 0:
+    blockers.append("market-data provider has recent errors")
+  if active_session and (provider_age is None or provider_age > provider_limit):
+    blockers.append("provider refresh is stale")
+  if not runtime.get("candle"):
+    blockers.append("latest market candle is unavailable")
+
+  timeframe_specs = (
+    (1, 60_000, 90_000 if not continuous else 180_000),
+    (5, 5 * MINUTE_MS, 8 * MINUTE_MS if not continuous else 12 * MINUTE_MS),
+    (15, 15 * MINUTE_MS, 23 * MINUTE_MS if not continuous else 35 * MINUTE_MS),
+  )
+  timeframes = {}
+  for timeframe, interval, freshness_limit in timeframe_specs:
+    values, gaps, latest = health_window(health_candles(runtime, timeframe), symbol, interval, timestamp)
+    age = timestamp - int(latest["time"]) if latest else None
+    issues = []
+    if len(values) < 12:
+      issues.append("not enough recent bars")
+    if gaps:
+      issues.append(f"{gaps} missing-bar gap{'s' if gaps != 1 else ''}")
+    if active_session and (age is None or age > freshness_limit):
+      issues.append("bar is stale")
+    if timeframe == 1 and not continuous and values[-5:] and any(int(candle.get("volume") or 0) <= 0 for candle in values[-5:]):
+      issues.append("zero-volume bar")
+    allowed = not issues
+    if not allowed:
+      blockers.extend(f"{timeframe}m {issue}" for issue in issues)
+    timeframes[str(timeframe)] = {
+      "label": f"{timeframe}m",
+      "lastBarAt": latest.get("time") if latest else None,
+      "ageMs": max(0, age) if age is not None else None,
+      "gaps": gaps,
+      "tradeAllowed": allowed,
+      "detail": "Clean" if allowed else ", ".join(issues),
+    }
+
+  daily = health_candles(runtime, strategy_engine.DAILY_TIMEFRAME)
+  daily_latest = daily[-1] if daily else None
+  daily_issues = []
+  if len(daily) < 180:
+    daily_issues.append("not enough daily history")
+  timeframes["1D"] = {
+    "label": "1D",
+    "lastBarAt": daily_latest.get("time") if daily_latest else None,
+    "ageMs": max(0, timestamp - int(daily_latest["time"])) if daily_latest else None,
+    "gaps": 0,
+    "tradeAllowed": not daily_issues and not bool(int(runtime.get("error_count") or 0)),
+    "detail": "Clean" if not daily_issues else ", ".join(daily_issues),
+  }
+  if daily_issues:
+    warnings.extend(f"1D {issue}" for issue in daily_issues)
+
+  trade_allowed = not blockers
+  if not active_session and not continuous:
+    status, tone = "Closed", "neutral"
+  elif trade_allowed:
+    status, tone = "Healthy", "positive"
+  else:
+    status, tone = "Blocked", "negative"
+  return {
+    "symbol": symbol,
+    "generatedAt": timestamp,
+    "status": status,
+    "tone": tone,
+    "tradeAllowed": trade_allowed,
+    "session": market.get("phase"),
+    "providerAgeMs": max(0, provider_age) if provider_age is not None else None,
+    "providerFresh": provider_age is not None and provider_age <= provider_limit,
+    "blockers": list(dict.fromkeys(blockers)),
+    "warnings": list(dict.fromkeys(warnings)),
+    "timeframes": timeframes,
+  }
+
+
+def apply_data_health(recommendations, data_health):
+  for timeframe, signal in (recommendations or {}).items():
+    key = "1D" if int(timeframe) == strategy_engine.DAILY_TIMEFRAME else str(int(timeframe))
+    timeframe_health = (data_health.get("timeframes") or {}).get(key) or {}
+    allowed = bool(data_health.get("tradeAllowed")) and bool(timeframe_health.get("tradeAllowed", True))
+    issues = [*data_health.get("blockers", []), *([] if timeframe_health.get("tradeAllowed", True) else [timeframe_health.get("detail")])]
+    for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
+      if not isinstance(candidate, dict):
+        continue
+      candidate["dataHealth"] = data_health
+      candidate["dataQuality"] = "clean" if allowed else ", ".join(issue for issue in issues if issue)
+      if not allowed and candidate.get("direction") in {"long", "short"}:
+        candidate["watchOnly"] = True
+        candidate.setdefault("reasons", []).append("Data health blocks new trade alerts: " + "; ".join(issue for issue in issues if issue))
+  return recommendations
+
+
 def refresh_server_recommendations(provider, symbol=SYMBOL):
   runtime = market_runtime_snapshot(symbol)
   candles = merge_candle_series([*runtime["history"], *([runtime["candle"]] if runtime["candle"] else [])])
@@ -1800,6 +1935,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
   settings = load_strategy_settings()
   plan_ids = {}
   generated_at = now_ms()
+  data_health = evaluate_data_health(symbol, runtime, generated_at)
   with db() as connection:
     learning_snapshot = load_learning_snapshot(connection, symbol)
     performance = learning_snapshot.get("performance") or {}
@@ -1830,6 +1966,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
         spy_runtime.get("recommendations") or {},
         settings,
       )
+    apply_data_health(recommendations, data_health)
     replay = runtime.get("backtest") or {}
     replay_trades = replay.get("trades") or []
     for timeframe, signal in recommendations.items():
@@ -1848,6 +1985,8 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
     MARKET_RUNTIMES[symbol]["recommendations_at"] = generated_at
     MARKET_RUNTIMES[symbol]["options_opportunity"] = options_opportunity
     MARKET_RUNTIMES[symbol]["options_opportunity_at"] = generated_at
+    MARKET_RUNTIMES[symbol]["data_health"] = data_health
+    MARKET_RUNTIMES[symbol]["data_health_at"] = generated_at
   return recommendations
 
 
@@ -2427,6 +2566,7 @@ class Handler(SimpleHTTPRequestHandler):
       symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
       provider = active_provider(symbol)
       runtime = market_runtime_snapshot(symbol)
+      data_health = runtime.get("data_health") or evaluate_data_health(symbol, runtime)
       ibkr_status = IBKR_CLIENT.status() if provider == "ibkr" and IBKR_CLIENT is not None else None
       self.send_json(200, {
         "symbol": symbol,
@@ -2441,6 +2581,7 @@ class Handler(SimpleHTTPRequestHandler):
         "lastSuccessAt": runtime["last_success_at"],
         "providerErrors": runtime["error_count"],
         "providerMessage": runtime["last_error"] if provider == "ibkr" else None,
+        "dataHealth": data_health,
         "ibkrMarketDataType": ibkr_status["marketDataType"] if ibkr_status else None,
         "recommendationsAt": runtime["recommendations_at"],
         "analysisEngine": "python-server",
@@ -2472,6 +2613,7 @@ class Handler(SimpleHTTPRequestHandler):
         "generatedAt": runtime["recommendations_at"],
         "recommendations": runtime["recommendations"],
         "optionsOpportunity": runtime["options_opportunity"],
+        "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
         "analysisEngine": "python-server",
         "backtestStatus": runtime["backtest_status"],
       })
@@ -2688,6 +2830,7 @@ class Handler(SimpleHTTPRequestHandler):
         "candle": candle,
         "lastSuccessAt": runtime["last_success_at"],
         "providerErrors": runtime["error_count"],
+        "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
       })
     except Exception as error:
       status, payload = self.api_error(error)
@@ -2823,6 +2966,7 @@ class Handler(SimpleHTTPRequestHandler):
         "candles": candles[-2500:],
         "providerErrors": runtime["error_count"],
         "lastSuccessAt": runtime["last_success_at"],
+        "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
       })
     except Exception as error:
       status, payload = self.api_error(error)
@@ -2944,6 +3088,7 @@ class Handler(SimpleHTTPRequestHandler):
               "candleTime": candle["time"],
               "lastSuccessAt": runtime["last_success_at"],
               "providerErrors": runtime["error_count"],
+              "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
             })
         else:
           self.send_sse("status", {"message": "Server feed is starting"})
@@ -2961,6 +3106,7 @@ class Handler(SimpleHTTPRequestHandler):
             "generatedAt": runtime["recommendations_at"],
             "recommendations": runtime["recommendations"],
             "optionsOpportunity": runtime["options_opportunity"],
+            "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
           })
         options_key = json.dumps(runtime["options_opportunity"], sort_keys=True, separators=(",", ":"))
         if options_key != last_options_key:
