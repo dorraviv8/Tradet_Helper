@@ -1862,7 +1862,14 @@ def evaluate_data_health(symbol, runtime, timestamp=None):
       issues.append("zero-volume bar")
     allowed = not issues
     if not allowed:
-      blockers.extend(f"{timeframe}m {issue}" for issue in issues)
+      critical_source_issue = timeframe == 1 and any(
+        issue == "bar is stale" or issue == "zero-volume bar" or "missing-bar gap" in issue
+        for issue in issues
+      )
+      if critical_source_issue:
+        blockers.extend(f"{timeframe}m {issue}" for issue in issues)
+      else:
+        warnings.extend(f"{timeframe}m {issue}" for issue in issues)
     timeframes[str(timeframe)] = {
       "label": f"{timeframe}m",
       "lastBarAt": latest.get("time") if latest else None,

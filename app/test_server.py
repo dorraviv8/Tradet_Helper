@@ -226,6 +226,32 @@ class ServerTests(unittest.TestCase):
     self.assertFalse(health["tradeAllowed"])
     self.assertIn("missing-bar gap", " ".join(health["blockers"]))
 
+  def test_data_health_scopes_higher_timeframe_bootstrap_to_that_timeframe(self):
+    now = int(datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    runtime = server.new_market_runtime()
+    minute = 60_000
+    runtime["history"] = [
+      candle(now - (70 - index) * minute, 100, 101, 99, 100.5, 1_000)
+      for index in range(70)
+    ]
+    runtime["candle"] = candle(now, 100, 101, 99, 100.5, 1_000)
+    runtime["five_minute_history"] = [
+      candle(now - (65 - index * 5) * minute, 100, 101, 99, 100.5, 2_000)
+      for index in range(14)
+    ]
+    runtime["daily_history"] = [
+      candle(now - (220 - index) * 86_400_000, 100, 101, 99, 100.5, 2_000)
+      for index in range(220)
+    ]
+    runtime["last_success_at"] = now
+    health = server.evaluate_data_health("QQQ", runtime, now)
+    self.assertTrue(health["tradeAllowed"])
+    self.assertEqual(health["status"], "Healthy")
+    self.assertTrue(health["timeframes"]["1"]["tradeAllowed"])
+    self.assertTrue(health["timeframes"]["5"]["tradeAllowed"])
+    self.assertFalse(health["timeframes"]["15"]["tradeAllowed"])
+    self.assertIn("15m not enough recent bars", health["warnings"])
+
   def test_data_health_marks_directional_candidates_watch_only(self):
     candidate = {"direction": "long", "watchOnly": False, "reasons": []}
     recommendations = {5: {**candidate, "bestLong": candidate, "bestShort": None}}
