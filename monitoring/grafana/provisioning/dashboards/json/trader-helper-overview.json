@@ -28,7 +28,7 @@
       "gridPos": {"h": 7, "w": 6, "x": 12, "y": 0},
       "id": 3,
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
-      "targets": [{"expr": "count(node_cpu_info{job=\"node-exporter\"})", "refId": "A"}],
+      "targets": [{"expr": "count(count by (cpu) (node_cpu_seconds_total{job=\"node-exporter\"}))", "refId": "A"}],
       "title": "Server CPU Capacity",
       "type": "stat"
     },
