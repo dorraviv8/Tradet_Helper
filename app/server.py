@@ -50,7 +50,8 @@ IBKR_CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "17"))
 IBKR_REQUIRE_LIVE = os.environ.get("IBKR_REQUIRE_LIVE", "true").lower() in {"1", "true", "yes"}
 IBKR_HISTORY_DURATION = os.environ.get("IBKR_HISTORY_DURATION", "2 D")
 SYMBOL = "QQQ"
-SUPPORTED_SYMBOLS = ("QQQ", "SPY", "BTC-USD")
+SUPPORTED_SYMBOLS = ("QQQ", "SPY", "BTC-USD", "TA125")
+YAHOO_SYMBOLS = {"TA125": "^TA125.TA"}
 STRATEGY_VERSION = "5.2.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
@@ -466,7 +467,7 @@ def merge_candle_series(raw_candles):
 
 
 def active_provider(symbol=SYMBOL):
-  if str(symbol).upper() in {"SPY", "BTC-USD"}:
+  if str(symbol).upper() in {"SPY", "BTC-USD", "TA125"}:
     return "yahoo"
   if DATA_PROVIDER == "demo":
     return ""
@@ -505,6 +506,10 @@ def validate_symbol(symbol):
   if value not in SUPPORTED_SYMBOLS:
     raise ValueError(f"Supported symbols are {', '.join(SUPPORTED_SYMBOLS)}")
   return value
+
+
+def yahoo_symbol(symbol):
+  return YAHOO_SYMBOLS.get(validate_symbol(symbol), validate_symbol(symbol))
 
 
 def polygon_get(path, params=None):
@@ -751,7 +756,7 @@ def fetch_latest_candle(provider, symbol):
   if provider == "ibkr":
     return ibkr_client().latest_candle()
   if provider == "yahoo":
-    data = yahoo_get(f"/v8/finance/chart/{symbol}", {
+    data = yahoo_get(f"/v8/finance/chart/{yahoo_symbol(symbol)}", {
       "range": "1d",
       "interval": "1m",
       "includePrePost": "true",
@@ -780,17 +785,17 @@ def latest_candle(provider, symbol):
   return value
 
 
-def market_date():
-  return datetime.now(MARKET_TIME_ZONE).date()
+def market_date(symbol=SYMBOL):
+  return datetime.now(strategy_engine.market_timezone(symbol)).date()
 
 
 def fetch_history_candles(provider, symbol):
-  today = market_date()
+  today = market_date(symbol)
   start = today - timedelta(days=7)
   if provider == "ibkr":
     candles = ibkr_client().request_history(IBKR_HISTORY_DURATION)
   elif provider == "yahoo":
-    data = yahoo_get(f"/v8/finance/chart/{symbol}", {
+    data = yahoo_get(f"/v8/finance/chart/{yahoo_symbol(symbol)}", {
       "range": "5d",
       "interval": "1m",
       "includePrePost": "true",
@@ -822,7 +827,7 @@ def fetch_history_candles(provider, symbol):
 
 def fetch_five_minute_candles(provider, symbol):
   if provider == "yahoo":
-    data = yahoo_get(f"/v8/finance/chart/{symbol}", {
+    data = yahoo_get(f"/v8/finance/chart/{yahoo_symbol(symbol)}", {
       "range": "60d",
       "interval": "5m",
       "includePrePost": "true",
@@ -833,7 +838,7 @@ def fetch_five_minute_candles(provider, symbol):
 
 
 def fetch_daily_candles(symbol):
-  data = yahoo_get(f"/v8/finance/chart/{symbol}", {
+  data = yahoo_get(f"/v8/finance/chart/{yahoo_symbol(symbol)}", {
     "range": "2y",
     "interval": "1d",
     "includePrePost": "false",
@@ -1934,11 +1939,12 @@ def evaluate_data_health(symbol, runtime, timestamp=None):
     issues = []
     if len(values) < 12:
       issues.append("not enough recent bars")
-    if gaps:
+    gap_is_material = gaps >= 2 if continuous or strategy_engine.is_tel_aviv_market(symbol) else gaps > 0
+    if gap_is_material:
       issues.append(f"{gaps} missing-bar gap{'s' if gaps != 1 else ''}")
     if active_session and (age is None or age > freshness_limit):
       issues.append("bar is stale")
-    if timeframe == 1 and not continuous and values[-5:] and any(int(candle.get("volume") or 0) <= 0 for candle in values[-5:]):
+    if timeframe == 1 and not continuous and not strategy_engine.is_tel_aviv_market(symbol) and values[-5:] and any(int(candle.get("volume") or 0) <= 0 for candle in values[-5:]):
       issues.append("zero-volume bar")
     allowed = not issues
     if not allowed:

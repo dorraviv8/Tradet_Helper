@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>QQQ Trader Alert Helper</title>
+    <title>Market Trader Alert Helper</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23101214'/%3E%3Cpath d='M7 21l5-5 4 4 8-10' fill='none' stroke='%232fd17c' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -14,9 +14,13 @@
         <h1>Technical trend alerts</h1>
       </div>
       <nav class="asset-switcher" aria-label="Market selector">
-        <button class="asset-button active" type="button" data-symbol="QQQ" aria-pressed="true">QQQ</button>
-        <button class="asset-button" type="button" data-symbol="SPY" aria-pressed="false">SPY</button>
-        <button class="asset-button" type="button" data-symbol="BTC-USD" aria-pressed="false">BTC-USD</button>
+        <label class="asset-selector-label" for="assetSelector">Market</label>
+        <select id="assetSelector" class="asset-selector" aria-label="Select market">
+          <option value="QQQ">QQQ · Nasdaq-100 ETF</option>
+          <option value="SPY">SPY · S&amp;P 500 ETF</option>
+          <option value="BTC-USD">BTC-USD · Bitcoin</option>
+          <option value="TA125">TA-125 · Tel Aviv 125</option>
+        </select>
       </nav>
       <div class="market-clock">
         <span id="sessionState">Starting market feed</span>

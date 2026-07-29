@@ -6,10 +6,15 @@ import strategy_engine as strategy
 
 
 NEW_YORK = ZoneInfo("America/New_York")
+TEL_AVIV = ZoneInfo("Asia/Jerusalem")
 
 
 def timestamp(year, month, day, hour, minute):
   return int(datetime(year, month, day, hour, minute, tzinfo=NEW_YORK).timestamp() * 1000)
+
+
+def tel_aviv_timestamp(year, month, day, hour, minute):
+  return int(datetime(year, month, day, hour, minute, tzinfo=TEL_AVIV).timestamp() * 1000)
 
 
 def candle(time, open_price, high, low, close, volume=1000):
@@ -93,6 +98,15 @@ class StrategyEngineTests(unittest.TestCase):
     self.assertTrue(session["regular"])
     self.assertEqual(session["phase"], "continuous")
     self.assertEqual(strategy.market_phase(saturday, "BTC-USD"), "continuous")
+
+  def test_tel_aviv_market_uses_local_weekday_and_regular_session(self):
+    sunday = tel_aviv_timestamp(2026, 7, 26, 11, 0)
+    monday_open = tel_aviv_timestamp(2026, 7, 27, 10, 0)
+    monday_close = tel_aviv_timestamp(2026, 7, 27, 17, 31)
+    self.assertEqual(strategy.market_session(sunday, "TA125")["phase"], "closed")
+    self.assertEqual(strategy.market_session(monday_open, "TA125")["phase"], "regular")
+    self.assertEqual(strategy.market_session(monday_close, "TA125")["phase"], "after_hours")
+    self.assertEqual(strategy.market_parts(monday_open, "TA125")[0], "2026-07-27")
 
   def test_bitcoin_risk_bounds_are_asset_specific(self):
     qqq = strategy.bounds(5, "normal", "QQQ")

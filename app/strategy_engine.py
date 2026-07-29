@@ -5,14 +5,36 @@ from zoneinfo import ZoneInfo
 
 MINUTE_MS = 60_000
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
+TEL_AVIV_TIME_ZONE = ZoneInfo("Asia/Jerusalem")
 TIMEFRAMES = (1, 5, 15)
 DAILY_TIMEFRAME = 1440
 DEFAULT_SYMBOL = "QQQ"
 CRYPTO_SYMBOLS = {"BTC-USD"}
+TEL_AVIV_SYMBOLS = {"TA125"}
+US_REGULAR_OPEN_MINUTE = 9 * 60 + 30
+US_REGULAR_CLOSE_MINUTE = 16 * 60
+TEL_AVIV_REGULAR_OPEN_MINUTE = 10 * 60
+TEL_AVIV_REGULAR_CLOSE_MINUTE = 17 * 60 + 30
 
 
 def is_continuous_market(symbol=DEFAULT_SYMBOL):
   return str(symbol or DEFAULT_SYMBOL).upper() in CRYPTO_SYMBOLS
+
+
+def is_tel_aviv_market(symbol=DEFAULT_SYMBOL):
+  return str(symbol or DEFAULT_SYMBOL).upper() in TEL_AVIV_SYMBOLS
+
+
+def market_timezone(symbol=DEFAULT_SYMBOL):
+  if is_continuous_market(symbol):
+    return timezone.utc
+  return TEL_AVIV_TIME_ZONE if is_tel_aviv_market(symbol) else MARKET_TIME_ZONE
+
+
+def regular_session_minutes(symbol=DEFAULT_SYMBOL):
+  if is_tel_aviv_market(symbol):
+    return TEL_AVIV_REGULAR_OPEN_MINUTE, TEL_AVIV_REGULAR_CLOSE_MINUTE
+  return US_REGULAR_OPEN_MINUTE, US_REGULAR_CLOSE_MINUTE
 
 
 def clamp(value, minimum, maximum):
@@ -20,22 +42,23 @@ def clamp(value, minimum, maximum):
 
 
 def market_parts(timestamp, symbol=DEFAULT_SYMBOL):
-  zone = timezone.utc if is_continuous_market(symbol) else MARKET_TIME_ZONE
+  zone = market_timezone(symbol)
   value = datetime.fromtimestamp(timestamp / 1000, zone)
   return value.strftime("%Y-%m-%d"), value.hour * 60 + value.minute
 
 
 def market_session(timestamp, symbol=DEFAULT_SYMBOL):
-  zone = timezone.utc if is_continuous_market(symbol) else MARKET_TIME_ZONE
+  zone = market_timezone(symbol)
   value = datetime.fromtimestamp(timestamp / 1000, zone)
   day, minute = market_parts(timestamp, symbol)
   if is_continuous_market(symbol):
     return {"date": day, "minute": minute, "phase": "continuous", "regular": True}
-  if value.weekday() >= 5:
+  if value.weekday() >= 5 or (is_tel_aviv_market(symbol) and value.weekday() == 6):
     return {"date": day, "minute": minute, "phase": "closed", "regular": False}
-  if minute < 570:
+  regular_open, regular_close = regular_session_minutes(symbol)
+  if minute < regular_open:
     return {"date": day, "minute": minute, "phase": "premarket", "regular": False}
-  if minute < 960:
+  if minute < regular_close:
     return {"date": day, "minute": minute, "phase": "regular", "regular": True}
   return {"date": day, "minute": minute, "phase": "after_hours", "regular": False}
 
@@ -43,20 +66,22 @@ def market_session(timestamp, symbol=DEFAULT_SYMBOL):
 def market_phase(timestamp, symbol=DEFAULT_SYMBOL):
   if is_continuous_market(symbol):
     return "continuous"
-  if datetime.fromtimestamp(timestamp / 1000, MARKET_TIME_ZONE).weekday() >= 5:
+  session = market_session(timestamp, symbol)
+  if session["phase"] == "closed":
     return "closed"
-  minute = market_parts(timestamp, symbol)[1]
-  if minute < 570:
+  minute = session["minute"]
+  regular_open, regular_close = regular_session_minutes(symbol)
+  if minute < regular_open:
     return "premarket"
-  if minute < 585:
+  if minute < regular_open + 15:
     return "open"
-  if minute < 660:
+  if minute < regular_open + 90:
     return "morning"
-  if minute < 780:
+  if minute < regular_open + (regular_close - regular_open) * 0.55:
     return "midday"
-  if minute < 900:
+  if minute < regular_close - 60:
     return "afternoon"
-  if minute < 960:
+  if minute < regular_close:
     return "power_hour"
   return "after_hours"
 
@@ -189,7 +214,8 @@ def indicators(raw_candles, symbol=DEFAULT_SYMBOL):
   cumulative_volume = 0
   for index, candle in enumerate(candles):
     day, minute = market_parts(candle["time"], symbol)
-    segment = "continuous" if is_continuous_market(symbol) else "pre" if minute < 570 else "regular"
+    regular_open, _ = regular_session_minutes(symbol)
+    segment = "continuous" if is_continuous_market(symbol) else "pre" if minute < regular_open else "regular"
     key = (day, segment)
     if key != vwap_key:
       vwap_key = key
@@ -663,11 +689,12 @@ def daily_candle_is_closed(candle, now, symbol=DEFAULT_SYMBOL):
   candle_date = market_parts(candle["time"], symbol)[0]
   if is_continuous_market(symbol):
     return candle_date < datetime.fromtimestamp(now / 1000, timezone.utc).strftime("%Y-%m-%d")
-  current = datetime.fromtimestamp(now / 1000, MARKET_TIME_ZONE)
+  current = datetime.fromtimestamp(now / 1000, market_timezone(symbol))
   current_date = current.strftime("%Y-%m-%d")
   if candle_date < current_date:
     return True
-  return candle_date == current_date and current.weekday() < 5 and current.hour * 60 + current.minute >= 965
+  _, regular_close = regular_session_minutes(symbol)
+  return candle_date == current_date and market_session(now, symbol)["regular"] is False and current.hour * 60 + current.minute >= regular_close + 5
 
 
 def classify_daily_trend(values):
@@ -892,7 +919,7 @@ def analyze_all(raw_candles, settings=None, performance=None, now=None, five_min
     recent_regular[index]["time"] - recent_regular[index - 1]["time"] > gap_limit
     for index in range(1, len(recent_regular))
   )
-  gap_is_material = recent_gaps >= 2 if is_continuous_market(symbol) else recent_gaps > 0
+  gap_is_material = recent_gaps >= 2 if is_continuous_market(symbol) or is_tel_aviv_market(symbol) else recent_gaps > 0
   quality_issues = [f"{recent_gaps} recent data gap{'s' if recent_gaps != 1 else ''}"] if gap_is_material else []
   if market_session(now, symbol)["regular"] and (not closed_one or now - closed_one[-1]["time"] > 4 * MINUTE_MS):
     quality_issues.append("market data is stale")

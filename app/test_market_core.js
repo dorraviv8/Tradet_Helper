@@ -93,6 +93,17 @@ function candle(time, open, high, low, close, volume = 100) {
 }
 
 {
+  const sunday = Date.parse("2026-07-26T08:00:00Z");
+  const mondayOpen = Date.parse("2026-07-27T07:00:00Z");
+  const mondayAfterClose = Date.parse("2026-07-27T14:31:00Z");
+  const options = { market: "tase" };
+  assert.equal(Core.marketSession(sunday, options).phase, "closed");
+  assert.equal(Core.marketSession(mondayOpen, options).phase, "regular");
+  assert.equal(Core.marketSession(mondayAfterClose, options).phase, "after_hours");
+  assert.equal(Core.marketParts(mondayOpen, options).date, "2026-07-27");
+}
+
+{
   const saturday = Date.parse("2026-07-18T15:00:00Z");
   const session = Core.marketSession(saturday, { continuous: true });
   assert.equal(session.phase, "continuous");

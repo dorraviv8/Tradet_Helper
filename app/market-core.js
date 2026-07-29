@@ -5,6 +5,11 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function buildMarketCore() {
   const MINUTE_MS = 60_000;
   const MARKET_TIME_ZONE = "America/New_York";
+  const TEL_AVIV_TIME_ZONE = "Asia/Jerusalem";
+  const US_REGULAR_OPEN_MINUTE = 9 * 60 + 30;
+  const US_REGULAR_CLOSE_MINUTE = 16 * 60;
+  const TEL_AVIV_REGULAR_OPEN_MINUTE = 10 * 60;
+  const TEL_AVIV_REGULAR_CLOSE_MINUTE = 17 * 60 + 30;
 
   function finite(value) {
     const number = Number(value);
@@ -181,12 +186,35 @@
     timeZone: "UTC", hour: "2-digit", minute: "2-digit", hour12: false,
   });
   const utcWeekdayFormatter = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "short" });
+  const telAvivDateFormatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TEL_AVIV_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const telAvivTimeFormatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: TEL_AVIV_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const telAvivWeekdayFormatter = new Intl.DateTimeFormat("en-US", { timeZone: TEL_AVIV_TIME_ZONE, weekday: "short" });
+
+  function isTelAvivMarket(options = {}) {
+    return options.market === "tase";
+  }
+
+  function regularSessionMinutes(options = {}) {
+    return isTelAvivMarket(options)
+      ? { open: TEL_AVIV_REGULAR_OPEN_MINUTE, close: TEL_AVIV_REGULAR_CLOSE_MINUTE }
+      : { open: US_REGULAR_OPEN_MINUTE, close: US_REGULAR_CLOSE_MINUTE };
+  }
 
   function marketParts(timestamp, options = {}) {
     const date = new Date(Number(timestamp));
-    const selectedTimeFormatter = options.continuous ? utcTimeFormatter : timeFormatter;
-    const selectedDateFormatter = options.continuous ? utcDateFormatter : dateFormatter;
-    const selectedWeekdayFormatter = options.continuous ? utcWeekdayFormatter : weekdayFormatter;
+    const selectedTimeFormatter = options.continuous ? utcTimeFormatter : isTelAvivMarket(options) ? telAvivTimeFormatter : timeFormatter;
+    const selectedDateFormatter = options.continuous ? utcDateFormatter : isTelAvivMarket(options) ? telAvivDateFormatter : dateFormatter;
+    const selectedWeekdayFormatter = options.continuous ? utcWeekdayFormatter : isTelAvivMarket(options) ? telAvivWeekdayFormatter : weekdayFormatter;
     const parts = selectedTimeFormatter.formatToParts(date);
     const hour = Number(parts.find((part) => part.type === "hour")?.value || 0);
     const minute = Number(parts.find((part) => part.type === "minute")?.value || 0);
@@ -203,8 +231,9 @@
     const parts = marketParts(timestamp, options);
     if (options.continuous) return { ...parts, phase: "continuous", regular: true };
     if (["Sat", "Sun"].includes(parts.weekday)) return { ...parts, phase: "closed", regular: false };
-    if (parts.minuteOfDay < 570) return { ...parts, phase: "premarket", regular: false };
-    if (parts.minuteOfDay < 960) return { ...parts, phase: "regular", regular: true };
+    const { open, close } = regularSessionMinutes(options);
+    if (parts.minuteOfDay < open) return { ...parts, phase: "premarket", regular: false };
+    if (parts.minuteOfDay < close) return { ...parts, phase: "regular", regular: true };
     return { ...parts, phase: "after_hours", regular: false };
   }
 
@@ -301,7 +330,8 @@
 
     return candles.map((candle, index) => {
       const parts = marketParts(candle.time, options);
-      const segment = options.continuous ? "continuous" : parts.minuteOfDay < 570 ? "pre" : "regular";
+      const { open } = regularSessionMinutes(options);
+      const segment = options.continuous ? "continuous" : parts.minuteOfDay < open ? "pre" : "regular";
       const key = `${parts.date}:${segment}`;
       if (key !== vwapKey) {
         vwapKey = key;
@@ -343,7 +373,8 @@
     const currentDay = marketParts(latestTime || candles[candles.length - 1].time, options).date;
     const prior = candles.filter((candle) => {
       const parts = marketParts(candle.time, options);
-      return parts.date < currentDay && (options.continuous || (parts.minuteOfDay >= 570 && parts.minuteOfDay < 960));
+      const { open, close } = regularSessionMinutes(options);
+      return parts.date < currentDay && (options.continuous || (parts.minuteOfDay >= open && parts.minuteOfDay < close));
     });
     return prior.length ? prior[prior.length - 1].close : null;
   }
@@ -351,6 +382,7 @@
   return {
     MINUTE_MS,
     MARKET_TIME_ZONE,
+    TEL_AVIV_TIME_ZONE,
     minuteStart,
     normalizeChartWindow,
     zoomChartWindow,

@@ -129,6 +129,23 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(candles[0]["time"], minute)
     self.assertEqual(candles[0]["close"], 100.5)
 
+  def test_ta125_uses_yahoo_tel_aviv_index_symbol(self):
+    payload = {
+      "chart": {
+        "result": [{
+          "timestamp": [1_800],
+          "indicators": {"quote": [{
+            "open": [4_000], "high": [4_010], "low": [3_995], "close": [4_005], "volume": [0],
+          }]},
+        }],
+      },
+    }
+    with patch.object(server, "yahoo_get", return_value=payload) as yahoo_get:
+      candle = server.fetch_latest_candle("yahoo", "TA125")
+    self.assertEqual(candle["close"], 4_005)
+    self.assertEqual(yahoo_get.call_args.args[0], "/v8/finance/chart/^TA125.TA")
+    self.assertEqual(server.active_provider("TA125"), "yahoo")
+
   def test_zero_volume_quote_outlier_is_rejected(self):
     self.assertIsNone(server.normalized_candle(
       candle(120_000, 100.0, 100.1, 92.0, 100.05, volume=0)

@@ -1,9 +1,20 @@
 const Core = window.MarketCore;
 const Patterns = window.PatternEngine;
-const SUPPORTED_SYMBOLS = new Set(["QQQ", "SPY", "BTC-USD"]);
+const ASSETS = {
+  QQQ: { label: "QQQ", market: "us", currency: "$" },
+  SPY: { label: "SPY", market: "us", currency: "$" },
+  "BTC-USD": { label: "BTC-USD", continuous: true, currency: "$" },
+  TA125: { label: "TA-125", market: "tase", currency: "ILS ", hasReliableIntradayVolume: false },
+};
+const SUPPORTED_SYMBOLS = new Set(Object.keys(ASSETS));
 const requestedSymbol = new URLSearchParams(window.location.search).get("symbol")?.toUpperCase();
 const API_SYMBOL = SUPPORTED_SYMBOLS.has(requestedSymbol) ? requestedSymbol : "QQQ";
-const ASSET_OPTIONS = { continuous: API_SYMBOL === "BTC-USD" };
+const ASSET = ASSETS[API_SYMBOL];
+const ASSET_OPTIONS = {
+  continuous: Boolean(ASSET.continuous),
+  market: ASSET.market,
+  hasReliableIntradayVolume: ASSET.hasReliableIntradayVolume !== false,
+};
 const SETTINGS_KEY = `trader-helper-settings:${API_SYMBOL}`;
 const STRATEGY_VERSION = "5.2.0";
 const ALERT_TIMEFRAMES = [1, 5, 15, 1440];
@@ -84,7 +95,7 @@ const els = {
   sessionState: document.getElementById("sessionState"),
   brandEyebrow: document.getElementById("brandEyebrow"),
   chartSymbol: document.getElementById("chartSymbol"),
-  assetButtons: [...document.querySelectorAll(".asset-button")],
+  assetSelector: document.getElementById("assetSelector"),
   lastPrice: document.getElementById("lastPrice"),
   priceChange: document.getElementById("priceChange"),
   graphRefreshButton: document.getElementById("graphRefreshButton"),
@@ -315,7 +326,11 @@ function syncSettingsControls() {
   els.tradeMode.value = state.settings.mode;
   els.sessionMode.value = state.settings.sessionMode || "regular";
   els.sessionMode.disabled = ASSET_OPTIONS.continuous;
-  els.sessionMode.closest("label").title = ASSET_OPTIONS.continuous ? "Bitcoin trades continuously, 24 hours a day" : "Choose regular or extended equity sessions";
+  els.sessionMode.closest("label").title = ASSET_OPTIONS.continuous
+    ? "Bitcoin trades continuously, 24 hours a day"
+    : ASSET_OPTIONS.market === "tase"
+      ? "Choose Tel Aviv regular-session or all available chart bars"
+      : "Choose regular or extended equity sessions";
   els.layerMAs.checked = Boolean(state.settings.chartLayers.movingAverages);
   syncVwapControl();
   els.layerLevels.checked = Boolean(state.settings.chartLayers.levels);
@@ -354,7 +369,7 @@ function renderProviderHealth() {
   els.marketStatus.textContent = ASSET_OPTIONS.continuous
     ? "24/7 market"
     : marketOpen
-    ? "Regular open"
+    ? ASSET_OPTIONS.market === "tase" ? "TASE regular open" : "Regular open"
     : session.phase === "premarket"
       ? "Premarket"
       : session.phase === "closed"
@@ -465,8 +480,8 @@ function assessDataQuality() {
     if (recentRegular[index].time - recentRegular[index - 1].time > gapLimit) gaps += 1;
   }
   const issues = [];
-  if (gaps >= (ASSET_OPTIONS.continuous ? 2 : 1)) issues.push(`${gaps} gap${gaps === 1 ? "" : "s"}`);
-  if (!ASSET_OPTIONS.continuous && regular.slice(-5).some((candle) => candle.volume <= 0)) issues.push("zero volume");
+  if (gaps >= (ASSET_OPTIONS.continuous || ASSET_OPTIONS.market === "tase" ? 2 : 1)) issues.push(`${gaps} gap${gaps === 1 ? "" : "s"}`);
+  if (!ASSET_OPTIONS.continuous && ASSET_OPTIONS.hasReliableIntradayVolume && regular.slice(-5).some((candle) => candle.volume <= 0)) issues.push("zero volume");
   state.localDataQualityIssues = issues;
   state.dataQualityIssues = [...new Set([
     ...issues,
@@ -2810,11 +2825,12 @@ function renderBestSwing(analysis) {
   els.bestSwingStopLabel.textContent = long ? "Sell if invalid" : "Cover if invalid";
   els.bestSwingTarget1Label.textContent = long ? "Sell target 1" : "Cover target 1";
   els.bestSwingTarget2Label.textContent = long ? "Sell target 2" : "Cover target 2";
-  els.bestSwingEntry.textContent = `$${fmt(candidate.entry)}`;
-  els.bestSwingStop.textContent = `$${fmt(candidate.stop)}`;
-  els.bestSwingTarget1.textContent = `$${fmt(candidate.target)} (${signedPct(target1Pct)})`;
-  els.bestSwingTarget2.textContent = `$${fmt(candidate.target2)} (${signedPct(target2Pct)})`;
-  els.bestSwingRationale.textContent = `Daily EMA 20/50, SMA 150, RSI, volume, and 5/20-day momentum determine whether this setup qualifies and how it scores. Target 1 at $${fmt(candidate.target)} projects a ${fmt(Math.abs(target1Pct), 2)}% ${long ? "rise" : "decline"} from entry; its distance uses at least ${fmt(minTargetPct, 2)}% or 1.2 times the structure-based risk, capped near ${fmt(maxTargetPct, 2)}%. Target 2 extends the move toward $${fmt(candidate.target2)}, capped near ${fmt(maxTarget2Pct, 2)}%. These are model projections, not guaranteed prices.`;
+  const price = (value) => `${ASSET.currency}${fmt(value)}`;
+  els.bestSwingEntry.textContent = price(candidate.entry);
+  els.bestSwingStop.textContent = price(candidate.stop);
+  els.bestSwingTarget1.textContent = `${price(candidate.target)} (${signedPct(target1Pct)})`;
+  els.bestSwingTarget2.textContent = `${price(candidate.target2)} (${signedPct(target2Pct)})`;
+  els.bestSwingRationale.textContent = `Daily EMA 20/50, SMA 150, RSI, volume, and 5/20-day momentum determine whether this setup qualifies and how it scores. Target 1 at ${price(candidate.target)} projects a ${fmt(Math.abs(target1Pct), 2)}% ${long ? "rise" : "decline"} from entry; its distance uses at least ${fmt(minTargetPct, 2)}% or 1.2 times the structure-based risk, capped near ${fmt(maxTargetPct, 2)}%. Target 2 extends the move toward ${price(candidate.target2)}, capped near ${fmt(maxTarget2Pct, 2)}%. These are model projections, not guaranteed prices.`;
 }
 
 function optionsDate(value) {
@@ -3533,11 +3549,11 @@ function providerLabel(config) {
 }
 
 function initializeAssetPage() {
-  document.title = `${API_SYMBOL} Trader Alert Helper`;
-  els.brandEyebrow.textContent = `${API_SYMBOL} alert assistant`;
-  els.chartSymbol.textContent = API_SYMBOL;
-  els.canvas.setAttribute("aria-label", `${API_SYMBOL} candlestick, volume, and RSI chart`);
-  els.fearGreedTitle.textContent = ASSET_OPTIONS.continuous ? "CNN US Market Context" : "CNN Fear & Greed";
+  document.title = `${ASSET.label} Trader Alert Helper`;
+  els.brandEyebrow.textContent = `${ASSET.label} alert assistant`;
+  els.chartSymbol.textContent = ASSET.label;
+  els.canvas.setAttribute("aria-label", `${ASSET.label} candlestick, volume, and RSI chart`);
+  els.fearGreedTitle.textContent = ASSET_OPTIONS.continuous || ASSET_OPTIONS.market === "tase" ? "CNN US Market Context" : "CNN Fear & Greed";
   els.marketConfirmationTile.hidden = API_SYMBOL !== "QQQ";
   try {
     state.lastOptionsAlertKey = window.sessionStorage.getItem(OPTIONS_ALERT_STORAGE_KEY) || "";
@@ -3549,17 +3565,13 @@ function initializeAssetPage() {
       option.textContent = "All hours (24/7)";
     });
   }
-  els.assetButtons.forEach((button) => {
-    const active = button.dataset.symbol === API_SYMBOL;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-    button.addEventListener("click", () => {
-      const symbol = button.dataset.symbol;
-      if (!SUPPORTED_SYMBOLS.has(symbol) || symbol === API_SYMBOL) return;
-      const url = new URL(window.location.href);
-      url.searchParams.set("symbol", symbol);
-      window.location.assign(url);
-    });
+  els.assetSelector.value = API_SYMBOL;
+  els.assetSelector.addEventListener("change", () => {
+    const symbol = els.assetSelector.value;
+    if (!SUPPORTED_SYMBOLS.has(symbol) || symbol === API_SYMBOL) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set("symbol", symbol);
+    window.location.assign(url);
   });
 }
 
