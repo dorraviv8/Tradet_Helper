@@ -42,6 +42,33 @@ def _net_r(gross_r, entry, risk, slippage_bps, commission_per_share):
   return gross_r - execution_cost / risk
 
 
+def execution_slippage_bps(signal, timeframe, base_slippage_bps, symbol):
+  phase = signal.get("marketPhase") or strategy_engine.market_phase(int(signal.get("signalCandleTime") or 0), symbol)
+  extra = 0.0
+  if phase in {"open", "premarket", "after_hours"}:
+    extra += 1.0
+  elif phase == "midday":
+    extra += 0.35
+  if strategy_engine.is_continuous_market(symbol):
+    extra += 1.0
+  if timeframe == strategy_engine.DAILY_TIMEFRAME:
+    extra += 0.5
+  return float(base_slippage_bps) + extra
+
+
+def gap_adjusted_stop_r(signal, candle):
+  entry = float(signal["entry"])
+  stop = float(signal["stop"])
+  risk = abs(entry - stop)
+  if risk <= 0:
+    return -1.0
+  if signal["direction"] == "long":
+    exit_price = min(stop, float(candle["open"]))
+    return (exit_price - entry) / risk
+  exit_price = max(stop, float(candle["open"]))
+  return (entry - exit_price) / risk
+
+
 def simulate_trade(signal, future_candles, timeframe, slippage_bps=0.5, commission_per_share=0.0, symbol=strategy_engine.DEFAULT_SYMBOL):
   entry = float(signal["entry"])
   stop = float(signal["stop"])
@@ -55,6 +82,7 @@ def simulate_trade(signal, future_candles, timeframe, slippage_bps=0.5, commissi
   signal_day = strategy_engine.market_parts(signal_time, symbol)[0]
   max_age = 14 * 24 * 60 * MINUTE_MS if timeframe == strategy_engine.DAILY_TIMEFRAME else 4 * 60 * MINUTE_MS
   entered_at = None
+  working_signal = dict(signal)
   target1_at = None
   favorable = 0.0
   adverse = 0.0
@@ -68,14 +96,23 @@ def simulate_trade(signal, future_candles, timeframe, slippage_bps=0.5, commissi
     if candle["time"] - signal_time > max_age:
       break
     last = candle
-    hits = _hit_map(signal, candle)
+    hits = _hit_map(working_signal, candle)
     if entered_at is None:
       if not hits["entry"] and hits["stop"]:
         return _trade_record(signal, timeframe, "invalidated", None, candle["time"], 0, 0, None, None)
       if not hits["entry"]:
         continue
       if hits["stop"]:
-        return _trade_record(signal, timeframe, "ambiguous", candle["time"], candle["time"], 0, 0, None, None)
+        return _trade_record(working_signal, timeframe, "ambiguous", candle["time"], candle["time"], 0, 0, None, None)
+      opening_fill = float(candle["open"])
+      if direction == "long" and opening_fill > entry:
+        working_signal["entry"] = opening_fill
+      elif direction == "short" and opening_fill < entry:
+        working_signal["entry"] = opening_fill
+      entry = float(working_signal["entry"])
+      risk = abs(entry - stop)
+      if risk <= 0 or (direction == "long" and entry >= target1) or (direction == "short" and entry <= target1):
+        return _trade_record(working_signal, timeframe, "ambiguous", candle["time"], candle["time"], 0, 0, None, None)
       entered_at = candle["time"]
       continue
 
@@ -83,41 +120,42 @@ def simulate_trade(signal, future_candles, timeframe, slippage_bps=0.5, commissi
     adverse = max(adverse, hits["adverse"])
     if target1_at is not None:
       if hits["target2"] and hits["stop"]:
-        return _trade_record(signal, timeframe, "ambiguous", entered_at, candle["time"], favorable, adverse, None, target1_at)
+        return _trade_record(working_signal, timeframe, "ambiguous", entered_at, candle["time"], favorable, adverse, None, target1_at)
       if hits["target2"]:
         gross_r = abs(target2 - entry) / risk
-        net = _net_r(gross_r, entry, risk, slippage_bps, commission_per_share)
-        return _trade_record(signal, timeframe, "target2", entered_at, candle["time"], favorable, adverse, net, target1_at)
+        net = _net_r(gross_r, entry, risk, execution_slippage_bps(signal, timeframe, slippage_bps, symbol), commission_per_share)
+        return _trade_record(working_signal, timeframe, "target2", entered_at, candle["time"], favorable, adverse, net, target1_at)
       if hits["stop"]:
-        gross_r = abs(target1 - entry) / risk * 0.5 - 0.5
-        net = _net_r(gross_r, entry, risk, slippage_bps, commission_per_share)
-        return _trade_record(signal, timeframe, "target1_stop", entered_at, candle["time"], favorable, adverse, net, target1_at)
+        gross_r = abs(target1 - entry) / risk * 0.5 + gap_adjusted_stop_r(working_signal, candle) * 0.5
+        net = _net_r(gross_r, entry, risk, execution_slippage_bps(signal, timeframe, slippage_bps, symbol), commission_per_share)
+        return _trade_record(working_signal, timeframe, "target1_stop", entered_at, candle["time"], favorable, adverse, net, target1_at)
       continue
 
     if hits["stop"] and (hits["target1"] or hits["target2"]):
-      return _trade_record(signal, timeframe, "ambiguous", entered_at, candle["time"], favorable, adverse, None, None)
+      return _trade_record(working_signal, timeframe, "ambiguous", entered_at, candle["time"], favorable, adverse, None, None)
     if hits["target2"]:
       gross_r = abs(target2 - entry) / risk
-      net = _net_r(gross_r, entry, risk, slippage_bps, commission_per_share)
-      return _trade_record(signal, timeframe, "target2", entered_at, candle["time"], favorable, adverse, net, candle["time"])
+      net = _net_r(gross_r, entry, risk, execution_slippage_bps(signal, timeframe, slippage_bps, symbol), commission_per_share)
+      return _trade_record(working_signal, timeframe, "target2", entered_at, candle["time"], favorable, adverse, net, candle["time"])
     if hits["target1"]:
       target1_at = candle["time"]
       continue
     if hits["stop"]:
-      net = _net_r(-1.0, entry, risk, slippage_bps, commission_per_share)
-      return _trade_record(signal, timeframe, "stopped", entered_at, candle["time"], favorable, adverse, net, None)
+      gross_r = gap_adjusted_stop_r(working_signal, candle)
+      net = _net_r(gross_r, entry, risk, execution_slippage_bps(signal, timeframe, slippage_bps, symbol), commission_per_share)
+      return _trade_record(working_signal, timeframe, "stopped", entered_at, candle["time"], favorable, adverse, net, None)
 
   if entered_at is None:
     end_time = last["time"] if last else signal_time + max_age
     return _trade_record(signal, timeframe, "expired", None, end_time, 0, 0, None, None)
   if last is None:
-    return _trade_record(signal, timeframe, "open", entered_at, None, favorable, adverse, None, target1_at)
+    return _trade_record(working_signal, timeframe, "open", entered_at, None, favorable, adverse, None, target1_at)
   close_move = (last["close"] - entry) if direction == "long" else (entry - last["close"])
   gross_r = close_move / risk
   if target1_at is not None:
     gross_r = abs(target1 - entry) / risk * 0.5 + gross_r * 0.5
-  net = _net_r(gross_r, entry, risk, slippage_bps, commission_per_share)
-  return _trade_record(signal, timeframe, "time_exit", entered_at, last["time"], favorable, adverse, net, target1_at)
+  net = _net_r(gross_r, entry, risk, execution_slippage_bps(signal, timeframe, slippage_bps, symbol), commission_per_share)
+  return _trade_record(working_signal, timeframe, "time_exit", entered_at, last["time"], favorable, adverse, net, target1_at)
 
 
 def _trade_record(signal, timeframe, outcome, entered_at, closed_at, favorable, adverse, realized_r, target1_at):
@@ -259,24 +297,27 @@ def run_replay(one_minute=None, five_minute=None, daily=None, settings=None, sym
   settings = settings or {}
   trades = []
   if one_minute:
-    trades.extend(replay_intraday(one_minute, 1, 1, settings, max_bars=2_500, symbol=symbol))
+    trades.extend(replay_intraday(one_minute, 1, 1, settings, max_bars=25_000, symbol=symbol))
   if five_minute:
-    trades.extend(replay_intraday(five_minute, 5, 5, settings, max_bars=5_000, symbol=symbol))
-    trades.extend(replay_intraday(five_minute, 15, 5, settings, max_bars=1_800, symbol=symbol))
+    trades.extend(replay_intraday(five_minute, 5, 5, settings, max_bars=50_000, symbol=symbol))
+    trades.extend(replay_intraday(five_minute, 15, 5, settings, max_bars=50_000, symbol=symbol))
   if daily:
-    trades.extend(replay_daily(daily, settings, max_bars=520, symbol=symbol))
+    trades.extend(replay_daily(daily, settings, max_bars=3_000, symbol=symbol))
+  validation = chronological_validation(trades)
   return {
     "symbol": symbol,
     "summary": summarize(trades),
     "byTimeframe": timeframe_summaries(trades),
     "groups": grouped_summaries(trades),
     "trades": trades,
+    "validation": validation,
     "method": {
       "lookAheadSafe": True,
       "sameBarTargetsExcluded": True,
       "ambiguousBarsExcludedFromCalibration": True,
       "slippageBpsPerSide": float(settings.get("backtestSlippageBps", 0.5)),
       "commissionPerSharePerSide": float(settings.get("backtestCommissionPerShare", 0.0)),
+      "validation": "Fixed-rule chronological holdout and rolling forward folds; no replay result changes production parameters",
     },
   }
 
@@ -289,6 +330,26 @@ def summarize(trades):
   favorable = [trade["mfeR"] for trade in resolved if trade["mfeR"] is not None]
   adverse = [trade["maeR"] for trade in resolved if trade["maeR"] is not None]
   target_times = [trade["timeToTarget1Ms"] for trade in resolved if trade["timeToTarget1Ms"] is not None]
+  wins = [value for value in realized if value > 0]
+  losses = [value for value in realized if value <= 0]
+  equity = 0.0
+  peak = 0.0
+  max_drawdown = 0.0
+  consecutive_losses = 0
+  max_consecutive_losses = 0
+  for value in realized:
+    equity += value
+    peak = max(peak, equity)
+    max_drawdown = max(max_drawdown, peak - equity)
+    if value <= 0:
+      consecutive_losses += 1
+      max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
+    else:
+      consecutive_losses = 0
+  gross_profit = sum(wins)
+  gross_loss = abs(sum(losses))
+  average_win = statistics.fmean(wins) if wins else None
+  average_loss = statistics.fmean(losses) if losses else None
   return {
     "signals": len(trades),
     "entries": len(entered),
@@ -299,9 +360,62 @@ def summarize(trades):
     "ambiguous": sum(trade["outcome"] == "ambiguous" for trade in trades),
     "probabilityT1": len(target_hits) / len(resolved) if resolved else None,
     "expectedR": statistics.fmean(realized) if realized else None,
+    "totalR": sum(realized) if realized else None,
+    "winRate": len(wins) / len(resolved) if resolved else None,
+    "profitFactor": gross_profit / gross_loss if gross_loss > 0 else None,
+    "avgWinR": average_win,
+    "avgLossR": average_loss,
+    "payoffRatio": average_win / abs(average_loss) if average_win is not None and average_loss not in {None, 0} else None,
+    "maxDrawdownR": max_drawdown if resolved else None,
+    "maxConsecutiveLosses": max_consecutive_losses,
     "avgFavorableR": statistics.fmean(favorable) if favorable else None,
     "avgAdverseR": statistics.fmean(adverse) if adverse else None,
     "medianTimeToTarget1Ms": statistics.median(target_times) if target_times else None,
+  }
+
+
+def chronological_validation(trades, holdout_fraction=0.4, folds=3):
+  resolved = sorted(
+    [trade for trade in trades if trade.get("enteredAt") is not None and trade.get("outcome") in RESOLVED_OUTCOMES and trade.get("realizedR") is not None],
+    key=lambda trade: (int(trade.get("signalTime") or 0), int(trade.get("timeframe") or 0)),
+  )
+  if len(resolved) < 10:
+    return {
+      "status": "building",
+      "detail": "At least 10 resolved replay trades are required for a chronological holdout",
+      "sampleSize": len(resolved),
+      "inSample": summarize([]),
+      "outOfSample": summarize([]),
+      "folds": [],
+    }
+  split = max(1, min(len(resolved) - 1, round(len(resolved) * (1 - holdout_fraction))))
+  in_sample = resolved[:split]
+  out_of_sample = resolved[split:]
+  fold_rows = []
+  fold_size = max(1, len(resolved) // (folds + 1))
+  for index in range(folds):
+    test_start = min(len(resolved), fold_size * (index + 1))
+    test_end = len(resolved) if index == folds - 1 else min(len(resolved), test_start + fold_size)
+    test_rows = resolved[test_start:test_end]
+    if not test_rows:
+      continue
+    fold_rows.append({
+      "fold": index + 1,
+      "trainingSamples": test_start,
+      "testStart": test_rows[0]["signalTime"],
+      "testEnd": test_rows[-1]["signalTime"],
+      "test": summarize(test_rows),
+    })
+  holdout = summarize(out_of_sample)
+  status = "validated" if holdout["resolved"] >= 30 and (holdout.get("expectedR") or 0) > 0 and (holdout.get("profitFactor") or 0) > 1 else "provisional"
+  return {
+    "status": status,
+    "detail": "Chronological fixed-rule holdout; production scoring is not fitted on the test period",
+    "sampleSize": len(resolved),
+    "splitIndex": split,
+    "inSample": summarize(in_sample),
+    "outOfSample": holdout,
+    "folds": fold_rows,
   }
 
 

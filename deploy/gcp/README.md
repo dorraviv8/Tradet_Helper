@@ -100,9 +100,13 @@ Set `ALERT_WEBHOOK_URL` in the private `.env` file to an incoming Slack, Discord
 
 The authenticated endpoint `/api/system-health` returns the current findings and recent incident history. Without a webhook URL, monitoring remains active and persistent, but no external message is sent.
 
+Set `TRADE_ALERT_WEBHOOK_URL` for server-side trade lifecycle messages, or set both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for Telegram delivery. These alerts cover armed plans, entries, targets, stops, expiry, and invalidation. They continue while the browser is closed. The Provider Health tile shows whether a server alert channel is configured.
+
+The SQLite journal is backed up to the persistent `trader-data` volume every 24 hours by default. Every backup runs `PRAGMA integrity_check`, and the most recent 14 verified copies are retained. `BACKUP_INTERVAL_SECONDS`, `BACKUP_RETENTION`, and `BACKTEST_MAX_CONCURRENCY` can be adjusted in `.env`; keep replay concurrency at `1` unless live request latency remains stable under load.
+
 ## Grafana Operations Dashboard
 
-The Compose stack includes private Prometheus and Node Exporter services plus Grafana at `https://PUBLIC_HOST/grafana/`. Grafana has its own login; set `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` in the private `.env` file. Prometheus scrapes the application's private `/metrics` endpoint and VM resource metrics every 30 seconds. Caddy blocks public access to `/metrics`; only Grafana is exposed through HTTPS.
+The Compose stack includes private Prometheus, Node Exporter, Loki, and Promtail services plus Grafana at `https://PUBLIC_HOST/grafana/`. Grafana has its own login; set `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` in the private `.env` file. Prometheus scrapes application and VM metrics every 30 seconds. Loki retains container logs for 14 days and exposes them in the operations dashboard. Caddy blocks public access to `/metrics`; only Grafana is exposed through HTTPS.
 
 ## Post-deploy Checks
 

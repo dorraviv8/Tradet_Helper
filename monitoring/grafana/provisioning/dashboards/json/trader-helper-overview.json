@@ -56,6 +56,7 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"min": 0}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
+      "id": 4,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [{"expr": "trader_helper_provider_errors", "legendFormat": "{{symbol}}", "refId": "A"}],
       "title": "Provider Errors",
@@ -65,6 +66,7 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "id": 5,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [{"expr": "trader_helper_trade_alerts_allowed", "legendFormat": "{{symbol}}", "refId": "A"}],
       "title": "Trade Data Health Permission",
@@ -74,10 +76,60 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+      "id": 6,
       "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
       "targets": [{"expr": "1 - (node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"})", "legendFormat": "Root disk used", "refId": "A"}],
       "title": "VM Root Disk Used",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 86400}, {"color": "red", "value": 129600}]}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 23},
+      "id": 9,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_database_backup_age_seconds", "refId": "A"}],
+      "title": "Verified Backup Age",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 23},
+      "id": 10,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_database_backup_integrity", "refId": "A"}],
+      "title": "Backup Integrity",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0}, "overrides": []},
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 23},
+      "id": 11,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_trade_notification_attempts", "refId": "A"}],
+      "title": "Trade Alert Attempts",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 23},
+      "id": 12,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_trade_notification_failures", "refId": "A"}],
+      "title": "Trade Alert Failures",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 29},
+      "id": 13,
+      "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "loki"}, "expr": "{job=\"docker\"}", "refId": "A"}],
+      "title": "Recent Container Logs",
+      "type": "logs"
     }
   ],
   "refresh": "30s",
@@ -87,5 +139,5 @@
   "time": {"from": "now-6h", "to": "now"},
   "title": "Trader Helper Operations",
   "uid": "trader-helper-operations",
-  "version": 1
+  "version": 2
 }

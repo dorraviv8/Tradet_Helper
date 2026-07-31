@@ -15,6 +15,56 @@ US_REGULAR_OPEN_MINUTE = 9 * 60 + 30
 US_REGULAR_CLOSE_MINUTE = 16 * 60
 TEL_AVIV_REGULAR_OPEN_MINUTE = 10 * 60
 TEL_AVIV_REGULAR_CLOSE_MINUTE = 17 * 60 + 30
+MARKET_PROFILES = {
+  "QQQ": {
+    "label": "US technology ETF",
+    "reliableVolume": True,
+    "relativeVolumeFloor": 1.10,
+    "intradayScale": 1.0,
+    "dailyTargetMinPct": 0.012,
+    "dailyTargetMaxPct": 0.025,
+    "dailyTarget2MaxPct": 0.04,
+    "dailyRiskAtr": 1.45,
+    "dailyRiskPct": 0.022,
+  },
+  "SPY": {
+    "label": "US broad-market ETF",
+    "reliableVolume": True,
+    "relativeVolumeFloor": 1.05,
+    "intradayScale": 0.82,
+    "dailyTargetMinPct": 0.008,
+    "dailyTargetMaxPct": 0.018,
+    "dailyTarget2MaxPct": 0.03,
+    "dailyRiskAtr": 1.4,
+    "dailyRiskPct": 0.018,
+  },
+  "BTC-USD": {
+    "label": "Continuous cryptocurrency",
+    "reliableVolume": True,
+    "relativeVolumeFloor": 1.15,
+    "intradayScale": 1.0,
+    "dailyTargetMinPct": 0.02,
+    "dailyTargetMaxPct": 0.05,
+    "dailyTarget2MaxPct": 0.08,
+    "dailyRiskAtr": 1.65,
+    "dailyRiskPct": 0.045,
+  },
+  "TA125": {
+    "label": "Tel Aviv broad-market index",
+    "reliableVolume": False,
+    "relativeVolumeFloor": None,
+    "intradayScale": 0.78,
+    "dailyTargetMinPct": 0.007,
+    "dailyTargetMaxPct": 0.018,
+    "dailyTarget2MaxPct": 0.028,
+    "dailyRiskAtr": 1.4,
+    "dailyRiskPct": 0.018,
+  },
+}
+
+
+def asset_profile(symbol=DEFAULT_SYMBOL):
+  return MARKET_PROFILES.get(str(symbol or DEFAULT_SYMBOL).upper(), MARKET_PROFILES[DEFAULT_SYMBOL])
 
 
 def is_continuous_market(symbol=DEFAULT_SYMBOL):
@@ -366,6 +416,10 @@ def bounds(timeframe, mode, symbol=DEFAULT_SYMBOL):
     15: {"maxRiskAtr": 1.65, "maxRiskPct": 0.012, "target1MinPct": 0.008, "target1MaxPct": 0.02, "target2MaxPct": 0.03, "lookback": 18},
   }
   values = dict((crypto_values if is_continuous_market(symbol) else equity_values)[timeframe])
+  profile = asset_profile(symbol)
+  if not is_continuous_market(symbol):
+    for key in ("maxRiskPct", "target1MinPct", "target1MaxPct", "target2MaxPct"):
+      values[key] *= profile["intradayScale"]
   scale = {"scalp": 0.82, "normal": 1, "strict": 1.08}.get(mode, 1)
   for key in ("target1MinPct", "target1MaxPct", "target2MaxPct"):
     values[key] *= scale
@@ -438,7 +492,7 @@ def five_minute_no_trade_filters(latest, regime, symbol=DEFAULT_SYMBOL):
     reasons.append("Wait for the 15-minute opening range to complete")
   if atr > 0 and close > 0 and atr / close < 0.00035:
     reasons.append("5m volatility is too compressed for a reliable target")
-  if phase == "midday" and relative_volume is not None and relative_volume < 0.6:
+  if phase == "midday" and asset_profile(symbol)["reliableVolume"] and relative_volume is not None and relative_volume < 0.6:
     reasons.append("Midday volume is too light for a momentum trade")
   if regime.get("type") == "chop" and atr > 0 and abs(latest["close"] - (latest.get("vwap") or latest["close"])) < atr * 0.35:
     reasons.append("Choppy price action is too close to VWAP")
@@ -451,6 +505,7 @@ def execution_confirmation(values, direction):
     return {"available": False, "aligned": None, "detail": "1m execution bars are still building"}
   latest = values[-1]
   previous = values[-2]
+  anchor = values[-4]
   required = (latest.get("ema20"), latest.get("vwap"), latest.get("rsi"), previous.get("ema20"))
   if any(value is None for value in required):
     return {"available": False, "aligned": None, "detail": "1m execution indicators are still building"}
@@ -462,6 +517,8 @@ def execution_confirmation(values, direction):
       and latest["rsi"] >= 50
       and latest["close"] >= previous["close"]
       and (shape["bullish"] or latest["low"] <= latest["ema20"])
+      and latest["close"] > anchor["close"]
+      and latest["rsi"] >= (anchor.get("rsi") or latest["rsi"])
     )
   else:
     aligned = (
@@ -470,11 +527,13 @@ def execution_confirmation(values, direction):
       and latest["rsi"] <= 50
       and latest["close"] <= previous["close"]
       and (shape["bearish"] or latest["high"] >= latest["ema20"])
+      and latest["close"] < anchor["close"]
+      and latest["rsi"] <= (anchor.get("rsi") or latest["rsi"])
     )
   return {
     "available": True,
     "aligned": aligned,
-    "detail": "1m execution confirms the 5m direction" if aligned else "1m execution does not yet confirm the 5m direction",
+    "detail": "1m execution confirms price, EMA/VWAP, and three-bar momentum" if aligned else "1m price, EMA/VWAP, and three-bar momentum are not fully aligned",
   }
 
 
@@ -550,31 +609,38 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   continuation = kind in {"momentum", "breakout", "breakdown", "ema_pullback"}
   execution = context.get("execution") or {"available": False, "aligned": None}
   relative_volume = latest.get("relativeVolume") or 0
+  profile = asset_profile(symbol)
+  contribution_rows = [{"label": "Setup structure", "points": int(candidate["baseScore"])}]
+
+  def adjust(points, label):
+    nonlocal score
+    score += points
+    contribution_rows.append({"label": label, "points": int(points)})
 
   if (regime["type"] == "trend_up" and not long) or (regime["type"] == "trend_down" and long):
-    score -= 16
+    adjust(-16, "Regime opposition")
     reasons.append(f"Market regime opposes {direction} setup")
   if regime["type"] in {"range", "chop"} and setup_type(candidate["setup"]) == "momentum":
-    score -= 10
+    adjust(-10, "Momentum in range/chop")
     reasons.append(f"{regime['label']} regime reduces momentum follow-through quality")
   if setup_type(candidate["setup"]) in {"reversal", "vwap"} and regime["type"] in {"range", "mixed"}:
-    score += 5
+    adjust(5, "Reversion-friendly regime")
     reasons.append(f"{regime['label']} regime can favor tactical reversion setups")
   if continuation and confirmation["aligned"] < 2:
-    score -= 18
+    adjust(-18, "Missing trend alignment")
     reasons.append("Higher-timeframe momentum is not sufficiently aligned")
   elif continuation and confirmation["opposed"]:
-    score -= 12
+    adjust(-12, "Opposing monitored trend")
     reasons.append("A monitored timeframe opposes the setup direction")
   if continuation and extension > 1.35:
-    score -= 20
+    adjust(-20, "Overextended entry")
     reasons.append(f"Price is already {extension:.1f} ATR beyond EMA 20; avoid chasing")
   if timeframe == 5 and execution["available"]:
     if execution["aligned"]:
-      score += 10
+      adjust(10, "One-minute execution confirmation")
       reasons.append(execution["detail"])
     elif continuation:
-      score -= 18
+      adjust(-18, "One-minute execution conflict")
       reasons.append(execution["detail"])
 
   checks = (
@@ -586,19 +652,42 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
     ((latest["close"] > latest["vwap"]) if long else (latest["close"] < latest["vwap"]), 8, "VWAP is on the correct side"),
     ((45 <= latest["rsi"] <= 68) if long else (32 <= latest["rsi"] <= 55), 10, "RSI is in a tradable momentum zone"),
     ((shape["bullish"] if long else shape["bearish"]) and shape["bodyPct"] >= 0.35, 10, "Confirmation candle has a real body"),
-    ((relative_volume >= (1.1 if timeframe == 5 else 1.15)) or shape["body"] >= latest["atr"] * 0.35, 8, "Relative volume or candle expansion supports the move"),
+    ((relative_volume >= (profile["relativeVolumeFloor"] or 99) if profile["reliableVolume"] else False) or shape["body"] >= latest["atr"] * 0.35, 8, "Relative volume or candle expansion supports the move"),
     ((local["supportTouches"] if long else local["resistanceTouches"]) >= 2, 4, "Nearby level has repeated touches"),
   )
   if phase in {"morning", "afternoon", "power_hour"}:
-    score += 6
+    adjust(6, f"{phase.replace('_', ' ').title()} follow-through window")
     reasons.append(f"Market phase supports intraday follow-through: {phase}")
   elif phase == "midday":
-    score -= 6
+    adjust(-6, "Midday liquidity penalty")
     reasons.append("Midday session can be choppy")
   for condition, points, reason in checks:
     if condition:
-      score += points
+      adjust(points, reason)
       reasons.append(reason)
+
+  five_minute_model = None
+  if timeframe == 5:
+    if kind == "opening_range":
+      five_minute_model = "opening_breakout"
+      if phase == "morning":
+        adjust(5, "Opening breakout timing")
+    elif kind in {"ema_pullback", "vwap"}:
+      five_minute_model = "trend_pullback"
+      if regime["type"] in {"trend_up", "trend_down"}:
+        adjust(5, "Trend pullback regime")
+    elif kind in {"failed_breakout", "reversal"}:
+      five_minute_model = "failed_break_reversal"
+      if regime["type"] in {"range", "mixed"}:
+        adjust(4, "Reversal-friendly regime")
+    elif kind in {"breakout", "breakdown", "compression"}:
+      five_minute_model = "range_expansion"
+    else:
+      five_minute_model = "momentum_continuation"
+    if phase == "midday" and continuation:
+      adjust(-6, "Midday continuation requires exceptional volume")
+    if phase == "power_hour" and continuation:
+      adjust(4, "Power-hour continuation window")
 
   current_bounds = bounds(timeframe, settings.get("mode", "normal"), symbol)
   buffer = max(0.03, latest["atr"] * (0.1 if timeframe == 5 else 0.08))
@@ -611,7 +700,7 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   risk = abs(entry - stop)
   structural_risk_too_wide = risk > min(latest["atr"] * current_bounds["maxRiskAtr"], entry * current_bounds["maxRiskPct"])
   if structural_risk_too_wide:
-    score -= 14
+    adjust(-14, "Structural risk too wide")
     reasons.append("Structural invalidation is wider than this timeframe risk limit")
 
   minimum = entry * current_bounds["target1MinPct"]
@@ -628,15 +717,18 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   target2 = entry + target2_move if long else entry - target2_move
   risk_reward = target_move / risk if risk else 0
   if risk_reward >= 1.05:
-    score += 8
+    adjust(8, "Acceptable reward/risk")
     reasons.append("Target 1 offers acceptable reward/risk")
   if risk_reward < 0.85:
-    score -= 22
+    adjust(-22, "Weak reward/risk")
     reasons.append("Reward/risk is weak")
   elif risk_reward < 1.05:
-    score -= 8
+    adjust(-8, "Marginal reward/risk")
     reasons.append("Reward/risk is marginal")
-  score += adaptive_adjustment(kind, timeframe, phase, performance, reasons)
+  shadow_adjustment = adaptive_adjustment(kind, timeframe, phase, performance, [])
+  learning_mode = (settings.get("learning") or {}).get("mode", "shadow")
+  if shadow_adjustment and learning_mode == "approved_live":
+    adjust(shadow_adjustment, "Approved forward outcome calibration")
   normalized_score = int(clamp(round(50 + (score - 50) * 0.68), 0, 95))
   exit_rules = [
     "Take partial profit near Target 1",
@@ -649,6 +741,7 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
     "direction": direction,
     "score": normalized_score,
     "rawScore": round(score),
+    "scoreContributions": contribution_rows,
     "reasons": reasons,
     "entry": entry,
     "stop": stop,
@@ -658,6 +751,12 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
     "watchOnly": structural_risk_too_wide or risk_reward < 0.85 or (continuation and extension > 1.8) or (timeframe == 5 and continuation and execution["available"] and not execution["aligned"]),
     "marketPhase": phase,
     "executionConfirmation": execution,
+    "fiveMinuteModel": five_minute_model,
+    "shadowModel": {
+      "status": "shadow" if learning_mode != "approved_live" else "approved_live",
+      "suggestedScoreAdjustment": shadow_adjustment,
+      "appliedToProduction": learning_mode == "approved_live",
+    },
     "exitWarning": f"For {direction}: scale at T1, trail {'below' if long else 'above'} EMA 20/VWAP",
     "exitRules": exit_rules,
   }
@@ -735,8 +834,10 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
   tone = "positive" if long else "negative"
   reasons = list(candidate["reasons"])
   score = candidate["baseScore"]
+  contribution_rows = [{"label": "Daily setup structure", "points": int(candidate["baseScore"])}]
   shape = candle_shape(latest)
   kind = setup_type(candidate["setup"])
+  profile = asset_profile(symbol)
   extension = atr_extension(latest, candidate["direction"])
   ema20_rising = latest["ema20"] > prior_week["ema20"]
   five_day_return = latest["close"] / prior_week["close"] - 1
@@ -750,15 +851,17 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     ((five_day_return > 0) if long else (five_day_return < 0), 8, "Five-day price momentum agrees"),
     ((twenty_day_return > 0) if long else (twenty_day_return < 0), 8, "Twenty-day price momentum agrees"),
     ((shape["bullish"] if long else shape["bearish"]) and shape["bodyPct"] >= 0.35, 8, "Daily confirmation candle has directional body"),
-    ((latest.get("relativeVolume") or 0) >= 1.0, 6, "Daily volume is at or above its recent average"),
+    (profile["reliableVolume"] and (latest.get("relativeVolume") or 0) >= 1.0, 6, "Daily volume is at or above its recent average"),
   )
   for condition, points, reason in checks:
     if condition:
       score += points
       reasons.append(reason)
+      contribution_rows.append({"label": reason, "points": int(points)})
   if kind in {"momentum", "breakout", "breakdown", "ema_pullback"} and extension > 1.75:
     score -= 8
     reasons.append(f"Daily close is already {extension:.1f} ATR beyond EMA 20; wait for a better location")
+    contribution_rows.append({"label": "Daily extension penalty", "points": -8})
 
   buffer = max(0.05, latest["atr"] * 0.08)
   if long:
@@ -770,16 +873,17 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     structural = min(latest["high"], latest["ema20"], levels["resistance"])
     stop = structural + latest["atr"] * 0.18
   risk = abs(entry - stop)
-  risk_limit = min(latest["atr"] * (1.65 if is_continuous_market(symbol) else 1.45), entry * (0.045 if is_continuous_market(symbol) else 0.022))
+  risk_limit = min(latest["atr"] * profile["dailyRiskAtr"], entry * profile["dailyRiskPct"])
   structural_risk_too_wide = risk <= 0 or risk > risk_limit
   if structural_risk_too_wide:
     score -= 16
     reasons.append("Daily invalidation is wider than the swing risk limit")
+    contribution_rows.append({"label": "Swing risk too wide", "points": -16})
 
   scale = {"scalp": 0.9, "normal": 1, "strict": 1.1}.get(settings.get("mode", "normal"), 1)
-  minimum = entry * (0.02 if is_continuous_market(symbol) else 0.012) * scale
-  maximum = entry * (0.05 if is_continuous_market(symbol) else 0.025) * scale
-  maximum2 = entry * (0.08 if is_continuous_market(symbol) else 0.04) * scale
+  minimum = entry * profile["dailyTargetMinPct"] * scale
+  maximum = entry * profile["dailyTargetMaxPct"] * scale
+  maximum2 = entry * profile["dailyTarget2MaxPct"] * scale
   target_move = clamp(max(risk * 1.2, minimum), minimum, maximum)
   target2_move = clamp(max(risk * 1.8, target_move * 1.45), target_move, maximum2)
   target = entry + target_move if long else entry - target_move
@@ -788,11 +892,17 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
   if risk_reward >= 1.2:
     score += 10
     reasons.append("Swing Target 1 offers at least 1.2R")
+    contribution_rows.append({"label": "Swing reward/risk", "points": 10})
   elif risk_reward < 1:
     score -= 18
     reasons.append("Swing reward/risk is below 1R")
+    contribution_rows.append({"label": "Weak swing reward/risk", "points": -18})
 
-  score += adaptive_adjustment(kind, DAILY_TIMEFRAME, "swing", performance, reasons)
+  shadow_adjustment = adaptive_adjustment(kind, DAILY_TIMEFRAME, "swing", performance, [])
+  learning_mode = (settings.get("learning") or {}).get("mode", "shadow")
+  if shadow_adjustment and learning_mode == "approved_live":
+    score += shadow_adjustment
+    contribution_rows.append({"label": "Approved forward outcome calibration", "points": int(shadow_adjustment)})
   normalized_score = int(clamp(round(50 + (score - 50) * 0.68), 0, 95))
   return {
     "setup": candidate["setup"],
@@ -800,6 +910,12 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     "direction": candidate["direction"],
     "score": normalized_score,
     "rawScore": round(score),
+    "scoreContributions": contribution_rows,
+    "shadowModel": {
+      "status": "shadow" if learning_mode != "approved_live" else "approved_live",
+      "suggestedScoreAdjustment": shadow_adjustment,
+      "appliedToProduction": learning_mode == "approved_live",
+    },
     "reasons": reasons,
     "entry": entry,
     "stop": stop,

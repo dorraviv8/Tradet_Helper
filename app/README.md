@@ -1,6 +1,6 @@
-# QQQ and Bitcoin Trader Alert Helper
+# Multi-Market Trader Alert Helper
 
-Alert-only technical-analysis helper for QQQ and BTC-USD. It does not import order APIs and cannot place trades.
+Alert-only technical-analysis helper for QQQ, SPY, BTC-USD, and TA-125. It does not import order APIs and cannot place trades.
 
 ## Local Run
 
@@ -9,7 +9,7 @@ cd app
 python3 server.py
 ```
 
-Open `http://127.0.0.1:5173/`. Use the QQQ and BTC-USD buttons in the top bar to switch between isolated asset pages. The selected asset is also addressable with `?symbol=QQQ` or `?symbol=BTC-USD`.
+Open `http://127.0.0.1:5173/`. Use the market selector in the top bar to switch between isolated asset views. The selected asset is also addressable with `?symbol=QQQ`, `?symbol=SPY`, `?symbol=BTC-USD`, or `?symbol=TA125`.
 
 Yahoo Finance chart data is used by default without an account or API key. It is best-effort web data and may be delayed, rate-limited, unavailable, or changed by Yahoo. The application pauses recommendations when recent data quality is not clean.
 
@@ -45,13 +45,13 @@ The provider requests QQQ trades only. Live and frozen data types are accepted; 
 
 ## Analysis
 
-The Python strategy engine is the only authority for entries, exits, targets, trend state, regime, and candidate scores. The browser renders those server results and shows a neutral waiting state while server analysis is unavailable; it cannot silently substitute a second browser-generated trade. QQQ and BTC-USD have separate live runtimes, recommendations, journals, historical replays, and calibration samples.
+The Python strategy engine is the only authority for entries, exits, targets, trend state, regime, and candidate scores. The browser renders those server results and shows a neutral waiting state while server analysis is unavailable; it cannot silently substitute a second browser-generated trade. Every market has a separate live runtime, recommendation set, journal, historical replay, and calibration sample.
 
-QQQ uses New York regular and extended trading sessions. BTC-USD is analyzed as a continuous 24/7 market: day boundaries and daily VWAP reset at 00:00 UTC, weekends remain active, and crypto-specific ATR and percentage limits are used for entries, invalidations, and targets. CNN Fear & Greed is labeled as US market context on the BTC page and does not affect Bitcoin scores.
+QQQ and SPY use New York regular and extended sessions with distinct ETF volatility profiles. BTC-USD is analyzed continuously: day boundaries and daily VWAP reset at 00:00 UTC, weekends remain active, and crypto-specific limits are used. TA-125 follows the Tel Aviv session and does not use unreliable index volume as a confirmation factor. CNN Fear & Greed remains contextual and does not alter scores.
 
-The engine evaluates closed 1m, 5m, and 15m candles on every refresh, regardless of which chart is visible. Yahoo's native 5m feed supplies up to 60 days of context, so 5m/15m averages and momentum do not depend on the shorter retained 1m window. The General Trend panel also reports 1D momentum from closed daily candles using EMA 20/50 alignment, five-session price momentum, EMA slope, and RSI. The Best Day Trade panel shows the strongest actionable intraday timeframe.
+The engine evaluates closed 1m, 5m, and 15m candles on every refresh, regardless of which chart is visible. Yahoo's native 5m feed supplies up to 60 days per fetch and is accumulated in persistent storage. Non-boundary quote rows are rejected before 5m analysis. The General Trend panel also reports 1D momentum from closed daily candles. The opportunity scanner ranks current day and swing candidates across all configured markets.
 
-The daily engine uses up to two years of Yahoo candles and produces a separate Best Swing result. It ranks bull and bear momentum continuation, 20-day breakout/breakdown, EMA 20 pullback/rejection, and support/resistance reversal setups. Daily plans require at least 160 closed candles and use daily EMA 20/50, SMA 150, RSI 14, ATR 14, relative volume, and 5/20-day price momentum. Session VWAP is intentionally excluded from daily scoring and display.
+The daily engine requests up to ten years of Yahoo candles, retains up to 3,000 bars, and produces a separate Best Swing result. It ranks bull and bear momentum continuation, 20-day breakout/breakdown, EMA 20 pullback/rejection, and support/resistance reversal setups. Daily plans require at least 160 closed candles and use daily EMA 20/50, SMA 150, RSI 14, ATR 14, supported volume context, and 5/20-day price momentum. Session VWAP is intentionally excluded from daily scoring and display.
 
 Indicators:
 
@@ -66,15 +66,15 @@ Indicators:
 
 The Patterns control ranks confirmed or geometrically valid structures and displays only the strongest current match. Intraday pattern detection uses regular-session candles only (09:30-16:00 New York time); premarket and after-hours candles may remain visible but cannot create or confirm a pattern. Daily detection is unchanged. Supported families include head-and-shoulders, double and triple tops/bottoms, flags, pennants, triangles, wedges, cup-and-handle, rounded reversals, rectangles, channels, engulfing candles, hammers/shooting stars, dojis, and morning/evening stars. Clicking a pattern toggles its measured-move projection. Pattern scores rank competing shapes; they are not probabilities and do not directly alter the server alert score.
 
-Each actionable long or short plan includes entry, invalidation, Target 1, Target 2, exit warnings, quality score, and reasons. Intraday targets use asset-specific volatility bounds. QQQ swing targets are bounded at roughly 1.2%-2.5% for Target 1 and up to 4% for Target 2; BTC-USD uses roughly 2%-5% and up to 8%. Scores are rule-based quality ranks, not probabilities.
+Each actionable long or short plan includes entry, invalidation, Target 1, Target 2, exit warnings, score drivers, and the next missing condition. Intraday targets use asset-specific volatility bounds. QQQ swing targets are bounded at roughly 1.2%-2.5% for Target 1 and up to 4% for Target 2; BTC-USD uses roughly 2%-5% and up to 8%. Scores are rule-based quality ranks, not probabilities. Position sizing is shown only after an account size and risk percentage are supplied; TA-125 requires selection of a tradable instrument first.
 
 ## Historical Replay And Calibration
 
-The server runs a background candle-by-candle replay over retained 1m history, up to 5,000 native 5m bars, resampled 15m bars, and up to 520 daily bars. Replay calls the same Python setup and scoring functions used by live recommendations. It enforces the signal boundary, starts entry evaluation on a later candle, does not award a target on the entry candle, excludes ambiguous OHLC paths from calibration, applies configurable execution friction, and keeps simulated trades separate from the live journal.
+The server runs a bounded background candle-by-candle replay over persistent 1m history, up to 50,000 native 5m bars, resampled 15m bars, and up to 3,000 daily bars. Replay calls the same Python setup and scoring functions used by live recommendations. It uses chronological holdouts and rolling forward folds, models opening fills, stop gaps and session-dependent slippage, excludes ambiguous OHLC paths, and keeps simulated trades separate from the live journal.
 
 Default replay execution assumptions are 0.5 basis points of slippage per side and zero per-share commission. Configure `backtestSlippageBps` and `backtestCommissionPerShare` in `settings.json` if the expected execution environment differs.
 
-Historical Edge reports a neutral-prior estimate of Target 1 occurring before the stop, expected net return in R, comparable sample size, and a 95% Wilson interval. The most specific group with enough observations is selected in this order: setup/timeframe/direction, setup/timeframe, timeframe/direction, timeframe, then all replay trades. Fewer than 20 resolved comparable trades is explicitly labeled Preliminary. Replay statistics describe the retained sample and do not guarantee future results.
+Historical Edge reports a neutral-prior estimate of Target 1 occurring before the stop, expected net return in R, profit factor, maximum drawdown, comparable sample size, and a 95% Wilson interval. The most specific group with enough observations is selected in this order: setup/timeframe/direction, setup/timeframe, timeframe/direction, timeframe, then all replay trades. Replay statistics describe the retained sample and do not guarantee future results.
 
 On the selected chart, a confirmed long plan marks its exact entry trigger with a green upward arrow. A confirmed short plan uses a red downward arrow. Watch-only candidates and rejected setups do not draw entry arrows.
 
@@ -86,11 +86,11 @@ Each timeframe keeps its own viewport while the page is open. Historical views s
 
 ## Journal Integrity
 
-Strategy version `5.1.0` records the signal candle separately from the time the plan became actionable. Outcome evaluation starts at the first candle after that boundary and never awards a target from the same OHLC bar that first triggered entry. Intraday waiting plans expire after four hours; daily swing entries can remain valid for up to 14 calendar days.
+Strategy version `6.0.0` records the signal candle separately from the time the plan became actionable. Outcome evaluation starts at the first candle after that boundary and never awards a target from the same OHLC bar that first triggered entry. Intraday waiting plans expire after four hours; daily swing entries can remain valid for up to 14 calendar days.
 
 The server owns candle persistence and outcome evaluation. Browser clients cannot submit outcome candles. Older strategy versions remain in SQLite but are excluded from adaptive statistics.
 
-Adaptive score adjustments require at least 30 resolved examples and use shrinkage toward a neutral prior. Expectancy and positive-R rate are shown alongside target and stop counts.
+Adaptive suggestions remain in shadow mode and cannot alter production scores. Promotion requires at least 120 forward outcomes plus a separate comparison against the fixed-rule champion; automatic promotion is disabled. The execution review stores actual fill, quantity, exit, realized R, notes, and an optional chart snapshot. Pattern projections maintain a separate outcome sample and remain descriptive until validated.
 
 The journal path defaults to:
 
@@ -106,16 +106,18 @@ One background worker per symbol polls Yahoo, caches the latest candle for every
 
 The Graph Refresh control manually synchronizes the latest candle, intraday history, native five-minute history, daily history, and server recommendations, then redraws the selected chart without reloading the page or resetting chart controls.
 
-Yahoo data horizons:
+Yahoo source and retained horizons:
 
 - 1m: five-day source window, with the newest 2,500 bars retained for the browser
-- 5m: native 60-day source window, refreshed every 15 minutes
-- 1D: native two-year source window, refreshed at most every six hours
+- 5m: native 60-day source window, refreshed every 15 minutes and accumulated up to 50,000 bars
+- 1D: native ten-year source window, up to 3,000 bars, refreshed at most every six hours
 
 Health endpoints:
 
 - `GET /health`
 - `GET /ready`
+
+The server creates an integrity-checked SQLite backup every 24 hours by default and retains 14 copies. Server-side lifecycle alerts can be sent through a webhook or Telegram while the browser is closed. Prometheus tracks provider health, incidents, backup integrity, and notification failures; Grafana displays those metrics and Loki container logs.
 
 ## Security
 

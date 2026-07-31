@@ -29,6 +29,16 @@ def candle(time, open_price, high, low, close, volume=1000):
 
 
 class StrategyEngineTests(unittest.TestCase):
+  def test_asset_profiles_use_distinct_market_targets(self):
+    qqq = strategy.bounds(5, "normal", "QQQ")
+    spy = strategy.bounds(5, "normal", "SPY")
+    ta125 = strategy.bounds(5, "normal", "TA125")
+    btc = strategy.bounds(5, "normal", "BTC-USD")
+    self.assertLess(spy["target1MaxPct"], qqq["target1MaxPct"])
+    self.assertLess(ta125["target1MaxPct"], qqq["target1MaxPct"])
+    self.assertGreater(btc["target1MaxPct"], qqq["target1MaxPct"])
+    self.assertFalse(strategy.asset_profile("TA125")["reliableVolume"])
+
   def test_resample_preserves_ohlcv_order(self):
     start = timestamp(2026, 7, 17, 9, 30)
     sampled = strategy.resample([
@@ -56,6 +66,36 @@ class StrategyEngineTests(unittest.TestCase):
     self.assertEqual(strategy.adaptive_adjustment("momentum", 5, "morning", below_minimum, reasons), 0)
     enough = {"bySetup": {"momentum": {"winners": 26, "stopped": 4}}}
     self.assertGreater(strategy.adaptive_adjustment("momentum", 5, "morning", enough, []), 0)
+
+  def test_shadow_learning_does_not_change_production_candidate_score(self):
+    latest = {
+      "time": timestamp(2026, 7, 17, 10, 30), "open": 100.0, "high": 100.2, "low": 99.9, "close": 100.1,
+      "volume": 2_000, "ema20": 100.0, "ema50": 99.8, "sma20": 100.0, "sma50": 99.8,
+      "vwap": 99.9, "rsi": 60.0, "atr": 1.0, "relativeVolume": 1.3,
+    }
+    context = {
+      "latest": latest,
+      "previous": {**latest, "time": latest["time"] - 5 * strategy.MINUTE_MS, "close": 99.95},
+      "direction": "long",
+      "shape": strategy.candle_shape(latest),
+      "levels": {"support": 99.7, "resistance": 100.15, "supportTouches": 2, "resistanceTouches": 2},
+      "timeframe": 5,
+      "trend5": {"tone": "positive"},
+      "trend15": {"tone": "positive"},
+      "selectedTrend": {"tone": "positive"},
+      "trends": {1: {"tone": "positive"}, 5: {"tone": "positive"}, 15: {"tone": "positive"}},
+      "regime": {"type": "trend_up", "label": "Trend Up"},
+      "execution": {"available": True, "aligned": True, "detail": "1m confirms"},
+    }
+    setup = {"setup": "Long 5m momentum continuation", "baseScore": 45, "reasons": ["test"]}
+    performance = {"bySetup": {"momentum": {"winners": 30, "stopped": 0}}}
+    baseline = strategy.score_candidate(setup, context, {"mode": "normal", "learning": {"mode": "shadow"}}, {})
+    shadow = strategy.score_candidate(setup, context, {"mode": "normal", "learning": {"mode": "shadow"}}, performance)
+    approved = strategy.score_candidate(setup, context, {"mode": "normal", "learning": {"mode": "approved_live"}}, performance)
+    self.assertGreater(shadow["shadowModel"]["suggestedScoreAdjustment"], 0)
+    self.assertEqual(shadow["score"], baseline["score"])
+    self.assertFalse(shadow["shadowModel"]["appliedToProduction"])
+    self.assertGreater(approved["score"], shadow["score"])
 
   def test_analysis_returns_every_timeframe_with_actionable_boundaries(self):
     start = timestamp(2026, 7, 17, 9, 30)

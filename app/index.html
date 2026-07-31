@@ -28,6 +28,37 @@
       </div>
     </header>
 
+    <section class="decision-strip" aria-label="Current trading decision">
+      <div class="decision-main">
+        <span class="decision-label">Action now</span>
+        <strong id="actionNow">Loading market analysis</strong>
+        <span id="actionDetail">Waiting for current candles and server recommendations.</span>
+      </div>
+      <div class="decision-metric">
+        <span>Data</span>
+        <strong id="actionData">Checking</strong>
+      </div>
+      <div class="decision-metric">
+        <span>Entry distance</span>
+        <strong id="actionDistance">--</strong>
+      </div>
+      <div class="decision-metric">
+        <span>Planned risk</span>
+        <strong id="actionRisk">Not configured</strong>
+      </div>
+      <div class="horizon-control segmented-control" aria-label="Trading horizon">
+        <button id="dayTradeView" class="horizon-button active" type="button">Day trade</button>
+        <button id="swingTradeView" class="horizon-button" type="button">Swing</button>
+        <button id="contextView" class="horizon-button" type="button">Context</button>
+      </div>
+    </section>
+
+    <section id="systemBanner" class="system-banner" role="status" hidden>
+      <strong id="systemBannerTitle">System issue</strong>
+      <span id="systemBannerDetail"></span>
+      <a href="/grafana/" target="_blank" rel="noreferrer">Open monitoring</a>
+    </section>
+
     <section class="swing-summary" aria-labelledby="bestSwingTitle">
       <div class="swing-summary-heading">
         <div>
@@ -72,6 +103,17 @@
           </div>
         </dl>
       </div>
+    </section>
+
+    <section class="market-scanner" aria-labelledby="scannerTitle">
+      <div class="section-heading scanner-heading">
+        <div>
+          <p class="eyebrow">All configured markets</p>
+          <h2 id="scannerTitle">Opportunity Scanner</h2>
+        </div>
+        <span id="scannerBest" class="badge neutral">Scanning</span>
+      </div>
+      <div id="scannerMarkets" class="scanner-grid" aria-live="polite"></div>
     </section>
 
     <section id="optionsOpportunity" class="options-opportunity" aria-labelledby="optionsOpportunityTitle" hidden>
@@ -291,6 +333,20 @@
             <p id="marketConfirmationDetail" class="tile-footnote">Waiting for SPY confirmation.</p>
           </section>
 
+          <section id="broadMarketContextTile" class="insight-tile" hidden>
+            <div class="section-heading">
+              <h2>VIX &amp; Breadth</h2>
+              <span id="broadMarketContextBadge" class="badge neutral">Building</span>
+            </div>
+            <div class="diagnostic-list">
+              <div><span>VIX</span><strong id="contextVix">--</strong></div>
+              <div><span>Equal-weight breadth</span><strong id="contextBreadth">--</strong></div>
+              <div><span>Technology strength</span><strong id="contextTechnology">--</strong></div>
+              <div><span>Score effect</span><strong id="contextScoreEffect">0 pts</strong></div>
+            </div>
+            <p id="contextDetail" class="tile-footnote">Context is loading.</p>
+          </section>
+
           <section class="insight-tile">
             <div class="section-heading">
               <h2>Provider Health</h2>
@@ -300,6 +356,7 @@
               <div><span>Source</span><strong id="providerSource">--</strong></div>
               <div><span>Last Tick</span><strong id="providerLastTick">--</strong></div>
               <div><span>Errors</span><strong id="providerErrors">0</strong></div>
+              <div><span>Server alerts</span><strong id="providerTradeAlerts">--</strong></div>
               <div><span>Market</span><strong id="marketStatus">--</strong></div>
               <div><span>Signal Bar</span><strong id="signalBarState">--</strong></div>
               <div><span>Data Quality</span><strong id="dataQuality">--</strong></div>
@@ -337,7 +394,37 @@
               <div><span>Expected return</span><strong id="replayAvgStop">--</strong></div>
               <div><span>Resolved samples</span><strong id="replaySamples">--</strong></div>
               <div><span>MFE / MAE</span><strong id="replayExcursion">--</strong></div>
+              <div><span>Profit factor</span><strong id="replayProfitFactor">--</strong></div>
+              <div><span>Max drawdown</span><strong id="replayDrawdown">--</strong></div>
+              <div><span>Holdout status</span><strong id="replayValidation">--</strong></div>
             </div>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>Model Governance</h2>
+              <span id="modelGovernanceBadge" class="badge neutral">Building</span>
+            </div>
+            <div class="diagnostic-list">
+              <div><span>Champion</span><strong id="modelChampion">--</strong></div>
+              <div><span>Challenger</span><strong id="modelChallenger">--</strong></div>
+              <div><span>Forward samples</span><strong id="modelSamples">--</strong></div>
+              <div><span>Production changes</span><strong id="modelApplied">No</strong></div>
+            </div>
+            <p id="modelGovernanceDetail" class="tile-footnote">Adaptive changes remain in shadow mode.</p>
+          </section>
+
+          <section class="insight-tile">
+            <div class="section-heading">
+              <h2>Pattern Validation</h2>
+              <span id="patternValidationBadge" class="badge neutral">Building</span>
+            </div>
+            <div class="diagnostic-list">
+              <div><span>Detected</span><strong id="patternTracked">0</strong></div>
+              <div><span>Resolved</span><strong id="patternResolved">0</strong></div>
+              <div><span>Best measured</span><strong id="patternBest">Building sample</strong></div>
+            </div>
+            <p id="patternValidationDetail" class="tile-footnote">Patterns stay descriptive until outcomes resolve.</p>
           </section>
 
           <section class="insight-tile insight-full alert-log-block">
@@ -370,6 +457,8 @@
           <div id="activeAlert" class="active-alert" aria-live="polite">
             Waiting for enough candles.
           </div>
+          <div id="scoreDrivers" class="score-drivers"></div>
+          <p id="nextCondition" class="next-condition">Waiting for an activation condition.</p>
         </section>
 
         <section class="panel-block">
@@ -415,6 +504,14 @@
               <dd id="exitWarning">--</dd>
             </div>
           </dl>
+          <div class="risk-summary">
+            <label><span>Account size</span><input id="riskAccountSize" type="number" min="0" step="1000" inputmode="decimal" placeholder="Set amount" /></label>
+            <label><span>Risk / trade</span><input id="riskPerTradePct" type="number" min="0.05" max="5" step="0.05" inputmode="decimal" /></label>
+            <div><span>Quantity</span><strong id="riskQuantity">--</strong></div>
+            <div><span>Dollar risk</span><strong id="riskDollars">--</strong></div>
+            <div><span>Position value</span><strong id="riskPositionValue">--</strong></div>
+            <div><span>T1 reward</span><strong id="riskTargetReward">--</strong></div>
+          </div>
           <div class="feedback-actions" aria-label="Trade feedback">
             <button id="feedbackTook" class="text-button" type="button">Took</button>
             <button id="feedbackSkipped" class="text-button" type="button">Skipped</button>
@@ -455,6 +552,22 @@
           <option value="target">Targets</option>
         </select>
       </div>
+      <form id="tradeReviewForm" class="trade-review-form">
+        <div class="trade-review-heading">
+          <div>
+            <span class="eyebrow">Actual execution</span>
+            <strong id="reviewPlanLabel">Select a journal row</strong>
+          </div>
+          <span id="reviewStatus" class="badge neutral">Not selected</span>
+        </div>
+        <label>Actual fill<input id="reviewFill" type="number" min="0" step="0.01" inputmode="decimal" /></label>
+        <label>Quantity<input id="reviewQuantity" type="number" min="0" step="1" inputmode="numeric" /></label>
+        <label>Actual exit<input id="reviewExit" type="number" min="0" step="0.01" inputmode="decimal" /></label>
+        <label class="trade-review-notes">Notes<textarea id="reviewNotes" rows="2" maxlength="2000"></textarea></label>
+        <label class="snapshot-toggle"><input id="reviewSnapshot" type="checkbox" checked /> Capture current chart</label>
+        <button id="saveTradeReview" class="control-button" type="submit" disabled>Save review</button>
+        <a id="reviewSnapshotLink" class="text-button" href="#" target="_blank" rel="noreferrer" hidden>View snapshot</a>
+      </form>
       <div class="journal-table-wrap">
         <table class="journal-table">
           <thead>
@@ -468,6 +581,8 @@
               <th>Entry</th>
               <th>T1</th>
               <th>Stop</th>
+              <th>Actual R</th>
+              <th>Review</th>
             </tr>
           </thead>
           <tbody id="journalRows"></tbody>

@@ -102,6 +102,18 @@ class ServerTests(unittest.TestCase):
         )
       """, row)
 
+  def test_native_five_minute_storage_rejects_non_boundary_quote(self):
+    boundary = 1_780_000_100_000
+    boundary -= boundary % (5 * server.MINUTE_MS)
+    malformed = boundary + 4 * server.MINUTE_MS
+    saved = server.save_market_bars("QQQ", 5, "yahoo", [
+      candle(boundary, 100, 101, 99, 100.5, 1_000),
+      candle(malformed, 100.6, 100.6, 100.6, 100.6, 0),
+    ])
+    self.assertEqual(saved, 1)
+    rows = server.load_market_bars("QQQ", 5)
+    self.assertEqual([row["time"] for row in rows], [boundary])
+
   def fetch_plan(self, plan_id):
     with server.db() as connection:
       return dict(connection.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone())
@@ -128,6 +140,45 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(len(candles), 1)
     self.assertEqual(candles[0]["time"], minute)
     self.assertEqual(candles[0]["close"], 100.5)
+
+  def test_pattern_observation_tracks_breakout_then_target(self):
+    detected = int(datetime(2026, 7, 31, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    pattern = server.validate_pattern_payload({
+      "symbol": "QQQ",
+      "timeframe": 1,
+      "name": "Bull Flag",
+      "direction": "up",
+      "detectedAt": detected,
+      "breakout": 100,
+      "target": 102,
+      "invalidation": 99,
+      "measuredMove": 2,
+    })
+    with server.db() as connection:
+      self.assertTrue(server.save_pattern_observation(connection, pattern))
+      server.evaluate_pattern_observations(connection, "QQQ", [
+        candle(detected + 60_000, 99.8, 100.2, 99.7, 100.1),
+        candle(detected + 120_000, 100.2, 102.1, 100.1, 102.0),
+      ])
+      row = connection.execute("SELECT * FROM pattern_observations WHERE id = ?", (pattern["id"],)).fetchone()
+      stats = server.pattern_validation_stats(connection, "QQQ")
+    self.assertEqual(row["status"], "target")
+    self.assertEqual(row["eligible_for_learning"], 1)
+    self.assertEqual(stats[0]["targets"], 1)
+    self.assertFalse(stats[0]["validated"])
+
+  def test_database_backup_is_integrity_checked(self):
+    old_backup_dir = server.BACKUP_DIR
+    old_persistent_dir = server.PERSISTENT_DATA_DIR
+    try:
+      server.PERSISTENT_DATA_DIR = self.tmp.name
+      server.BACKUP_DIR = os.path.join(self.tmp.name, "backups")
+      path = server.backup_database(1_800_000_000_000)
+      self.assertTrue(os.path.isfile(path))
+      self.assertEqual(server.BACKUP_STATE["integrity"], "ok")
+    finally:
+      server.BACKUP_DIR = old_backup_dir
+      server.PERSISTENT_DATA_DIR = old_persistent_dir
 
   def test_ta125_uses_yahoo_tel_aviv_index_symbol(self):
     payload = {

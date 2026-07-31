@@ -3,6 +3,7 @@ import base64
 import binascii
 from contextlib import contextmanager
 import hmac
+import hashlib
 import json
 import math
 import mimetypes
@@ -24,6 +25,8 @@ import strategy_engine
 import backtest_engine
 import ibkr_provider
 import options_engine
+import notification_engine
+import risk_engine
 
 
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -52,11 +55,15 @@ IBKR_HISTORY_DURATION = os.environ.get("IBKR_HISTORY_DURATION", "2 D")
 SYMBOL = "QQQ"
 SUPPORTED_SYMBOLS = ("QQQ", "SPY", "BTC-USD", "TA125")
 YAHOO_SYMBOLS = {"TA125": "^TA125.TA"}
-STRATEGY_VERSION = "5.2.0"
+STRATEGY_VERSION = "6.0.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 LEGACY_DB_PATH = os.path.join(APP_DIR, "trader_journal.sqlite3")
 DB_PATH = os.environ.get("JOURNAL_DB_PATH", os.path.join(DATA_DIR, "trader_journal.sqlite3"))
+PERSISTENT_DATA_DIR = os.path.dirname(DB_PATH)
+BACKUP_DIR = os.path.join(PERSISTENT_DATA_DIR, "backups")
+BACKUP_INTERVAL_SECONDS = max(3600, int(os.environ.get("BACKUP_INTERVAL_SECONDS", str(24 * 60 * 60))))
+BACKUP_RETENTION = max(3, int(os.environ.get("BACKUP_RETENTION", "14")))
 STATIC_FILES = {
   "/": "index.html",
   "/index.html": "index.html",
@@ -69,10 +76,12 @@ STATIC_FILES = {
 MINUTE_MS = 60_000
 DAILY_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 SENTIMENT_CACHE_TTL_SECONDS = 5 * 60
+MARKET_CONTEXT_TTL_SECONDS = 5 * 60
 OPTIONS_CACHE_TTL_SECONDS = 30 * 60
 OPTIONS_PROVIDER_DAILY_LIMIT = 80
 OPTIONS_PROVIDER_REQUEST_CREDITS = 4
 BACKTEST_MIN_REPLAY_INTERVAL_MS = 60 * 60 * 1000
+BACKTEST_MAX_CONCURRENCY = max(1, int(os.environ.get("BACKTEST_MAX_CONCURRENCY", "1")))
 LEARNING_SNAPSHOT_VERSION = 2
 ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
 MONITOR_INTERVAL_SECONDS = max(30, int(os.environ.get("MONITOR_INTERVAL_SECONDS", "60")))
@@ -81,6 +90,9 @@ SSE_MAX_CONNECTION_SECONDS = 75
 MAX_REQUEST_THREADS = 32
 FETCH_CACHE = {}
 FETCH_CACHE_LOCK = threading.Lock()
+MARKET_CONTEXT_LOCK = threading.Lock()
+MARKET_CONTEXT_STATE = {"value": None, "updated_at": None, "fetching": False, "error": None}
+PROCESS_STARTED_AT_MS = int(time.time() * 1000)
 MARKET_TIME_ZONE = ZoneInfo("America/New_York")
 MARKET_RUNTIME_LOCK = threading.Lock()
 def new_market_runtime():
@@ -103,6 +115,7 @@ def new_market_runtime():
     "backtest_status": "not_started",
     "backtest_error": None,
     "backtest_last_started_at": None,
+    "source_metadata": {},
   }
 
 
@@ -111,6 +124,9 @@ MARKET_STOP_EVENT = threading.Event()
 MONITOR_FAILURE_COUNTS = {}
 BACKTEST_JOB_LOCK = threading.Lock()
 BACKTEST_JOBS_ACTIVE = set()
+BACKTEST_JOB_SLOTS = threading.BoundedSemaphore(BACKTEST_MAX_CONCURRENCY)
+BACKUP_LOCK = threading.Lock()
+BACKUP_STATE = {"last_success_at": None, "last_path": None, "last_error": None, "integrity": "not_checked"}
 IBKR_CLIENT = None
 IBKR_CLIENT_LOCK = threading.Lock()
 
@@ -229,6 +245,13 @@ def init_db():
       "last_observed_at": "INTEGER",
       "calibration_json": "TEXT",
       "feature_snapshot_json": "TEXT",
+      "actual_fill": "REAL",
+      "actual_exit": "REAL",
+      "actual_quantity": "REAL",
+      "actual_realized_r": "REAL",
+      "trader_notes": "TEXT",
+      "review_updated_at": "INTEGER",
+      "screenshot_path": "TEXT",
     }.items():
       add_column(connection, existing, column, definition)
 
@@ -277,7 +300,45 @@ def init_db():
     connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_learning ON plans(eligible_for_learning, strategy_version)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_time ON candles(symbol, time)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_candles_symbol_time ON daily_candles(symbol, time)")
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS market_bars (
+        symbol TEXT NOT NULL,
+        timeframe INTEGER NOT NULL,
+        time INTEGER NOT NULL,
+        open REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        close REAL NOT NULL,
+        volume INTEGER NOT NULL DEFAULT 0,
+        provider TEXT NOT NULL,
+        fetched_at INTEGER NOT NULL,
+        PRIMARY KEY (symbol, timeframe, time)
+      )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_market_bars_symbol_timeframe_time ON market_bars(symbol, timeframe, time)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_events_plan ON plan_events(plan_id, event_at)")
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS pattern_observations (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        timeframe INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        detected_at INTEGER NOT NULL,
+        breakout REAL NOT NULL,
+        target REAL NOT NULL,
+        invalidation REAL NOT NULL,
+        measured_move REAL,
+        status TEXT NOT NULL DEFAULT 'armed',
+        triggered_at INTEGER,
+        target_hit_at INTEGER,
+        invalidated_at INTEGER,
+        expired_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        eligible_for_learning INTEGER NOT NULL DEFAULT 0
+      )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_pattern_symbol_status ON pattern_observations(symbol, status, detected_at)")
     connection.execute("""
       CREATE TABLE IF NOT EXISTS backtest_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -390,6 +451,56 @@ def init_db():
     """, (STRATEGY_VERSION,))
 
 
+def backup_database(timestamp=None):
+  timestamp = int(timestamp or time.time() * 1000)
+  with BACKUP_LOCK:
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.fromtimestamp(timestamp / 1000).strftime("%Y%m%d-%H%M%S")
+    final_path = os.path.join(BACKUP_DIR, f"trader-journal-{stamp}.sqlite3")
+    temporary_path = final_path + ".tmp"
+    try:
+      source = sqlite3.connect(DB_PATH, timeout=10)
+      destination = sqlite3.connect(temporary_path)
+      try:
+        source.backup(destination)
+        integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+          raise RuntimeError(f"backup integrity check failed: {integrity}")
+      finally:
+        destination.close()
+        source.close()
+      os.replace(temporary_path, final_path)
+      backups = sorted(
+        [os.path.join(BACKUP_DIR, name) for name in os.listdir(BACKUP_DIR) if name.endswith(".sqlite3")],
+        key=os.path.getmtime,
+        reverse=True,
+      )
+      for path in backups[BACKUP_RETENTION:]:
+        os.remove(path)
+      BACKUP_STATE.update({"last_success_at": timestamp, "last_path": final_path, "last_error": None, "integrity": "ok"})
+      return final_path
+    except Exception as error:
+      if os.path.exists(temporary_path):
+        os.remove(temporary_path)
+      BACKUP_STATE.update({"last_error": str(error)[:240], "integrity": "failed"})
+      raise
+
+
+def backup_loop():
+  while not MARKET_STOP_EVENT.is_set():
+    try:
+      backup_database()
+    except Exception as error:
+      print(f"backup error: {error}", flush=True)
+    MARKET_STOP_EVENT.wait(BACKUP_INTERVAL_SECONDS)
+
+
+def start_backup_worker():
+  worker = threading.Thread(target=backup_loop, name="database-backup", daemon=True)
+  worker.start()
+  return worker
+
+
 def now_ms():
   return int(time.time() * 1000)
 
@@ -466,24 +577,68 @@ def merge_candle_series(raw_candles):
   return output
 
 
-def active_provider(symbol=SYMBOL):
-  if str(symbol).upper() in {"SPY", "BTC-USD", "TA125"}:
-    return "yahoo"
+def provider_candidates(symbol=SYMBOL):
+  symbol = validate_symbol(symbol)
+  if symbol in {"BTC-USD", "TA125"}:
+    return ["yahoo"]
   if DATA_PROVIDER == "demo":
-    return ""
+    return []
   if DATA_PROVIDER == "yahoo":
-    return "yahoo"
-  if DATA_PROVIDER == "ibkr":
-    return "ibkr" if ibkr_provider.available() else ""
+    return ["yahoo"]
+  if DATA_PROVIDER == "ibkr" and symbol == "QQQ":
+    return ["ibkr"] if ibkr_provider.available() else []
   if DATA_PROVIDER == "alpaca":
-    return "alpaca" if ALPACA_API_KEY and ALPACA_API_SECRET else ""
+    return ["alpaca"] if ALPACA_API_KEY and ALPACA_API_SECRET else []
   if DATA_PROVIDER == "polygon":
-    return "polygon" if POLYGON_API_KEY else ""
+    return ["polygon"] if POLYGON_API_KEY else []
+  candidates = []
   if ALPACA_API_KEY and ALPACA_API_SECRET:
-    return "alpaca"
+    candidates.append("alpaca")
   if POLYGON_API_KEY:
-    return "polygon"
-  return "yahoo"
+    candidates.append("polygon")
+  candidates.append("yahoo")
+  return candidates
+
+
+def active_provider(symbol=SYMBOL):
+  candidates = provider_candidates(symbol)
+  return candidates[0] if candidates else ""
+
+
+def provider_metadata(provider, symbol=SYMBOL):
+  symbol = validate_symbol(symbol)
+  profiles = {
+    "yahoo": {
+      "name": "Yahoo Finance chart",
+      "tier": "best_effort",
+      "realtimeClaimed": False,
+      "detail": "Free best-effort chart data; exchange delay and missing bars are possible",
+    },
+    "polygon": {
+      "name": "Massive market data",
+      "tier": "licensed",
+      "realtimeClaimed": True,
+      "detail": "Real-time status depends on the configured subscription",
+    },
+    "alpaca": {
+      "name": "Alpaca market data",
+      "tier": "licensed",
+      "realtimeClaimed": ALPACA_FEED != "iex",
+      "detail": f"Using the {ALPACA_FEED.upper()} feed",
+    },
+    "ibkr": {
+      "name": "IBKR TWS",
+      "tier": "broker",
+      "realtimeClaimed": IBKR_REQUIRE_LIVE,
+      "detail": "Requires a running TWS session and applicable market-data subscription",
+    },
+  }
+  return {
+    **profiles.get(provider, {"name": provider or "Unavailable", "tier": "unavailable", "realtimeClaimed": False, "detail": "No provider configured"}),
+    "provider": provider or "unavailable",
+    "symbol": symbol,
+    "fallbacks": provider_candidates(symbol)[1:],
+  }
 
 
 def ibkr_client():
@@ -651,6 +806,95 @@ def cnn_fear_greed():
   with FETCH_CACHE_LOCK:
     FETCH_CACHE[key] = {"time": current, "value": value}
   return {**value, "cached": False, "stale": False}
+
+
+def fetch_yahoo_context_series(symbol):
+  data = yahoo_get(f"/v8/finance/chart/{symbol}", {
+    "range": "5d",
+    "interval": "5m",
+    "includePrePost": "false",
+  })
+  return normalize_yahoo_chart(data)
+
+
+def context_series_return(candles, bars=6):
+  values = merge_candle_series(candles)
+  if len(values) <= bars or float(values[-1]["close"]) <= 0 or float(values[-1 - bars]["close"]) <= 0:
+    return None
+  return float(values[-1]["close"]) / float(values[-1 - bars]["close"]) - 1
+
+
+def fetch_broad_market_context():
+  vix = fetch_yahoo_context_series("%5EVIX")
+  spy = fetch_yahoo_context_series("SPY")
+  rsp = fetch_yahoo_context_series("RSP")
+  xlk = fetch_yahoo_context_series("XLK")
+  if not vix or not spy:
+    raise ValueError("Broad-market context history is incomplete")
+  vix_level = float(vix[-1]["close"])
+  vix_return = context_series_return(vix)
+  spy_return = context_series_return(spy)
+  rsp_return = context_series_return(rsp)
+  xlk_return = context_series_return(xlk)
+  breadth = (rsp_return - spy_return) * 100 if rsp_return is not None and spy_return is not None else None
+  technology = (xlk_return - spy_return) * 100 if xlk_return is not None and spy_return is not None else None
+  if vix_level >= 30 or (vix_return is not None and vix_return >= 0.08):
+    label, tone = "Risk-off", "negative"
+  elif vix_level <= 17 and breadth is not None and breadth > -0.08:
+    label, tone = "Risk-on", "positive"
+  else:
+    label, tone = "Mixed", "neutral"
+  return {
+    "status": "observational",
+    "label": label,
+    "tone": tone,
+    "generatedAt": now_ms(),
+    "vix": {
+      "level": round(vix_level, 2),
+      "returnPct": round(vix_return * 100, 2) if vix_return is not None else None,
+    },
+    "breadth": {
+      "label": "Broadening" if breadth is not None and breadth >= 0.08 else "Narrowing" if breadth is not None and breadth <= -0.08 else "Neutral",
+      "rspVsSpyPct": round(breadth, 3) if breadth is not None else None,
+    },
+    "technology": {
+      "label": "Leading" if technology is not None and technology >= 0.08 else "Lagging" if technology is not None and technology <= -0.08 else "Neutral",
+      "xlkVsSpyPct": round(technology, 3) if technology is not None else None,
+    },
+    "scoreEffect": 0,
+    "detail": "VIX, equal-weight breadth, and technology relative strength are observational until enough aligned outcomes validate a score effect.",
+  }
+
+
+def broad_market_context():
+  current = now_ms()
+  with MARKET_CONTEXT_LOCK:
+    value = MARKET_CONTEXT_STATE["value"]
+    updated_at = MARKET_CONTEXT_STATE["updated_at"]
+    stale = not updated_at or current - int(updated_at) > MARKET_CONTEXT_TTL_SECONDS * 1000
+    if stale and not MARKET_CONTEXT_STATE["fetching"]:
+      MARKET_CONTEXT_STATE["fetching"] = True
+
+      def refresh_context():
+        try:
+          result = fetch_broad_market_context()
+          with MARKET_CONTEXT_LOCK:
+            MARKET_CONTEXT_STATE.update({"value": result, "updated_at": now_ms(), "error": None, "fetching": False})
+        except Exception as error:
+          with MARKET_CONTEXT_LOCK:
+            MARKET_CONTEXT_STATE.update({"error": str(error)[:200], "fetching": False})
+
+      threading.Thread(target=refresh_context, name="broad-market-context", daemon=True).start()
+    if value:
+      return {**value, "stale": stale}
+    return {
+      "status": "building",
+      "label": "Building",
+      "tone": "neutral",
+      "generatedAt": None,
+      "scoreEffect": 0,
+      "detail": MARKET_CONTEXT_STATE["error"] or "Loading VIX, breadth, and technology context",
+    }
 
 
 def parse_rfc3339_millis(value):
@@ -832,14 +1076,17 @@ def fetch_five_minute_candles(provider, symbol):
       "interval": "5m",
       "includePrePost": "true",
     })
-    return merge_candle_series(normalize_yahoo_chart(data))
+    return [
+      candle for candle in merge_candle_series(normalize_yahoo_chart(data))
+      if candle["time"] % (5 * MINUTE_MS) == 0
+    ]
   history = market_runtime_snapshot(symbol)["history"] or fetch_history_candles(provider, symbol)
   return strategy_engine.resample(history, 5)
 
 
 def fetch_daily_candles(symbol):
   data = yahoo_get(f"/v8/finance/chart/{yahoo_symbol(symbol)}", {
-    "range": "2y",
+    "range": "10y",
     "interval": "1d",
     "includePrePost": "false",
   })
@@ -860,6 +1107,7 @@ def record_market_candles(symbol, provider, candles):
     if closed:
       save_candles(connection, symbol, provider, closed, is_closed=1)
       evaluate_plans(connection, symbol, closed)
+      evaluate_pattern_observations(connection, symbol, closed)
       resolve_option_ideas(connection)
     if forming:
       save_candles(connection, symbol, provider, forming, is_closed=0)
@@ -876,6 +1124,53 @@ def load_cached_candles(symbol, limit=2500):
       LIMIT ?
     """, (symbol, int(limit))).fetchall()
   return merge_candle_series(dict(row) for row in reversed(rows))
+
+
+def save_market_bars(symbol, timeframe, provider, candles, fetched_at=None):
+  normalized = merge_candle_series(candles)
+  if int(timeframe) < strategy_engine.DAILY_TIMEFRAME:
+    duration_ms = int(timeframe) * MINUTE_MS
+    normalized = [candle for candle in normalized if candle["time"] % duration_ms == 0]
+  if not normalized:
+    return 0
+  timestamp = int(fetched_at or now_ms())
+  with db() as connection:
+    connection.executemany("""
+      INSERT INTO market_bars (
+        symbol, timeframe, time, open, high, low, close, volume, provider, fetched_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(symbol, timeframe, time) DO UPDATE SET
+        open = excluded.open,
+        high = excluded.high,
+        low = excluded.low,
+        close = excluded.close,
+        volume = MAX(market_bars.volume, excluded.volume),
+        provider = excluded.provider,
+        fetched_at = excluded.fetched_at
+    """, [
+      (
+        symbol, int(timeframe), candle["time"], candle["open"], candle["high"], candle["low"],
+        candle["close"], candle["volume"], provider, timestamp,
+      )
+      for candle in normalized
+    ])
+  return len(normalized)
+
+
+def load_market_bars(symbol, timeframe, limit=100_000):
+  with db() as connection:
+    rows = connection.execute("""
+      SELECT time, open, high, low, close, volume
+      FROM market_bars
+      WHERE symbol = ? AND timeframe = ?
+      ORDER BY time DESC
+      LIMIT ?
+    """, (symbol, int(timeframe), int(limit))).fetchall()
+  candles = merge_candle_series(dict(row) for row in reversed(rows))
+  if int(timeframe) < strategy_engine.DAILY_TIMEFRAME:
+    duration_ms = int(timeframe) * MINUTE_MS
+    candles = [candle for candle in candles if candle["time"] % duration_ms == 0]
+  return candles
 
 
 def history_candles_with_fallback(provider, symbol, runtime=None):
@@ -897,8 +1192,7 @@ def save_daily_candles(symbol, provider, candles, fetched_at=None):
     return 0
   timestamp = int(fetched_at or now_ms())
   with db() as connection:
-    for candle in normalized:
-      connection.execute("""
+    connection.executemany("""
         INSERT INTO daily_candles (
           symbol, time, open, high, low, close, volume, provider, fetched_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -910,10 +1204,14 @@ def save_daily_candles(symbol, provider, candles, fetched_at=None):
           volume = excluded.volume,
           provider = excluded.provider,
           fetched_at = excluded.fetched_at
-      """, (
-        symbol, candle["time"], candle["open"], candle["high"], candle["low"],
-        candle["close"], candle["volume"], provider, timestamp,
-      ))
+      """, [
+        (
+          symbol, candle["time"], candle["open"], candle["high"], candle["low"],
+          candle["close"], candle["volume"], provider, timestamp,
+        )
+        for candle in normalized
+      ])
+  save_market_bars(symbol, strategy_engine.DAILY_TIMEFRAME, provider, normalized, timestamp)
   return len(normalized)
 
 
@@ -1104,7 +1402,11 @@ def backtest_source_signature(runtime, settings, symbol=SYMBOL):
     "version": STRATEGY_VERSION,
     "symbol": symbol,
     "series": [
-      [(values[-1]["time"] // replay_intervals[index]) * replay_intervals[index] if values else None]
+      [
+        values[0]["time"] if values else None,
+        (values[-1]["time"] // replay_intervals[index]) * replay_intervals[index] if values else None,
+        len(values),
+      ]
       for index, values in enumerate(series)
     ],
     "settings": {
@@ -1121,12 +1423,29 @@ def backtest_source_signature(runtime, settings, symbol=SYMBOL):
 def attach_signal_calibration(signal, trades):
   if not isinstance(signal, dict):
     return signal
+  ordered = sorted(
+    [row for row in (trades or []) if row.get("signalTime") is not None],
+    key=lambda row: int(row["signalTime"]),
+  )
+  split = round(len(ordered) * 0.6)
+  validation_trades = ordered[split:] if len(ordered) >= 10 else []
+
+  def calibration(candidate):
+    result = backtest_engine.calibration_for_signal(validation_trades, candidate)
+    if result.get("sampleSize"):
+      result["sampleType"] = "chronological holdout"
+      return result
+    result = backtest_engine.calibration_for_signal(ordered, candidate)
+    result["sampleType"] = "full replay provisional"
+    result["calibrated"] = False
+    return result
+
   for key in ("bestLong", "bestShort"):
     candidate = signal.get(key)
     if isinstance(candidate, dict):
       candidate["timeframe"] = signal.get("timeframe")
-      candidate["calibration"] = backtest_engine.calibration_for_signal(trades, candidate)
-  signal["calibration"] = backtest_engine.calibration_for_signal(trades, signal)
+      candidate["calibration"] = calibration(candidate)
+  signal["calibration"] = calibration(signal)
   return signal
 
 
@@ -1213,11 +1532,17 @@ def attach_signal_learning_confidence(signal, snapshot):
 
 def schedule_historical_replay(symbol=SYMBOL):
   runtime = market_runtime_snapshot(symbol)
-  if len(runtime["five_minute_history"]) < 160 and len(runtime["daily_history"]) < 180:
-    return False
   current_time = now_ms()
   last_started_at = int(runtime.get("backtest_last_started_at") or 0)
   if last_started_at and current_time - last_started_at < BACKTEST_MIN_REPLAY_INTERVAL_MS:
+    return False
+  persisted_one = load_cached_candles(symbol, limit=100_000)
+  persisted_five = load_market_bars(symbol, 5, limit=50_000)
+  persisted_daily = load_market_bars(symbol, strategy_engine.DAILY_TIMEFRAME, limit=3_000)
+  runtime["history"] = merge_candle_series([*persisted_one, *runtime["history"]])
+  runtime["five_minute_history"] = merge_candle_series([*persisted_five, *runtime["five_minute_history"]])
+  runtime["daily_history"] = merge_candle_series([*persisted_daily, *runtime["daily_history"]])
+  if len(runtime["five_minute_history"]) < 160 and len(runtime["daily_history"]) < 180:
     return False
   settings = load_strategy_settings()
   signature = backtest_source_signature(runtime, settings, symbol)
@@ -1226,6 +1551,8 @@ def schedule_historical_replay(symbol=SYMBOL):
     return False
   with BACKTEST_JOB_LOCK:
     if symbol in BACKTEST_JOBS_ACTIVE:
+      return False
+    if not BACKTEST_JOB_SLOTS.acquire(blocking=False):
       return False
     BACKTEST_JOBS_ACTIVE.add(symbol)
   with MARKET_RUNTIME_LOCK:
@@ -1258,6 +1585,7 @@ def schedule_historical_replay(symbol=SYMBOL):
     finally:
       with BACKTEST_JOB_LOCK:
         BACKTEST_JOBS_ACTIVE.discard(symbol)
+      BACKTEST_JOB_SLOTS.release()
 
   threading.Thread(target=run, name=f"historical-replay-{symbol}", daemon=True).start()
   return True
@@ -1347,6 +1675,7 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
       "trend15": signal.get("trend15"),
       "marketConfirmation": signal.get("marketConfirmation"),
       "dataQuality": signal.get("dataQuality"),
+      "riskPlan": signal.get("riskPlan"),
     }),
   }
   cursor = connection.execute("""
@@ -1366,6 +1695,7 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
   """, row)
   if cursor.rowcount:
     insert_event(connection, plan_id, "created", actionable_at, latest["close"], {"score": row["score"], "source": "server"})
+    notification_engine.send_async("armed", row)
   return plan_id
 
 
@@ -1745,7 +2075,7 @@ def signal_for_timeframe(recommendations, timeframe):
   return (recommendations or {}).get(timeframe) or (recommendations or {}).get(str(timeframe)) or {}
 
 
-def qqq_spy_confirmation(timeframe, direction, qqq_runtime, spy_runtime, spy_recommendations):
+def qqq_spy_confirmation(timeframe, direction, qqq_runtime, spy_runtime, spy_recommendations, subject_symbol="QQQ", reference_symbol="SPY"):
   reference_timeframes = (5, 15, strategy_engine.DAILY_TIMEFRAME)
   reference_signals = {
     value: signal_for_timeframe(spy_recommendations, value)
@@ -1771,25 +2101,25 @@ def qqq_spy_confirmation(timeframe, direction, qqq_runtime, spy_runtime, spy_rec
     selected_tone = reference_tones.get(timeframe, "neutral")
     if selected_tone == expected_tone:
       adjustment += 4
-      reasons.append(f"SPY {timeframe if timeframe != strategy_engine.DAILY_TIMEFRAME else '1D'} trend confirms the trade direction")
+      reasons.append(f"{reference_symbol} {timeframe if timeframe != strategy_engine.DAILY_TIMEFRAME else '1D'} trend confirms the trade direction")
     elif selected_tone in {"positive", "negative"}:
       adjustment -= 7
-      reasons.append(f"SPY {timeframe if timeframe != strategy_engine.DAILY_TIMEFRAME else '1D'} trend conflicts with the trade direction")
+      reasons.append(f"{reference_symbol} {timeframe if timeframe != strategy_engine.DAILY_TIMEFRAME else '1D'} trend conflicts with the trade direction")
     if aligned >= 2:
       adjustment += 3
-      reasons.append("SPY is aligned across multiple timeframes")
+      reasons.append(f"{reference_symbol} is aligned across multiple timeframes")
     elif opposed >= 2:
       adjustment -= 5
-      reasons.append("SPY has broad multi-timeframe opposition")
+      reasons.append(f"{reference_symbol} has broad multi-timeframe opposition")
     if relative_pct is not None:
       leading = relative_pct >= threshold
       lagging = relative_pct <= -threshold
       if (direction == "long" and leading) or (direction == "short" and lagging):
         adjustment += 3
-        reasons.append(f"QQQ relative strength supports the {direction} thesis")
+        reasons.append(f"{subject_symbol} relative strength supports the {direction} thesis")
       elif (direction == "long" and lagging) or (direction == "short" and leading):
         adjustment -= 3
-        reasons.append(f"QQQ relative strength weakens the {direction} thesis")
+        reasons.append(f"{subject_symbol} relative strength weakens the {direction} thesis")
   adjustment = max(-12, min(10, adjustment))
 
   if relative_pct is None:
@@ -1814,11 +2144,12 @@ def qqq_spy_confirmation(timeframe, direction, qqq_runtime, spy_runtime, spy_rec
   if aligned == 0 or opposed:
     scope = "Technology-led / divergent"
   return {
-    "referenceSymbol": "SPY",
+    "referenceSymbol": reference_symbol,
+    "subjectSymbol": subject_symbol,
     "label": label,
     "tone": tone,
     "scoreAdjustment": adjustment,
-    "detail": "; ".join(reasons) if reasons else "Waiting for enough SPY context to confirm QQQ.",
+    "detail": "; ".join(reasons) if reasons else f"Waiting for enough {reference_symbol} context to confirm {subject_symbol}.",
     "scope": scope,
     "relativeStrength": {
       "label": relative_label,
@@ -1826,7 +2157,7 @@ def qqq_spy_confirmation(timeframe, direction, qqq_runtime, spy_runtime, spy_rec
       "pct": round(relative_pct, 3) if relative_pct is not None else None,
       "lookbackBars": lookback,
     },
-    "spyTrends": {
+    "referenceTrends": {
       str(value if value != strategy_engine.DAILY_TIMEFRAME else "1D"): {
         "label": (reference_signals[value].get("selectedTrend") or {}).get("label", "Building"),
         "tone": reference_tones[value],
@@ -1836,7 +2167,12 @@ def qqq_spy_confirmation(timeframe, direction, qqq_runtime, spy_runtime, spy_rec
   }
 
 
-def apply_qqq_spy_confirmation(recommendations, qqq_runtime, spy_runtime, spy_recommendations, settings):
+def add_legacy_confirmation_keys(context):
+  context["spyTrends"] = context.get("referenceTrends") or {}
+  return context
+
+
+def apply_qqq_spy_confirmation(recommendations, qqq_runtime, spy_runtime, spy_recommendations, settings, subject_symbol="QQQ", reference_symbol="SPY"):
   threshold = int(settings.get("activeTradeThreshold", 62)) + {
     "scalp": -6, "normal": 0, "strict": 8,
   }.get(settings.get("mode", "normal"), 0)
@@ -1848,13 +2184,15 @@ def apply_qqq_spy_confirmation(recommendations, qqq_runtime, spy_runtime, spy_re
       if not isinstance(candidate, dict) or id(candidate) in seen:
         continue
       seen.add(id(candidate))
-      context = qqq_spy_confirmation(
+      context = add_legacy_confirmation_keys(qqq_spy_confirmation(
         timeframe,
         str(candidate.get("direction") or "neutral"),
         qqq_runtime,
         spy_runtime,
         spy_recommendations,
-      )
+        subject_symbol,
+        reference_symbol,
+      ))
       candidate["marketConfirmation"] = context
       if candidate.get("direction") not in {"long", "short"}:
         continue
@@ -1866,7 +2204,7 @@ def apply_qqq_spy_confirmation(recommendations, qqq_runtime, spy_runtime, spy_re
         candidate.setdefault("reasons", []).extend(context["detail"].split("; "))
       if candidate is signal and candidate["score"] < threshold:
         candidate["watchOnly"] = True
-        candidate.setdefault("reasons", []).append("QQQ/SPY confirmation reduced the setup below the active threshold")
+        candidate.setdefault("reasons", []).append(f"{subject_symbol}/{reference_symbol} confirmation reduced the setup below the active threshold")
     best_long = signal.get("bestLong")
     best_short = signal.get("bestShort")
     signal["biasScore"] = (
@@ -1920,6 +2258,9 @@ def evaluate_data_health(symbol, runtime, timestamp=None):
   provider_limit = 90_000 if continuous else 180_000
   blockers = []
   warnings = []
+  source = runtime.get("source_metadata") or provider_metadata(active_provider(symbol), symbol)
+  if source.get("tier") == "best_effort":
+    warnings.append("best-effort source is not exchange-certified real-time data")
   if int(runtime.get("error_count") or 0) > 0:
     blockers.append("market-data provider has recent errors")
   if active_session and (provider_age is None or provider_age > provider_limit):
@@ -1981,6 +2322,25 @@ def evaluate_data_health(symbol, runtime, timestamp=None):
   if daily_issues:
     warnings.extend(f"1D {issue}" for issue in daily_issues)
 
+  reconciliation = {"status": "building", "driftPct": None, "time": None}
+  one_as_five = {item["time"]: item for item in strategy_engine.resample(runtime.get("history") or [], 5)}
+  native_five = {item["time"]: item for item in merge_candle_series(runtime.get("five_minute_history") or [])}
+  common_times = [value for value in set(one_as_five).intersection(native_five) if value + 5 * MINUTE_MS <= timestamp]
+  if common_times:
+    common_time = max(common_times)
+    one_close = float(one_as_five[common_time]["close"])
+    native_close = float(native_five[common_time]["close"])
+    drift = abs(one_close - native_close) / max(one_close, native_close) * 100
+    tolerance = 0.5 if continuous else 0.25 if strategy_engine.is_tel_aviv_market(symbol) else 0.15
+    reconciliation = {
+      "status": "clean" if drift <= tolerance else "mismatch",
+      "driftPct": round(drift, 4),
+      "tolerancePct": tolerance,
+      "time": common_time,
+    }
+    if drift > tolerance:
+      blockers.append(f"1m/5m close mismatch is {drift:.2f}%")
+
   trade_allowed = not blockers
   if not active_session and not continuous:
     status, tone = "Closed", "neutral"
@@ -1997,6 +2357,9 @@ def evaluate_data_health(symbol, runtime, timestamp=None):
     "session": market.get("phase"),
     "providerAgeMs": max(0, provider_age) if provider_age is not None else None,
     "providerFresh": provider_age is not None and provider_age <= provider_limit,
+    "source": source,
+    "dataConfidence": "low" if blockers else "medium" if warnings else "high",
+    "reconciliation": reconciliation,
     "blockers": list(dict.fromkeys(blockers)),
     "warnings": list(dict.fromkeys(warnings)),
     "timeframes": timeframes,
@@ -2029,6 +2392,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
   plan_ids = {}
   generated_at = now_ms()
   data_health = evaluate_data_health(symbol, runtime, generated_at)
+  broad_context = broad_market_context() if symbol in {"QQQ", "SPY"} else None
   with db() as connection:
     learning_snapshot = load_learning_snapshot(connection, symbol)
     performance = learning_snapshot.get("performance") or {}
@@ -2050,21 +2414,29 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
         intraday_context=recommendations.get(5),
         symbol=symbol,
       )
-    if symbol == "QQQ":
-      spy_runtime = market_runtime_snapshot("SPY")
+    if symbol in {"QQQ", "SPY"}:
+      reference_symbol = "SPY" if symbol == "QQQ" else "QQQ"
+      spy_runtime = market_runtime_snapshot(reference_symbol)
       apply_qqq_spy_confirmation(
         recommendations,
         runtime,
         spy_runtime,
         spy_runtime.get("recommendations") or {},
         settings,
+        subject_symbol=symbol,
+        reference_symbol=reference_symbol,
       )
     apply_data_health(recommendations, data_health)
     replay = runtime.get("backtest") or {}
     replay_trades = replay.get("trades") or []
     for timeframe, signal in recommendations.items():
+      if broad_context:
+        for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
+          if isinstance(candidate, dict):
+            candidate["broadMarketContext"] = broad_context
       attach_signal_calibration(signal, replay_trades)
       attach_signal_learning_confidence(signal, learning_snapshot)
+      risk_engine.attach_position_plan(signal, settings, symbol)
       plan_ids[int(timeframe)] = persist_generated_signal(
         connection, provider, int(timeframe), signal, settings, symbol
       )
@@ -2096,6 +2468,106 @@ def market_runtime_snapshot(symbol=SYMBOL):
     }
 
 
+def scanner_candidate(recommendations, include_daily=False):
+  rows = []
+  for timeframe, signal in (recommendations or {}).items():
+    timeframe = int(timeframe)
+    if (timeframe == strategy_engine.DAILY_TIMEFRAME) != bool(include_daily):
+      continue
+    if not isinstance(signal, dict):
+      continue
+    subject = signal if signal.get("direction") in {"long", "short"} else max(
+      [item for item in (signal.get("bestLong"), signal.get("bestShort")) if isinstance(item, dict)],
+      key=lambda item: (int(item.get("score") or 0), float(item.get("riskReward") or 0)),
+      default=None,
+    )
+    if subject:
+      rows.append((timeframe, subject, signal.get("direction") in {"long", "short"} and not subject.get("watchOnly")))
+  if not rows:
+    return None
+  timeframe, signal, actionable = max(rows, key=lambda item: (bool(item[2]), int(item[1].get("score") or 0), float(item[1].get("riskReward") or 0)))
+  return {
+    "timeframe": timeframe,
+    "direction": signal.get("direction"),
+    "setup": signal.get("setup"),
+    "score": int(signal.get("score") or 0),
+    "riskReward": finite_or_none(signal.get("riskReward")),
+    "entry": finite_or_none(signal.get("entry")),
+    "stop": finite_or_none(signal.get("stop")),
+    "target1": finite_or_none(signal.get("target")),
+    "actionable": bool(actionable),
+    "watchOnly": bool(signal.get("watchOnly")),
+    "probability": finite_or_none((signal.get("calibration") or {}).get("probabilityT1")),
+    "sampleSize": int((signal.get("calibration") or {}).get("sampleSize") or 0),
+  }
+
+
+def market_scanner_snapshot():
+  rows = []
+  for symbol in SUPPORTED_SYMBOLS:
+    runtime = market_runtime_snapshot(symbol)
+    health = runtime.get("data_health") or evaluate_data_health(symbol, runtime)
+    price = finite_or_none((runtime.get("candle") or {}).get("close"))
+    intraday = scanner_candidate(runtime.get("recommendations"), include_daily=False)
+    swing = scanner_candidate(runtime.get("recommendations"), include_daily=True)
+    rows.append({
+      "symbol": symbol,
+      "price": price,
+      "dataStatus": health.get("status"),
+      "tradeAllowed": bool(health.get("tradeAllowed")),
+      "dataConfidence": health.get("dataConfidence"),
+      "intraday": intraday,
+      "swing": swing,
+      "updatedAt": runtime.get("recommendations_at") or runtime.get("last_success_at"),
+    })
+  opportunities = []
+  for row in rows:
+    for horizon in ("intraday", "swing"):
+      candidate = row.get(horizon)
+      if candidate and candidate.get("actionable") and row.get("tradeAllowed"):
+        opportunities.append({"symbol": row["symbol"], "horizon": horizon, **candidate})
+  opportunities.sort(key=lambda item: (int(item.get("score") or 0), float(item.get("riskReward") or 0)), reverse=True)
+  return {"generatedAt": now_ms(), "markets": rows, "bestOpportunity": opportunities[0] if opportunities else None}
+
+
+def model_governance_snapshot(symbol):
+  settings = load_strategy_settings()
+  learning = settings.get("learning") or {}
+  minimum = max(30, int(learning.get("minimumPromotionSamples") or 120))
+  runtime = market_runtime_snapshot(symbol)
+  replay = runtime.get("backtest") or {}
+  validation = replay.get("validation") or {}
+  with db() as connection:
+    snapshot = load_learning_snapshot(connection, symbol)
+  samples = int(snapshot.get("resolvedSamples") or 0)
+  validation_ready = validation.get("status") == "validated"
+  sample_ready = samples >= minimum
+  # A challenger cannot be promoted from the same outcomes used to create it.
+  ready_for_comparison = bool(sample_ready and validation_ready)
+  return {
+    "symbol": symbol,
+    "champion": {
+      "version": STRATEGY_VERSION,
+      "status": "production",
+      "type": "fixed rules",
+    },
+    "challenger": {
+      "version": "adaptive-calibration-v1",
+      "status": "shadow",
+      "resolvedForwardSamples": samples,
+      "minimumPromotionSamples": minimum,
+      "validationStatus": validation.get("status") or "building",
+      "readyForIndependentComparison": ready_for_comparison,
+      "eligibleForPromotion": False,
+      "scoreChangesApplied": (learning.get("mode") == "approved_live"),
+      "detail": (
+        "Shadow suggestions are recorded but do not change production scores. Promotion requires a separate forward comparison against the champion."
+      ),
+    },
+    "autoPromote": False,
+  }
+
+
 def monitoring_findings(timestamp=None):
   timestamp = int(timestamp or now_ms())
   findings = {}
@@ -2113,6 +2585,13 @@ def monitoring_findings(timestamp=None):
         findings[f"{symbol}:stale_data"] = ("critical", f"{symbol}: market data is stale for {round(provider_age / MINUTE_MS)} minutes")
     if health.get("tradeAllowed") is False and health.get("blockers"):
       findings[f"{symbol}:data_health"] = ("warning", f"{symbol}: trade alerts paused - {'; '.join(health['blockers'])}")
+  backup_age = timestamp - int(BACKUP_STATE.get("last_success_at") or 0) if BACKUP_STATE.get("last_success_at") else None
+  if BACKUP_STATE.get("last_error"):
+    findings["database:backup_failed"] = ("critical", f"Database backup failed: {BACKUP_STATE['last_error']}")
+  elif backup_age is not None and backup_age > BACKUP_INTERVAL_SECONDS * 1500:
+    findings["database:backup_stale"] = ("warning", f"Last verified database backup is {round(backup_age / 3_600_000, 1)} hours old")
+  elif backup_age is None and timestamp - PROCESS_STARTED_AT_MS > 10 * MINUTE_MS:
+    findings["database:no_backup"] = ("warning", "No verified database backup has completed")
   return findings
 
 
@@ -2190,6 +2669,8 @@ def system_health_snapshot():
     "status": "degraded" if findings else "healthy",
     "generatedAt": timestamp,
     "webhookConfigured": bool(ALERT_WEBHOOK_URL),
+    "databaseBackup": {**BACKUP_STATE},
+    "tradeNotifications": notification_engine.delivery_status(),
     "findings": [{"key": key, "severity": value[0], "message": value[1]} for key, value in findings.items()],
     "incidents": incidents,
   }
@@ -2210,6 +2691,12 @@ def prometheus_metrics():
     "# HELP trader_helper_active_findings Number of current unconfirmed monitoring findings.",
     "# TYPE trader_helper_active_findings gauge",
     f"trader_helper_active_findings {len(findings)}",
+    "# HELP trader_helper_database_backup_age_seconds Age of the latest verified SQLite backup.",
+    "# TYPE trader_helper_database_backup_age_seconds gauge",
+    f"trader_helper_database_backup_age_seconds {((timestamp - BACKUP_STATE['last_success_at']) / 1000) if BACKUP_STATE.get('last_success_at') else -1}",
+    "# HELP trader_helper_database_backup_integrity Whether the latest backup passed SQLite integrity verification.",
+    "# TYPE trader_helper_database_backup_integrity gauge",
+    f"trader_helper_database_backup_integrity {1 if BACKUP_STATE.get('integrity') == 'ok' else 0}",
     "# HELP trader_helper_provider_errors Consecutive market-data provider errors by symbol.",
     "# TYPE trader_helper_provider_errors gauge",
     "# HELP trader_helper_provider_age_seconds Age of the most recent successful provider refresh.",
@@ -2217,6 +2704,15 @@ def prometheus_metrics():
     "# HELP trader_helper_trade_alerts_allowed Whether new trade alerts are permitted by data health.",
     "# TYPE trader_helper_trade_alerts_allowed gauge",
   ]
+  delivery = notification_engine.delivery_status()
+  lines.extend([
+    "# HELP trader_helper_trade_notification_attempts Total server trade-notification attempts.",
+    "# TYPE trader_helper_trade_notification_attempts counter",
+    f"trader_helper_trade_notification_attempts {delivery['attempts']}",
+    "# HELP trader_helper_trade_notification_failures Total server trade-notification failures.",
+    "# TYPE trader_helper_trade_notification_failures counter",
+    f"trader_helper_trade_notification_failures {delivery['failures']}",
+  ])
   for symbol in SUPPORTED_SYMBOLS:
     runtime = market_runtime_snapshot(symbol)
     health = runtime.get("data_health") or evaluate_data_health(symbol, runtime, timestamp)
@@ -2260,7 +2756,8 @@ def market_data_loop(symbol):
   next_five_minute_at = 0
   next_daily_at = 0
   cached = load_cached_candles(symbol)
-  cached_daily, daily_fetched_at = load_daily_candles(symbol)
+  cached_daily, daily_fetched_at = load_daily_candles(symbol, limit=3000)
+  cached_five_minute = load_market_bars(symbol, 5, limit=50_000)
   prior_candle = cached[-1] if cached else None
   if cached:
     with MARKET_RUNTIME_LOCK:
@@ -2269,26 +2766,36 @@ def market_data_loop(symbol):
   if cached_daily:
     with MARKET_RUNTIME_LOCK:
       MARKET_RUNTIMES[symbol]["daily_history"] = cached_daily
+  if cached_five_minute:
+    with MARKET_RUNTIME_LOCK:
+      MARKET_RUNTIMES[symbol]["five_minute_history"] = cached_five_minute
   if cached:
     refresh_server_recommendations(provider, symbol)
   while not MARKET_STOP_EVENT.is_set():
     try:
       current_time = time.time()
       if current_time >= next_history_at:
-        history = fetch_history_candles(provider, symbol)
-        history = merge_candle_series([*cached, *history])[-2500:]
-        record_market_candles(symbol, provider, history)
+        fetched_history = fetch_history_candles(provider, symbol)
+        history = merge_candle_series([*cached, *fetched_history])[-2500:]
+        updates = [
+          candle for candle in fetched_history
+          if prior_candle is None or candle["time"] >= prior_candle["time"]
+        ]
+        record_market_candles(symbol, provider, updates)
         with MARKET_RUNTIME_LOCK:
           MARKET_RUNTIMES[symbol]["history"] = history[-2500:]
           MARKET_RUNTIMES[symbol]["last_history_at"] = now_ms()
         next_history_at = current_time + 5 * 60
 
       if current_time >= next_five_minute_at:
-        five_minute = fetch_five_minute_candles(provider, symbol)
+        fetched_five_minute = fetch_five_minute_candles(provider, symbol)
+        five_minute = merge_candle_series([*cached_five_minute, *fetched_five_minute])
         if len(five_minute) < 160:
           raise ValueError("Five-minute provider history is incomplete")
+        save_market_bars(symbol, 5, provider, fetched_five_minute)
+        cached_five_minute = five_minute[-50_000:]
         with MARKET_RUNTIME_LOCK:
-          MARKET_RUNTIMES[symbol]["five_minute_history"] = five_minute[-20_000:]
+          MARKET_RUNTIMES[symbol]["five_minute_history"] = cached_five_minute
         next_five_minute_at = current_time + 15 * 60
 
       daily_is_stale = len(cached_daily) < 400 or not daily_fetched_at or now_ms() - int(daily_fetched_at) >= DAILY_CACHE_TTL_MS
@@ -2297,7 +2804,7 @@ def market_data_loop(symbol):
         save_daily_candles(symbol, "yahoo", daily)
         daily_fetched_at = now_ms()
         with MARKET_RUNTIME_LOCK:
-          MARKET_RUNTIMES[symbol]["daily_history"] = daily[-520:]
+          MARKET_RUNTIMES[symbol]["daily_history"] = daily[-3000:]
         next_daily_at = current_time + 60 * 60
       elif current_time >= next_daily_at:
         next_daily_at = current_time + 60 * 60
@@ -2313,6 +2820,7 @@ def market_data_loop(symbol):
         MARKET_RUNTIMES[symbol]["last_success_at"] = now_ms()
         MARKET_RUNTIMES[symbol]["error_count"] = 0
         MARKET_RUNTIMES[symbol]["last_error"] = None
+        MARKET_RUNTIMES[symbol]["source_metadata"] = provider_metadata(provider, symbol)
       refresh_server_recommendations(provider, symbol)
       schedule_historical_replay(symbol)
       delay = base_interval
@@ -2336,9 +2844,9 @@ def start_market_data_workers():
 
 
 def save_candles(connection, symbol, provider, candles, is_closed=1):
-  saved = 0
-  for candle in merge_candle_series(candles):
-    connection.execute("""
+  normalized = merge_candle_series(candles)
+  timestamp = now_ms()
+  connection.executemany("""
       INSERT INTO candles (symbol, time, open, high, low, close, volume, provider, is_closed, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(symbol, time) DO UPDATE SET
@@ -2349,20 +2857,22 @@ def save_candles(connection, symbol, provider, candles, is_closed=1):
         volume = MAX(candles.volume, excluded.volume),
         provider = excluded.provider,
         is_closed = excluded.is_closed
-    """, (
-      symbol,
-      int(candle["time"]),
-      candle["open"],
-      candle["high"],
-      candle["low"],
-      candle["close"],
-      int(candle.get("volume") or 0),
-      provider,
-      int(is_closed),
-      now_ms(),
-    ))
-    saved += 1
-  return saved
+    """, [
+      (
+        symbol,
+        int(candle["time"]),
+        candle["open"],
+        candle["high"],
+        candle["low"],
+        candle["close"],
+        int(candle.get("volume") or 0),
+        provider,
+        int(is_closed),
+        timestamp,
+      )
+      for candle in normalized
+    ])
+  return len(normalized)
 
 
 def insert_event(connection, plan_id, event_type, event_at, price=None, details=None):
@@ -2370,6 +2880,129 @@ def insert_event(connection, plan_id, event_type, event_at, price=None, details=
     INSERT INTO plan_events (plan_id, event_type, event_at, price, details_json)
     VALUES (?, ?, ?, ?, ?)
   """, (plan_id, event_type, int(event_at), price, json.dumps(details or {})))
+
+
+def validate_pattern_payload(payload):
+  symbol = validate_symbol(payload.get("symbol"))
+  timeframe = int(payload.get("timeframe") or 0)
+  if timeframe not in {1, 5, 15, strategy_engine.DAILY_TIMEFRAME}:
+    raise ValueError("invalid pattern timeframe")
+  direction_value = str(payload.get("direction") or "").lower()
+  direction = "long" if direction_value in {"up", "bullish", "long"} else "short" if direction_value in {"down", "bearish", "short"} else ""
+  if not direction:
+    raise ValueError("invalid pattern direction")
+  detected_at = int(payload.get("detectedAt") or 0)
+  if detected_at <= 0 or detected_at > now_ms() + MINUTE_MS:
+    raise ValueError("invalid pattern timestamp")
+  if timeframe != strategy_engine.DAILY_TIMEFRAME and not strategy_engine.is_continuous_market(symbol):
+    if not strategy_engine.market_session(detected_at, symbol).get("regular"):
+      raise ValueError("intraday patterns must come from the regular trading session")
+  prices = {key: finite_number(payload.get(key)) for key in ("breakout", "target", "invalidation")}
+  if any(value is None or value <= 0 for value in prices.values()):
+    raise ValueError("invalid pattern levels")
+  if direction == "long" and not (prices["invalidation"] < prices["breakout"] < prices["target"]):
+    raise ValueError("invalid bullish pattern levels")
+  if direction == "short" and not (prices["invalidation"] > prices["breakout"] > prices["target"]):
+    raise ValueError("invalid bearish pattern levels")
+  name = str(payload.get("name") or "Unknown")[:80]
+  identifier = hashlib.sha256(
+    f"{symbol}|{timeframe}|{name}|{detected_at}|{round(prices['breakout'], 4)}".encode("utf-8")
+  ).hexdigest()
+  return {
+    "id": identifier,
+    "symbol": symbol,
+    "timeframe": timeframe,
+    "name": name,
+    "direction": direction,
+    "detected_at": detected_at,
+    **prices,
+    "measured_move": finite_or_none(payload.get("measuredMove")),
+    "updated_at": detected_at,
+  }
+
+
+def save_pattern_observation(connection, pattern):
+  cursor = connection.execute("""
+    INSERT OR IGNORE INTO pattern_observations (
+      id, symbol, timeframe, name, direction, detected_at, breakout, target,
+      invalidation, measured_move, status, updated_at
+    ) VALUES (
+      :id, :symbol, :timeframe, :name, :direction, :detected_at, :breakout, :target,
+      :invalidation, :measured_move, 'armed', :updated_at
+    )
+  """, pattern)
+  return cursor.rowcount > 0
+
+
+def evaluate_pattern_observations(connection, symbol, candles):
+  rows = connection.execute("""
+    SELECT * FROM pattern_observations
+    WHERE symbol = ? AND status IN ('armed', 'triggered')
+    ORDER BY detected_at ASC
+  """, (symbol,)).fetchall()
+  updates = 0
+  for original in rows:
+    row = original
+    max_age = 30 * 24 * 60 * MINUTE_MS if int(row["timeframe"]) == strategy_engine.DAILY_TIMEFRAME else 4 * 60 * MINUTE_MS
+    for candle in merge_candle_series(candles):
+      if int(candle["time"]) <= int(row["updated_at"]):
+        continue
+      long = row["direction"] == "long"
+      breakout_hit = candle["high"] >= row["breakout"] if long else candle["low"] <= row["breakout"]
+      target_hit = candle["high"] >= row["target"] if long else candle["low"] <= row["target"]
+      invalid_hit = candle["low"] <= row["invalidation"] if long else candle["high"] >= row["invalidation"]
+      status = row["status"]
+      updates_dict = {"updated_at": candle["time"]}
+      if candle["time"] - int(row["detected_at"]) > max_age:
+        updates_dict.update({"status": "expired", "expired_at": candle["time"]})
+      elif status == "armed":
+        if breakout_hit and invalid_hit:
+          updates_dict.update({"status": "ambiguous", "triggered_at": candle["time"], "invalidated_at": candle["time"]})
+        elif invalid_hit and not breakout_hit:
+          updates_dict.update({"status": "invalidated_before_breakout", "invalidated_at": candle["time"]})
+        elif breakout_hit:
+          updates_dict.update({"status": "triggered", "triggered_at": candle["time"]})
+      elif status == "triggered":
+        if target_hit and invalid_hit:
+          updates_dict.update({"status": "ambiguous", "target_hit_at": candle["time"], "invalidated_at": candle["time"]})
+        elif target_hit:
+          updates_dict.update({"status": "target", "target_hit_at": candle["time"], "eligible_for_learning": 1})
+        elif invalid_hit:
+          updates_dict.update({"status": "invalidated", "invalidated_at": candle["time"], "eligible_for_learning": 1})
+      assignments = ", ".join(f"{key} = ?" for key in updates_dict)
+      connection.execute(
+        f"UPDATE pattern_observations SET {assignments} WHERE id = ?",
+        (*updates_dict.values(), row["id"]),
+      )
+      row = connection.execute("SELECT * FROM pattern_observations WHERE id = ?", (row["id"],)).fetchone()
+      updates += 1
+      if row["status"] not in {"armed", "triggered"}:
+        break
+  return updates
+
+
+def pattern_validation_stats(connection, symbol):
+  rows = connection.execute("""
+    SELECT name, timeframe,
+           COUNT(*) AS observations,
+           SUM(CASE WHEN status = 'triggered' THEN 1 ELSE 0 END) AS active,
+           SUM(CASE WHEN eligible_for_learning = 1 THEN 1 ELSE 0 END) AS resolved,
+           SUM(CASE WHEN status = 'target' THEN 1 ELSE 0 END) AS targets,
+           SUM(CASE WHEN status = 'invalidated' THEN 1 ELSE 0 END) AS invalidated
+    FROM pattern_observations
+    WHERE symbol = ?
+    GROUP BY name, timeframe
+    ORDER BY resolved DESC, observations DESC
+  """, (symbol,)).fetchall()
+  output = []
+  for row in rows:
+    item = dict(row)
+    resolved = int(item["resolved"] or 0)
+    targets = int(item["targets"] or 0)
+    item["targetRate"] = (targets + 5) / (resolved + 10) if resolved else None
+    item["validated"] = resolved >= 30
+    output.append(item)
+  return output
 
 
 def realized_r_for(status, row):
@@ -2467,6 +3100,51 @@ def update_plan_row(connection, row, candle, updates):
         observations = observations + 1
     WHERE id = :id
   """, params)
+
+
+def trader_lifecycle_state(row):
+  lifecycle = row["lifecycle_status"] or "waiting"
+  outcome = row["outcome_status"] or "open"
+  if outcome == "target1":
+    return "t1_hit"
+  if lifecycle == "waiting" and outcome == "open":
+    return "armed"
+  if lifecycle == "entered" and outcome == "open":
+    return "triggered"
+  if outcome in {"expired"}:
+    return "invalidated"
+  if outcome in {"target2", "target1_stop", "stopped", "ambiguous"} or lifecycle == "closed":
+    return "closed"
+  return lifecycle
+
+
+def active_trade_plans(symbol):
+  with db() as connection:
+    rows = connection.execute("""
+      SELECT id, created_at, updated_at, symbol, timeframe, direction, setup, setup_type, score,
+             entry, stop, target1, target2, risk_reward, lifecycle_status, outcome_status,
+             entry_hit_at, hit_target1_at, last_price, user_feedback, feature_snapshot_json
+      FROM plans
+      WHERE symbol = ? AND outcome_status IN ('open', 'target1')
+        AND COALESCE(lifecycle_status, 'waiting') IN ('waiting', 'entered')
+        AND strategy_version = ?
+      ORDER BY timeframe ASC, created_at DESC
+    """, (symbol, STRATEGY_VERSION)).fetchall()
+  plans = []
+  seen_timeframes = set()
+  for row in rows:
+    if int(row["timeframe"]) in seen_timeframes:
+      continue
+    seen_timeframes.add(int(row["timeframe"]))
+    item = dict(row)
+    item["tradeState"] = trader_lifecycle_state(row)
+    try:
+      features = json.loads(item.pop("feature_snapshot_json") or "{}")
+    except (TypeError, ValueError):
+      features = {}
+    item["riskPlan"] = features.get("riskPlan")
+    plans.append(item)
+  return plans
 
 
 def evaluate_plans(connection, symbol, candles):
@@ -2614,6 +3292,8 @@ def evaluate_plans(connection, symbol, candles):
         if event_type:
           insert_event(connection, row["id"], event_type, candle["time"], candle["close"], changed)
         row = connection.execute("SELECT * FROM plans WHERE id = ?", (row["id"],)).fetchone()
+        if event_type:
+          notification_engine.send_async(event_type, dict(row))
         updates += 1
         if row["lifecycle_status"] in {"closed", "expired"}:
           break
@@ -2716,6 +3396,13 @@ class Handler(SimpleHTTPRequestHandler):
     self.send_header("Content-Type", content_type)
     self.send_header("Content-Length", str(len(payload)))
     self.send_header("Cache-Control", "no-store")
+    self.end_headers()
+    self.wfile.write(payload)
+
+  def send_binary(self, status, payload, content_type):
+    self.send_response(status)
+    self.send_header("Content-Type", content_type)
+    self.send_header("Content-Length", str(len(payload)))
     self.end_headers()
     self.wfile.write(payload)
 
@@ -2824,6 +3511,21 @@ class Handler(SimpleHTTPRequestHandler):
     if parsed.path == "/api/system-health":
       self.send_json(200, system_health_snapshot())
       return
+    if parsed.path == "/api/scanner":
+      self.send_json(200, market_scanner_snapshot())
+      return
+    if parsed.path == "/api/model-governance":
+      params = parse_qs(parsed.query)
+      symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
+      self.send_json(200, model_governance_snapshot(symbol))
+      return
+    if parsed.path == "/api/pattern/stats":
+      params = parse_qs(parsed.query)
+      symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
+      with db() as connection:
+        rows = pattern_validation_stats(connection, symbol)
+      self.send_json(200, {"symbol": symbol, "patterns": rows})
+      return
     if parsed.path == "/api/config":
       params = parse_qs(parsed.query)
       symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
@@ -2836,7 +3538,9 @@ class Handler(SimpleHTTPRequestHandler):
         "symbols": list(SUPPORTED_SYMBOLS),
         "marketType": "crypto" if strategy_engine.is_continuous_market(symbol) else "equity",
         "continuousMarket": strategy_engine.is_continuous_market(symbol),
+        "assetProfile": strategy_engine.asset_profile(symbol),
         "provider": provider or "unavailable",
+        "sourceMetadata": runtime.get("source_metadata") or provider_metadata(provider, symbol),
         "feed": ALPACA_FEED if provider == "alpaca" else ("chart" if provider == "yahoo" else ("tws" if provider == "ibkr" else "snapshot")),
         "realTimeEnabled": bool(provider),
         "pollIntervalMs": 15000 if provider == "yahoo" else 5000,
@@ -2849,6 +3553,10 @@ class Handler(SimpleHTTPRequestHandler):
         "recommendationsAt": runtime["recommendations_at"],
         "analysisEngine": "python-server",
         "backtestStatus": runtime["backtest_status"],
+        "tradeNotifications": {
+          "serverEnabled": bool(notification_engine.configured_channels()),
+          "channels": notification_engine.configured_channels(),
+        },
         "optionsProvider": {
           "name": "Market Data",
           "configured": bool(MARKETDATA_TOKEN),
@@ -2879,6 +3587,8 @@ class Handler(SimpleHTTPRequestHandler):
         "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
         "analysisEngine": "python-server",
         "backtestStatus": runtime["backtest_status"],
+        "activePlans": active_trade_plans(symbol),
+        "modelGovernance": model_governance_snapshot(symbol),
       })
       return
     if parsed.path == "/api/options-opportunity":
@@ -2907,6 +3617,9 @@ class Handler(SimpleHTTPRequestHandler):
         status, payload = self.api_error(error)
         self.send_json(status, payload)
       return
+    if parsed.path == "/api/market-context":
+      self.send_json(200, broad_market_context())
+      return
     if parsed.path == "/api/stream":
       self.handle_stream(parsed)
       return
@@ -2915,6 +3628,9 @@ class Handler(SimpleHTTPRequestHandler):
       return
     if parsed.path == "/api/journal/replay":
       self.handle_journal_replay(parsed)
+      return
+    if parsed.path == "/api/journal/snapshot":
+      self.handle_journal_snapshot(parsed)
       return
     self.serve_static(parsed)
 
@@ -2930,6 +3646,12 @@ class Handler(SimpleHTTPRequestHandler):
       return
     if parsed.path == "/api/journal/feedback":
       self.handle_journal_feedback()
+      return
+    if parsed.path == "/api/journal/review":
+      self.handle_journal_review()
+      return
+    if parsed.path == "/api/pattern/observation":
+      self.handle_pattern_observation()
       return
     self.send_json(404, {"error": "not_found"})
 
@@ -3053,6 +3775,16 @@ class Handler(SimpleHTTPRequestHandler):
       status, payload = self.api_error(error)
       self.send_json(status, payload)
 
+  def handle_pattern_observation(self):
+    try:
+      pattern = validate_pattern_payload(self.read_json_body())
+      with db() as connection:
+        saved = save_pattern_observation(connection, pattern)
+      self.send_json(200, {"saved": saved, "id": pattern["id"]})
+    except Exception as error:
+      status, payload = self.api_error(error)
+      self.send_json(status, payload)
+
   def handle_journal_feedback(self):
     try:
       payload = self.read_json_body()
@@ -3074,6 +3806,81 @@ class Handler(SimpleHTTPRequestHandler):
     except Exception as error:
       status, payload = self.api_error(error)
       self.send_json(status, payload)
+
+  def handle_journal_review(self):
+    try:
+      payload = self.read_json_body()
+      plan_id = str(payload.get("id") or "")[:240]
+      if not plan_id:
+        raise ValueError("missing plan id")
+      with db() as connection:
+        row = connection.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not row:
+          self.send_json(404, {"error": "plan_not_found"})
+          return
+        feedback = payload.get("feedback")
+        if feedback is not None and feedback not in {"took", "skipped", "bad"}:
+          raise ValueError("invalid feedback")
+        actual_fill = finite_or_none(payload.get("actualFill"))
+        actual_exit = finite_or_none(payload.get("actualExit"))
+        actual_quantity = finite_or_none(payload.get("actualQuantity"))
+        if any(value is not None and value <= 0 for value in (actual_fill, actual_exit, actual_quantity)):
+          raise ValueError("execution values must be positive")
+        notes = str(payload.get("notes") or "")[:2000]
+        realized_r = None
+        if actual_fill is not None and actual_exit is not None:
+          actual_risk = abs(actual_fill - float(row["stop"]))
+          if actual_risk > 0:
+            move = actual_exit - actual_fill if row["direction"] == "long" else actual_fill - actual_exit
+            realized_r = move / actual_risk
+        screenshot_path = row["screenshot_path"]
+        screenshot = payload.get("chartSnapshot")
+        if screenshot:
+          prefix = "data:image/png;base64,"
+          if not isinstance(screenshot, str) or not screenshot.startswith(prefix):
+            raise ValueError("invalid chart snapshot")
+          try:
+            image = base64.b64decode(screenshot[len(prefix):], validate=True)
+          except (ValueError, binascii.Error) as error:
+            raise ValueError("invalid chart snapshot") from error
+          if len(image) > 750_000:
+            raise ValueError("chart snapshot is too large")
+          snapshot_dir = os.path.join(PERSISTENT_DATA_DIR, "trade_snapshots")
+          os.makedirs(snapshot_dir, exist_ok=True)
+          filename = hashlib.sha256(plan_id.encode("utf-8")).hexdigest() + ".png"
+          screenshot_path = os.path.join(snapshot_dir, filename)
+          with open(screenshot_path, "wb") as handle:
+            handle.write(image)
+        connection.execute("""
+          UPDATE plans
+          SET user_feedback = COALESCE(?, user_feedback), actual_fill = ?, actual_exit = ?,
+              actual_quantity = ?, actual_realized_r = ?, trader_notes = ?, review_updated_at = ?,
+              screenshot_path = ?
+          WHERE id = ?
+        """, (
+          feedback, actual_fill, actual_exit, actual_quantity, realized_r, notes, now_ms(), screenshot_path, plan_id,
+        ))
+      self.send_json(200, {
+        "updated": True,
+        "id": plan_id,
+        "actualRealizedR": realized_r,
+        "hasSnapshot": bool(screenshot_path),
+      })
+    except Exception as error:
+      status, response = self.api_error(error)
+      self.send_json(status, response)
+
+  def handle_journal_snapshot(self, parsed):
+    params = parse_qs(parsed.query)
+    plan_id = str((params.get("id") or [""])[0])[:240]
+    with db() as connection:
+      row = connection.execute("SELECT screenshot_path FROM plans WHERE id = ?", (plan_id,)).fetchone()
+    path = row["screenshot_path"] if row else None
+    if not path or not os.path.isfile(path) or not os.path.abspath(path).startswith(os.path.abspath(os.path.join(PERSISTENT_DATA_DIR, "trade_snapshots")) + os.sep):
+      self.send_json(404, {"error": "snapshot_not_found"})
+      return
+    with open(path, "rb") as handle:
+      self.send_binary(200, handle.read(), "image/png")
 
   def handle_latest(self, parsed):
     params = parse_qs(parsed.query)
@@ -3124,6 +3931,8 @@ class Handler(SimpleHTTPRequestHandler):
             COALESCE(AVG(CASE WHEN ABS(entry - stop) > 0 THEN max_favorable / ABS(entry - stop) END), 0) AS avg_favorable_r,
             COALESCE(AVG(CASE WHEN ABS(entry - stop) > 0 THEN max_adverse / ABS(entry - stop) END), 0) AS avg_adverse_r,
             COALESCE(AVG(realized_r), 0) AS avg_realized_r,
+            COALESCE(SUM(CASE WHEN actual_realized_r IS NOT NULL THEN 1 ELSE 0 END), 0) AS trader_resolved,
+            COALESCE(AVG(actual_realized_r), 0) AS trader_avg_realized_r,
             COALESCE(AVG(time_to_target1_ms), 0) AS avg_time_to_target1_ms,
             COALESCE(AVG(time_to_stop_ms), 0) AS avg_time_to_stop_ms
           FROM plans
@@ -3176,7 +3985,9 @@ class Handler(SimpleHTTPRequestHandler):
         recent = connection.execute(f"""
           SELECT id, created_at, timeframe, direction, setup, setup_type, score, lifecycle_status, outcome_status,
                  entry, stop, target1, target2, user_feedback, max_favorable, max_adverse,
-                 time_to_target1_ms, time_to_stop_ms, realized_r
+                 time_to_target1_ms, time_to_stop_ms, realized_r,
+                 actual_fill, actual_exit, actual_quantity, actual_realized_r, trader_notes,
+                 review_updated_at, CASE WHEN screenshot_path IS NOT NULL THEN 1 ELSE 0 END AS has_snapshot
           FROM plans
           WHERE {filter_sql}
           ORDER BY created_at DESC
@@ -3224,7 +4035,6 @@ class Handler(SimpleHTTPRequestHandler):
         return
       runtime = market_runtime_snapshot(symbol)
       candles, degraded = history_candles_with_fallback(provider, symbol, runtime)
-      record_market_candles(symbol, provider, candles)
       self.send_json(200, {
         "symbol": symbol,
         "candles": candles[-2500:],
@@ -3241,7 +4051,7 @@ class Handler(SimpleHTTPRequestHandler):
     params = parse_qs(parsed.query)
     try:
       symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
-      daily_cache, fetched_at = load_daily_candles(symbol)
+      daily_cache, fetched_at = load_daily_candles(symbol, limit=3000)
       if len(daily_cache) >= 400 and fetched_at and now_ms() - int(fetched_at) < DAILY_CACHE_TTL_MS:
         with MARKET_RUNTIME_LOCK:
           MARKET_RUNTIMES[symbol]["daily_history"] = daily_cache
@@ -3257,11 +4067,11 @@ class Handler(SimpleHTTPRequestHandler):
         candles = fetch_daily_candles(symbol)
         save_daily_candles(symbol, "yahoo", candles)
         with MARKET_RUNTIME_LOCK:
-          MARKET_RUNTIMES[symbol]["daily_history"] = candles[-520:]
+          MARKET_RUNTIMES[symbol]["daily_history"] = candles[-3000:]
         self.send_json(200, {
           "symbol": symbol,
           "provider": "yahoo",
-          "candles": candles[-520:],
+          "candles": candles[-3000:],
           "cached": False,
           "degraded": False,
         })
@@ -3300,8 +4110,9 @@ class Handler(SimpleHTTPRequestHandler):
       candles = runtime["five_minute_history"]
       if not candles:
         candles = fetch_five_minute_candles(provider, symbol)
+        save_market_bars(symbol, 5, provider, candles)
         with MARKET_RUNTIME_LOCK:
-          MARKET_RUNTIMES[symbol]["five_minute_history"] = candles[-20_000:]
+          MARKET_RUNTIMES[symbol]["five_minute_history"] = candles[-50_000:]
       self.send_json(200, {
         "symbol": symbol,
         "provider": provider,
@@ -3372,6 +4183,7 @@ class Handler(SimpleHTTPRequestHandler):
             "recommendations": runtime["recommendations"],
             "optionsOpportunity": runtime["options_opportunity"],
             "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
+            "activePlans": active_trade_plans(symbol),
           })
         options_key = json.dumps(runtime["options_opportunity"], sort_keys=True, separators=(",", ":"))
         if options_key != last_options_key:
@@ -3431,6 +4243,7 @@ def main():
   server = AppHTTPServer((HOST, PORT), Handler)
   start_market_data_workers()
   start_monitoring_worker()
+  start_backup_worker()
   provider = active_provider(SYMBOL)
   if provider == "alpaca":
     mode = f"Alpaca {ALPACA_FEED} data proxy"
@@ -3442,7 +4255,7 @@ def main():
     mode = "Polygon/Massive data proxy"
   else:
     mode = "no market provider configured"
-  print(f"Serving QQQ, SPY, and BTC-USD helper at http://{HOST}:{PORT}/ ({mode})")
+  print(f"Serving QQQ, SPY, BTC-USD, and TA-125 helper at http://{HOST}:{PORT}/ ({mode})")
   try:
     server.serve_forever()
   except KeyboardInterrupt:

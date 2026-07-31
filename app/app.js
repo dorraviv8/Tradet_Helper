@@ -16,7 +16,7 @@ const ASSET_OPTIONS = {
   hasReliableIntradayVolume: ASSET.hasReliableIntradayVolume !== false,
 };
 const SETTINGS_KEY = `trader-helper-settings:${API_SYMBOL}`;
-const STRATEGY_VERSION = "5.2.0";
+const STRATEGY_VERSION = "6.0.0";
 const ALERT_TIMEFRAMES = [1, 5, 15, 1440];
 const DAILY_TIMEFRAME = 1440;
 const OPTIONS_ALERT_STORAGE_KEY = `trader-helper-options-alert:${API_SYMBOL}`;
@@ -51,6 +51,14 @@ const state = {
       normal: { scoreOffset: 0, targetScale: 1 },
       strict: { scoreOffset: 8, targetScale: 1.08 },
     },
+    risk: {
+      accountSize: 0,
+      riskPerTradePct: 0.5,
+      maxPositionValuePct: 30,
+      maxDailyLossPct: 1.5,
+      maxOpenRiskPct: 1,
+      maxConsecutiveLosses: 3,
+    },
   },
   lastStatsAt: 0,
   activePlanIds: {},
@@ -61,6 +69,13 @@ const state = {
   serverOwnsSignals: false,
   analysisEngine: "unavailable",
   serverRecommendations: null,
+  activePlans: [],
+  scanner: null,
+  modelGovernance: null,
+  patternStats: null,
+  serverTradeNotifications: null,
+  scannerTimer: null,
+  selectedJournalPlanId: "",
   optionsOpportunity: null,
   lastOptionsAlertKey: "",
   journalRecent: [],
@@ -78,6 +93,7 @@ const state = {
   notifyEnabled: false,
   currentPattern: null,
   currentPatternKey: "",
+  lastPatternObservationKey: "",
   patternHitZones: [],
   patternProjectionVisible: false,
   chartGeometry: null,
@@ -93,6 +109,19 @@ const els = {
   chartOverlay: document.getElementById("chartOverlay"),
   clock: document.getElementById("clock"),
   sessionState: document.getElementById("sessionState"),
+  actionNow: document.getElementById("actionNow"),
+  actionDetail: document.getElementById("actionDetail"),
+  actionData: document.getElementById("actionData"),
+  actionDistance: document.getElementById("actionDistance"),
+  actionRisk: document.getElementById("actionRisk"),
+  systemBanner: document.getElementById("systemBanner"),
+  systemBannerTitle: document.getElementById("systemBannerTitle"),
+  systemBannerDetail: document.getElementById("systemBannerDetail"),
+  dayTradeView: document.getElementById("dayTradeView"),
+  swingTradeView: document.getElementById("swingTradeView"),
+  contextView: document.getElementById("contextView"),
+  scannerBest: document.getElementById("scannerBest"),
+  scannerMarkets: document.getElementById("scannerMarkets"),
   brandEyebrow: document.getElementById("brandEyebrow"),
   chartSymbol: document.getElementById("chartSymbol"),
   assetSelector: document.getElementById("assetSelector"),
@@ -122,6 +151,7 @@ const els = {
   providerSource: document.getElementById("providerSource"),
   providerLastTick: document.getElementById("providerLastTick"),
   providerErrors: document.getElementById("providerErrors"),
+  providerTradeAlerts: document.getElementById("providerTradeAlerts"),
   marketStatus: document.getElementById("marketStatus"),
   signalBarState: document.getElementById("signalBarState"),
   dataQuality: document.getElementById("dataQuality"),
@@ -144,6 +174,13 @@ const els = {
   marketSpyTrend: document.getElementById("marketSpyTrend"),
   marketConfirmationScore: document.getElementById("marketConfirmationScore"),
   marketConfirmationDetail: document.getElementById("marketConfirmationDetail"),
+  broadMarketContextTile: document.getElementById("broadMarketContextTile"),
+  broadMarketContextBadge: document.getElementById("broadMarketContextBadge"),
+  contextVix: document.getElementById("contextVix"),
+  contextBreadth: document.getElementById("contextBreadth"),
+  contextTechnology: document.getElementById("contextTechnology"),
+  contextScoreEffect: document.getElementById("contextScoreEffect"),
+  contextDetail: document.getElementById("contextDetail"),
   biasBadge: document.getElementById("biasBadge"),
   biasFill: document.getElementById("biasFill"),
   biasScore: document.getElementById("biasScore"),
@@ -201,7 +238,15 @@ const els = {
   calibrationHoldingTime: document.getElementById("calibrationHoldingTime"),
   calibrationScope: document.getElementById("calibrationScope"),
   activeAlert: document.getElementById("activeAlert"),
+  scoreDrivers: document.getElementById("scoreDrivers"),
+  nextCondition: document.getElementById("nextCondition"),
   riskReward: document.getElementById("riskReward"),
+  riskAccountSize: document.getElementById("riskAccountSize"),
+  riskPerTradePct: document.getElementById("riskPerTradePct"),
+  riskQuantity: document.getElementById("riskQuantity"),
+  riskDollars: document.getElementById("riskDollars"),
+  riskPositionValue: document.getElementById("riskPositionValue"),
+  riskTargetReward: document.getElementById("riskTargetReward"),
   entryLevel: document.getElementById("entryLevel"),
   stopLevel: document.getElementById("stopLevel"),
   targetLevel: document.getElementById("targetLevel"),
@@ -235,11 +280,35 @@ const els = {
   replayAvgStop: document.getElementById("replayAvgStop"),
   replaySamples: document.getElementById("replaySamples"),
   replayExcursion: document.getElementById("replayExcursion"),
+  replayProfitFactor: document.getElementById("replayProfitFactor"),
+  replayDrawdown: document.getElementById("replayDrawdown"),
+  replayValidation: document.getElementById("replayValidation"),
+  modelGovernanceBadge: document.getElementById("modelGovernanceBadge"),
+  modelChampion: document.getElementById("modelChampion"),
+  modelChallenger: document.getElementById("modelChallenger"),
+  modelSamples: document.getElementById("modelSamples"),
+  modelApplied: document.getElementById("modelApplied"),
+  modelGovernanceDetail: document.getElementById("modelGovernanceDetail"),
+  patternValidationBadge: document.getElementById("patternValidationBadge"),
+  patternTracked: document.getElementById("patternTracked"),
+  patternResolved: document.getElementById("patternResolved"),
+  patternBest: document.getElementById("patternBest"),
+  patternValidationDetail: document.getElementById("patternValidationDetail"),
   feedbackTook: document.getElementById("feedbackTook"),
   feedbackSkipped: document.getElementById("feedbackSkipped"),
   feedbackBad: document.getElementById("feedbackBad"),
   journalFilter: document.getElementById("journalFilter"),
   journalRows: document.getElementById("journalRows"),
+  tradeReviewForm: document.getElementById("tradeReviewForm"),
+  reviewPlanLabel: document.getElementById("reviewPlanLabel"),
+  reviewStatus: document.getElementById("reviewStatus"),
+  reviewFill: document.getElementById("reviewFill"),
+  reviewQuantity: document.getElementById("reviewQuantity"),
+  reviewExit: document.getElementById("reviewExit"),
+  reviewNotes: document.getElementById("reviewNotes"),
+  reviewSnapshot: document.getElementById("reviewSnapshot"),
+  saveTradeReview: document.getElementById("saveTradeReview"),
+  reviewSnapshotLink: document.getElementById("reviewSnapshotLink"),
 };
 
 function activeTradeThreshold() {
@@ -281,6 +350,138 @@ function rowWinRate(row) {
   return closed ? winners / closed : null;
 }
 
+function money(value, digits = 0) {
+  if (!Number.isFinite(Number(value))) return "--";
+  return `${ASSET.currency}${Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+}
+
+function localRiskPlan(signal) {
+  const settings = state.settings.risk || {};
+  const accountSize = Number(settings.accountSize || 0);
+  const riskPct = clamp(Number(settings.riskPerTradePct || 0.5), 0.05, 5);
+  const maxValuePct = clamp(Number(settings.maxPositionValuePct || 30), 1, 100);
+  const entry = Number(signal?.entry);
+  const stop = Number(signal?.stop);
+  const target = Number(signal?.target);
+  const unitRisk = Math.abs(entry - stop);
+  if (API_SYMBOL === "TA125") {
+    return { configured: false, quantity: null, detail: "Select a tradable TA-125 instrument before sizing." };
+  }
+  if (!(accountSize > 0 && entry > 0 && unitRisk > 0)) {
+    return { configured: false, quantity: null, detail: "Set account size to calculate quantity." };
+  }
+  const riskBudget = accountSize * riskPct / 100;
+  const maxPositionValue = accountSize * maxValuePct / 100;
+  const rawQuantity = Math.min(riskBudget / unitRisk, maxPositionValue / entry);
+  const quantity = API_SYMBOL === "BTC-USD" ? Number(rawQuantity.toFixed(6)) : Math.floor(rawQuantity);
+  return {
+    configured: quantity > 0,
+    quantity: quantity > 0 ? quantity : null,
+    riskBudget,
+    plannedRisk: quantity > 0 ? quantity * unitRisk : null,
+    positionValue: quantity > 0 ? quantity * entry : null,
+    target1Reward: quantity > 0 ? quantity * Math.abs(target - entry) : null,
+    detail: quantity > 0 ? `${riskPct.toFixed(2)}% account risk cap` : "Account settings do not permit a position.",
+  };
+}
+
+function strongestCandidate(signal) {
+  if (signal?.direction === "long" || signal?.direction === "short") return signal;
+  return [signal?.bestLong, signal?.bestShort]
+    .filter(Boolean)
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0] || null;
+}
+
+function nextTradeCondition(signal, candidate = strongestCandidate(signal)) {
+  if (state.dataHealth?.tradeAllowed === false) {
+    return `Trading paused: ${(state.dataHealth.blockers || []).join("; ") || "market data is not clean"}.`;
+  }
+  if (!candidate) return "Wait for a recognized setup with aligned structure and momentum.";
+  if (candidate.watchOnly) return candidate.reasons?.find((reason) => /wait|wide|weak|opposes|confirm|chasing|paused|quality/i.test(reason)) || "Wait for risk, confirmation, and entry location to improve.";
+  if (Number(candidate.score || 0) < activeTradeThreshold()) return `Setup needs ${activeTradeThreshold() - Number(candidate.score || 0)} more score points to become active.`;
+  const verb = candidate.direction === "long" ? "trades at or above" : "trades at or below";
+  return `Plan is armed and triggers only when price ${verb} ${fmt(Number(candidate.entry))}.`;
+}
+
+function renderActionStrip(signal, latest) {
+  const candidate = strongestCandidate(signal);
+  const activePlan = state.activePlans.find((plan) => Number(plan.timeframe) === state.selectedTimeframe);
+  const actionable = isActionableSignal(signal);
+  els.actionData.textContent = state.dataHealth?.status || "Checking";
+  setTone(els.actionData, state.dataHealth?.tone || "neutral");
+  if (activePlan) {
+    const label = String(activePlan.tradeState || "armed").replaceAll("_", " ");
+    els.actionNow.textContent = `${activePlan.direction.toUpperCase()} ${timeframeLabel(Number(activePlan.timeframe))} · ${label}`;
+    setTone(els.actionNow, activePlan.direction === "long" ? "positive" : "negative");
+  } else if (actionable) {
+    els.actionNow.textContent = `${signal.direction.toUpperCase()} ${timeframeLabel()} plan armed`;
+    setTone(els.actionNow, signal.direction === "long" ? "positive" : "negative");
+  } else {
+    els.actionNow.textContent = "No active trade";
+    setTone(els.actionNow, "neutral");
+  }
+  els.actionDetail.textContent = nextTradeCondition(signal, candidate);
+  if (candidate?.entry && latest?.close) {
+    const distance = (Number(candidate.entry) - Number(latest.close)) / Number(latest.close) * 100;
+    els.actionDistance.textContent = `${distance >= 0 ? "+" : ""}${fmt(distance, 2)}%`;
+  } else {
+    els.actionDistance.textContent = "--";
+  }
+  const risk = localRiskPlan(candidate);
+  els.actionRisk.textContent = risk.configured ? money(risk.plannedRisk, 0) : "Not configured";
+}
+
+function renderScanner(data) {
+  state.scanner = data;
+  const best = data?.bestOpportunity;
+  els.scannerBest.textContent = best ? `${best.symbol} ${best.direction} ${best.score}/100` : "No active trade";
+  setTone(els.scannerBest, best?.direction === "long" ? "positive" : best?.direction === "short" ? "negative" : "neutral");
+  els.scannerMarkets.innerHTML = (data?.markets || []).map((market) => {
+    const idea = market.intraday;
+    const stateLabel = idea?.actionable ? `${idea.direction.toUpperCase()} ${idea.score}/100` : idea ? `Watch ${idea.direction} ${idea.score}/100` : "No setup";
+    const tone = idea?.actionable ? idea.direction === "long" ? "positive" : "negative" : "neutral";
+    return `<button class="scanner-market ${API_SYMBOL === market.symbol ? "selected" : ""}" type="button" data-symbol="${escapeHtml(market.symbol)}">
+      <span><strong>${escapeHtml(ASSETS[market.symbol]?.label || market.symbol)}</strong><small class="${market.tradeAllowed ? "positive" : "negative"}">${escapeHtml(market.dataStatus || "Starting")}</small></span>
+      <b>${Number.isFinite(Number(market.price)) ? `${ASSETS[market.symbol]?.currency || ""}${fmt(Number(market.price))}` : "--"}</b>
+      <em class="${tone}">${escapeHtml(stateLabel)}</em>
+    </button>`;
+  }).join("");
+  els.scannerMarkets.querySelectorAll("[data-symbol]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("symbol", button.dataset.symbol);
+      window.location.assign(url);
+    });
+  });
+}
+
+async function refreshScanner() {
+  try {
+    const response = await fetch(`/api/scanner?t=${Date.now()}`);
+    if (!response.ok) throw new Error(`scanner failed: ${response.status}`);
+    renderScanner(await response.json());
+  } catch (error) {
+    console.info("Market scanner unavailable.", error);
+  }
+}
+
+async function refreshSystemHealth() {
+  try {
+    const response = await fetch(`/api/system-health?t=${Date.now()}`);
+    if (!response.ok) throw new Error(`system health failed: ${response.status}`);
+    const health = await response.json();
+    const findings = health.findings || [];
+    els.systemBanner.hidden = !findings.length;
+    if (!findings.length) return;
+    const critical = findings.find((item) => item.severity === "critical") || findings[0];
+    els.systemBannerTitle.textContent = `${findings.length} system issue${findings.length === 1 ? "" : "s"}`;
+    els.systemBannerDetail.textContent = critical.message;
+    els.systemBanner.classList.toggle("critical", critical.severity === "critical");
+  } catch (error) {
+    console.info("System health banner unavailable.", error);
+  }
+}
+
 function mergeDeep(base, override) {
   const output = { ...base };
   Object.entries(override || {}).forEach(([key, value]) => {
@@ -319,6 +520,7 @@ function saveSettings() {
     mode: state.settings.mode,
     sessionMode: state.settings.sessionMode,
     chartLayers: state.settings.chartLayers,
+    risk: state.settings.risk,
   }));
 }
 
@@ -338,6 +540,8 @@ function syncSettingsControls() {
   els.layerVolume.checked = Boolean(state.settings.chartLayers.volume);
   els.layerRsi.checked = Boolean(state.settings.chartLayers.rsi);
   els.patternsToggle.classList.toggle("active", Boolean(state.settings.chartLayers.patterns));
+  els.riskAccountSize.value = Number(state.settings.risk?.accountSize || 0) || "";
+  els.riskPerTradePct.value = Number(state.settings.risk?.riskPerTradePct || 0.5);
 }
 
 function syncVwapControl() {
@@ -365,6 +569,9 @@ function renderProviderHealth() {
   const candleAge = marketAgeMs === null ? "--" : `${Math.max(0, Math.round(marketAgeMs / 1000))}s candle`;
   els.providerLastTick.textContent = `${refreshAge} / ${candleAge}`;
   els.providerErrors.textContent = state.providerErrors;
+  const tradeChannels = state.serverTradeNotifications?.channels || [];
+  els.providerTradeAlerts.textContent = tradeChannels.length ? tradeChannels.join(" + ") : "Not configured";
+  setTone(els.providerTradeAlerts, tradeChannels.length ? "positive" : "neutral");
   els.sessionState.title = state.providerMessage || "";
   els.marketStatus.textContent = ASSET_OPTIONS.continuous
     ? "24/7 market"
@@ -1511,6 +1718,7 @@ function drawChart(indicators, signal) {
   const chartSession = isDailyTimeframe() ? {} : sessionLevelsForWindow(indicators, actualEnd);
   const visiblePlans = visibleJournalPlans(visible);
   const technicalPattern = detectChartTechnicalPattern(visible);
+  recordPatternObservation(technicalPattern, visible);
   const technicalPatternKey = patternKey(technicalPattern);
   if (state.currentPatternKey && state.currentPatternKey !== technicalPatternKey) {
     state.patternProjectionVisible = false;
@@ -2291,6 +2499,45 @@ function detectChartTechnicalPattern(candles) {
   return Patterns.remapPatternIndices(pattern, regular.map(({ chartIndex }) => chartIndex));
 }
 
+function recordPatternObservation(pattern, candles) {
+  if (!pattern?.projection || !candles.length) return;
+  const key = patternKey(pattern);
+  if (!key || key === state.lastPatternObservationKey) return;
+  const breakout = Number(pattern.projection.breakout?.price);
+  const target = Number(pattern.projection.target);
+  const prices = [
+    ...(pattern.points || []).map((point) => Number(point.price)),
+    ...(pattern.lines || []).flatMap((line) => [Number(line.from?.price), Number(line.to?.price)]),
+  ].filter(Number.isFinite);
+  const bullish = ["up", "bullish", "long"].includes(String(pattern.projection.direction).toLowerCase());
+  const measuredMove = Math.abs(Number(pattern.projection.measuredMove || target - breakout));
+  const structural = bullish ? Math.min(...prices) : Math.max(...prices);
+  const fallback = bullish ? breakout - measuredMove * 0.5 : breakout + measuredMove * 0.5;
+  const invalidation = Number.isFinite(structural)
+    && (bullish ? structural < breakout : structural > breakout)
+    ? structural
+    : fallback;
+  const detectedCandle = isDailyTimeframe() || ASSET_OPTIONS.continuous
+    ? candles.at(-1)
+    : [...candles].reverse().find((candle) => Core.marketSession(candle.time, ASSET_OPTIONS).regular);
+  if (!(breakout > 0 && target > 0 && invalidation > 0 && detectedCandle)) return;
+  state.lastPatternObservationKey = key;
+  postJson("/api/pattern/observation", {
+    symbol: API_SYMBOL,
+    timeframe: state.selectedTimeframe,
+    name: pattern.name,
+    direction: pattern.projection.direction,
+    detectedAt: detectedCandle.time,
+    breakout,
+    target,
+    invalidation,
+    measuredMove,
+  }).catch((error) => {
+    state.lastPatternObservationKey = "";
+    console.info("Pattern observation was not recorded.", error);
+  });
+}
+
 function drawPatternOverlay(ctx, pattern, x, y, pad) {
   state.currentPattern = pattern;
   state.currentPatternKey = patternKey(pattern);
@@ -2727,10 +2974,11 @@ function renderBias(signal) {
 }
 
 function renderMarketConfirmation(signal) {
-  if (API_SYMBOL !== "QQQ") return;
+  if (!new Set(["QQQ", "SPY"]).has(API_SYMBOL)) return;
   const confirmation = signal.marketConfirmation || {};
   const relative = confirmation.relativeStrength || {};
-  const spyTrends = confirmation.spyTrends || {};
+  const referenceSymbol = confirmation.referenceSymbol || (API_SYMBOL === "QQQ" ? "SPY" : "QQQ");
+  const spyTrends = confirmation.referenceTrends || confirmation.spyTrends || {};
   const adjustment = Number(confirmation.scoreAdjustment || 0);
   const trendSummary = ["5", "15", "1D"]
     .map((timeframe) => spyTrends[timeframe]?.label)
@@ -2751,6 +2999,28 @@ function renderMarketConfirmation(signal) {
   els.marketConfirmationScore.textContent = adjustment === 0 ? "0 pts" : `${adjustment > 0 ? "+" : ""}${adjustment} pts`;
   setTone(els.marketConfirmationScore, adjustment > 0 ? "positive" : adjustment < 0 ? "negative" : "neutral");
   els.marketConfirmationDetail.textContent = confirmation.detail || "Waiting for SPY confirmation.";
+  els.marketConfirmationTile.querySelector("h2").textContent = `${API_SYMBOL} vs ${referenceSymbol}`;
+  els.marketSpyTrend.previousElementSibling.textContent = `${referenceSymbol} alignment`;
+}
+
+function renderBroadMarketContext(signal) {
+  const context = signal?.broadMarketContext;
+  els.broadMarketContextTile.hidden = !context || !new Set(["QQQ", "SPY"]).has(API_SYMBOL);
+  if (!context) return;
+  els.broadMarketContextBadge.textContent = context.label || "Building";
+  setTone(els.broadMarketContextBadge, context.tone || "neutral");
+  const vixReturn = Number(context.vix?.returnPct);
+  els.contextVix.textContent = Number.isFinite(Number(context.vix?.level))
+    ? `${fmt(Number(context.vix.level), 1)} (${vixReturn >= 0 ? "+" : ""}${fmt(vixReturn, 1)}%)`
+    : "--";
+  els.contextBreadth.textContent = context.breadth?.rspVsSpyPct == null
+    ? context.breadth?.label || "--"
+    : `${context.breadth.label} ${Number(context.breadth.rspVsSpyPct) >= 0 ? "+" : ""}${fmt(Number(context.breadth.rspVsSpyPct), 2)}%`;
+  els.contextTechnology.textContent = context.technology?.xlkVsSpyPct == null
+    ? context.technology?.label || "--"
+    : `${context.technology.label} ${Number(context.technology.xlkVsSpyPct) >= 0 ? "+" : ""}${fmt(Number(context.technology.xlkVsSpyPct), 2)}%`;
+  els.contextScoreEffect.textContent = `${Number(context.scoreEffect || 0)} pts`;
+  els.contextDetail.textContent = context.detail || "Broad-market context is observational.";
 }
 
 function isActionableSignal(signal) {
@@ -2922,7 +3192,8 @@ function maybeOptionsAlert() {
 
 function renderLifecycle(signal, confirmed) {
   const activePlanId = state.activePlanIds[state.selectedTimeframe] || "";
-  const journalPlan = state.journalRecent.find((row) => row.id === activePlanId);
+  const journalPlan = state.activePlans.find((row) => row.id === activePlanId)
+    || state.journalRecent.find((row) => row.id === activePlanId);
   const journalActive = journalPlan
     && ["waiting", "entered"].includes(journalPlan.lifecycle_status)
     && ["open", "target1"].includes(journalPlan.outcome_status);
@@ -2931,7 +3202,9 @@ function renderLifecycle(signal, confirmed) {
     button.disabled = !feedbackEnabled;
   });
   if (journalActive) {
-    const label = journalPlan.outcome_status === "target1" ? "T1 hit" : journalPlan.lifecycle_status === "entered" ? "Entered" : "Waiting";
+    const stateLabels = { armed: "Armed", triggered: "Triggered", managing: "Managing", t1_hit: "T1 hit" };
+    const label = stateLabels[journalPlan.tradeState]
+      || (journalPlan.outcome_status === "target1" ? "T1 hit" : journalPlan.lifecycle_status === "entered" ? "Triggered" : "Armed");
     els.lifecycleBadge.textContent = label;
     setTone(els.lifecycleBadge, "positive");
     els.lifecycleDetail.textContent = `${journalPlan.direction.toUpperCase()} ${timeframeLabel(Number(journalPlan.timeframe))} plan: entry ${fmt(Number(journalPlan.entry))}, invalidation ${fmt(Number(journalPlan.stop))}, T1 ${fmt(Number(journalPlan.target1))}.`;
@@ -3009,7 +3282,7 @@ function renderCalibration(signal) {
     : "--";
   els.calibrationExcursion.textContent = "--";
   els.calibrationHoldingTime.textContent = "--";
-  els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.scope || "historical replay"} baseline with a neutral prior.`;
+  els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.sampleType || "historical replay"} ${calibration.scope || "baseline"} with a neutral prior.`;
 }
 
 function render(signal, indicators) {
@@ -3053,9 +3326,11 @@ function render(signal, indicators) {
   els.regimeDetail.textContent = signal.regime?.detail || "--";
   renderBias(signal);
   renderMarketConfirmation(signal);
+  renderBroadMarketContext(signal);
   renderCandidateComparison(signal);
 
-  els.confidenceScore.textContent = `${Number(signal.score || 0)}/100`;
+  const scoreSubject = strongestCandidate(signal) || signal;
+  els.confidenceScore.textContent = `${Number(scoreSubject.score || 0)}/100`;
   renderCalibration(signal);
   const confirmed = signal.direction !== "neutral" && signal.score >= activeTradeThreshold() && !signal.watchOnly;
   renderLifecycle(signal, confirmed);
@@ -3070,6 +3345,14 @@ function render(signal, indicators) {
     <ul class="alert-reasons">${signal.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>
     <ul class="alert-reasons">${signal.exitRules.map((rule) => `<li>${escapeHtml(rule)}</li>`).join("")}</ul>
   `;
+  const contributions = (scoreSubject.scoreContributions || [])
+    .filter((item) => Number(item.points))
+    .sort((a, b) => Math.abs(Number(b.points)) - Math.abs(Number(a.points)))
+    .slice(0, 6);
+  els.scoreDrivers.innerHTML = contributions.length
+    ? contributions.map((item) => `<span class="score-driver ${Number(item.points) > 0 ? "positive" : "negative"}"><b>${Number(item.points) > 0 ? "+" : ""}${escapeHtml(item.points)}</b>${escapeHtml(item.label)}</span>`).join("")
+    : "";
+  els.nextCondition.textContent = nextTradeCondition(signal, scoreSubject);
 
   document.querySelector("#entryLevel").previousElementSibling.textContent = planLabels.entry;
   document.querySelector("#stopLevel").previousElementSibling.textContent = planLabels.stop;
@@ -3082,6 +3365,12 @@ function render(signal, indicators) {
   els.target2Level.textContent = signal.target2 ? fmt(signal.target2) : "--";
   els.exitWarning.textContent = signal.exitWarning || "--";
   els.riskReward.textContent = signal.riskReward ? `1:${fmt(signal.riskReward, 1)}` : "--";
+  const risk = localRiskPlan(confirmed ? signal : null);
+  els.riskQuantity.textContent = risk.quantity == null ? "--" : API_SYMBOL === "BTC-USD" ? fmt(risk.quantity, 6) : String(risk.quantity);
+  els.riskDollars.textContent = money(risk.plannedRisk, 0);
+  els.riskPositionValue.textContent = money(risk.positionValue, 0);
+  els.riskTargetReward.textContent = money(risk.target1Reward, 0);
+  renderActionStrip(signal, latest);
 
   els.vwapMetric.textContent = isDailyTimeframe() ? "--" : fmt(latest.vwap);
   els.smaMetric.textContent = `${fmt(latest.sma20)} / ${fmt(latest.sma50)} / ${fmt(latest.sma150)}`;
@@ -3268,6 +3557,38 @@ async function refreshReplayStats() {
   }
 }
 
+async function refreshPatternStats() {
+  try {
+    const response = await fetch(`/api/pattern/stats?symbol=${encodeURIComponent(API_SYMBOL)}`);
+    if (!response.ok) throw new Error(`pattern stats failed: ${response.status}`);
+    state.patternStats = await response.json();
+    renderPatternValidation();
+  } catch (error) {
+    console.info("Pattern validation stats unavailable.", error);
+  }
+}
+
+function renderPatternValidation() {
+  const rows = state.patternStats?.patterns || [];
+  const tracked = rows.reduce((sum, row) => sum + Number(row.observations || 0), 0);
+  const resolved = rows.reduce((sum, row) => sum + Number(row.resolved || 0), 0);
+  const ranked = rows
+    .filter((row) => Number(row.resolved || 0) >= 5)
+    .sort((a, b) => Number(b.targetRate || 0) - Number(a.targetRate || 0));
+  const best = ranked[0];
+  els.patternTracked.textContent = tracked;
+  els.patternResolved.textContent = resolved;
+  els.patternBest.textContent = best
+    ? `${best.name} · ${fmt(Number(best.targetRate || 0) * 100, 0)}%`
+    : "Building sample";
+  const validated = resolved >= 30;
+  els.patternValidationBadge.textContent = validated ? "Measured" : "Building";
+  setTone(els.patternValidationBadge, validated ? "positive" : "neutral");
+  els.patternValidationDetail.textContent = validated
+    ? "Projection results are measured from regular-session detections."
+    : "Patterns stay descriptive until enough regular-session outcomes resolve.";
+}
+
 function renderReplaySummary(data) {
   const summary = (data.byTimeframe || {})[String(state.selectedTimeframe)] || data.summary || {};
   const resolved = Number(summary.resolved || 0);
@@ -3278,6 +3599,9 @@ function renderReplaySummary(data) {
     els.replayAvgStop.textContent = "--";
     els.replaySamples.textContent = "--";
     els.replayExcursion.textContent = "--";
+    els.replayProfitFactor.textContent = "--";
+    els.replayDrawdown.textContent = "--";
+    els.replayValidation.textContent = data.validation?.status || "Building";
     return;
   }
   els.replayBest.textContent = `${timeframeLabel()} Ready`;
@@ -3288,6 +3612,16 @@ function renderReplaySummary(data) {
   setTone(els.replayAvgStop, expectedR > 0 ? "positive" : expectedR < 0 ? "negative" : "neutral");
   els.replaySamples.textContent = resolved;
   els.replayExcursion.textContent = `${fmt(Number(summary.avgFavorableR || 0), 2)}R / ${fmt(Number(summary.avgAdverseR || 0), 2)}R`;
+  els.replayProfitFactor.textContent = Number.isFinite(Number(summary.profitFactor)) ? fmt(Number(summary.profitFactor), 2) : "--";
+  els.replayDrawdown.textContent = Number.isFinite(Number(summary.maxDrawdownR)) ? `${fmt(Number(summary.maxDrawdownR), 2)}R` : "--";
+  const validation = data.validation || {};
+  const holdout = validation.outOfSample || {};
+  els.replayValidation.textContent = validation.status === "validated"
+    ? `Validated · ${holdout.resolved || 0}`
+    : validation.status === "provisional"
+      ? `Provisional · ${holdout.resolved || 0}`
+      : "Building";
+  setTone(els.replayValidation, validation.status === "validated" ? "positive" : "neutral");
 }
 
 function renderJournalRows() {
@@ -3301,9 +3635,9 @@ function renderJournalRows() {
   });
 
   els.journalRows.innerHTML = rows.slice(0, 30).map((row) => {
-    const time = new Date(Number(row.created_at)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const time = new Date(Number(row.created_at)).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
     return `
-      <tr>
+      <tr class="${row.id === state.selectedJournalPlanId ? "selected" : ""}" data-plan-id="${escapeHtml(row.id)}">
         <td>${time}</td>
         <td>${Number(row.timeframe) === DAILY_TIMEFRAME ? "1D" : `${escapeHtml(row.timeframe)}m`}</td>
         <td class="${row.direction === "long" ? "positive" : "negative"}">${escapeHtml(row.direction)}</td>
@@ -3313,9 +3647,73 @@ function renderJournalRows() {
         <td>${fmt(Number(row.entry))}</td>
         <td>${fmt(Number(row.target1))}</td>
         <td>${fmt(Number(row.stop))}</td>
+        <td class="${Number(row.actual_realized_r) > 0 ? "positive" : Number(row.actual_realized_r) < 0 ? "negative" : ""}">${row.actual_realized_r == null ? "--" : `${Number(row.actual_realized_r) >= 0 ? "+" : ""}${fmt(Number(row.actual_realized_r), 2)}R`}</td>
+        <td><button class="text-button journal-review-button" type="button" data-review-id="${escapeHtml(row.id)}">Review</button></td>
       </tr>
     `;
   }).join("");
+  els.journalRows.querySelectorAll("[data-review-id]").forEach((button) => {
+    button.addEventListener("click", () => selectJournalPlan(button.dataset.reviewId));
+  });
+}
+
+function selectJournalPlan(planId) {
+  const plan = state.journalRecent.find((row) => row.id === planId);
+  if (!plan) return;
+  state.selectedJournalPlanId = planId;
+  els.reviewPlanLabel.textContent = `${timeframeLabel(Number(plan.timeframe))} ${String(plan.direction).toUpperCase()} · ${plan.setup_type || plan.setup}`;
+  els.reviewFill.value = plan.actual_fill ?? "";
+  els.reviewQuantity.value = plan.actual_quantity ?? "";
+  els.reviewExit.value = plan.actual_exit ?? "";
+  els.reviewNotes.value = plan.trader_notes || "";
+  els.saveTradeReview.disabled = false;
+  els.reviewStatus.textContent = plan.review_updated_at ? "Reviewed" : "Ready";
+  setTone(els.reviewStatus, plan.review_updated_at ? "positive" : "neutral");
+  els.reviewSnapshotLink.hidden = !Number(plan.has_snapshot);
+  els.reviewSnapshotLink.href = `/api/journal/snapshot?id=${encodeURIComponent(plan.id)}`;
+  renderJournalRows();
+}
+
+function captureChartSnapshot() {
+  const canvas = document.createElement("canvas");
+  canvas.width = els.canvas.width;
+  canvas.height = els.canvas.height;
+  const context = canvas.getContext("2d");
+  context.drawImage(els.canvas, 0, 0);
+  context.drawImage(els.chartOverlay, 0, 0);
+  return canvas.toDataURL("image/png");
+}
+
+async function saveTradeReview(event) {
+  event.preventDefault();
+  if (!state.selectedJournalPlanId) return;
+  els.saveTradeReview.disabled = true;
+  els.reviewStatus.textContent = "Saving";
+  setTone(els.reviewStatus, "neutral");
+  try {
+    const payload = {
+      id: state.selectedJournalPlanId,
+      actualFill: finiteOrNull(Number(els.reviewFill.value)),
+      actualExit: finiteOrNull(Number(els.reviewExit.value)),
+      actualQuantity: finiteOrNull(Number(els.reviewQuantity.value)),
+      notes: els.reviewNotes.value,
+      chartSnapshot: els.reviewSnapshot.checked ? captureChartSnapshot() : null,
+    };
+    if (!els.reviewFill.value) payload.actualFill = null;
+    if (!els.reviewExit.value) payload.actualExit = null;
+    if (!els.reviewQuantity.value) payload.actualQuantity = null;
+    await postJson("/api/journal/review", payload);
+    await refreshJournalStats(true);
+    selectJournalPlan(state.selectedJournalPlanId);
+    els.reviewStatus.textContent = "Saved";
+    setTone(els.reviewStatus, "positive");
+  } catch (error) {
+    els.reviewStatus.textContent = "Save failed";
+    setTone(els.reviewStatus, "negative");
+    console.info("Trade review save failed.", error);
+  } finally {
+    els.saveTradeReview.disabled = false;
+  }
 }
 
 function sendFeedback(feedback) {
@@ -3348,6 +3746,30 @@ function applyServerRecommendations(payload) {
   if (payload?.optionsOpportunity && typeof payload.optionsOpportunity === "object") {
     state.optionsOpportunity = payload.optionsOpportunity;
   }
+  if (Array.isArray(payload?.activePlans)) {
+    state.activePlans = payload.activePlans;
+    payload.activePlans.forEach((plan) => {
+      state.activePlanIds[Number(plan.timeframe)] = plan.id;
+    });
+  }
+  if (payload?.modelGovernance) {
+    state.modelGovernance = payload.modelGovernance;
+    renderModelGovernance();
+  }
+}
+
+function renderModelGovernance() {
+  const governance = state.modelGovernance;
+  const challenger = governance?.challenger;
+  if (!governance || !challenger) return;
+  els.modelGovernanceBadge.textContent = challenger.status === "shadow" ? "Shadow" : challenger.status;
+  setTone(els.modelGovernanceBadge, challenger.scoreChangesApplied ? "positive" : "neutral");
+  els.modelChampion.textContent = governance.champion?.version || "--";
+  els.modelChallenger.textContent = challenger.version || "--";
+  els.modelSamples.textContent = `${challenger.resolvedForwardSamples || 0} / ${challenger.minimumPromotionSamples || "--"}`;
+  els.modelApplied.textContent = challenger.scoreChangesApplied ? "Approved" : "No";
+  setTone(els.modelApplied, challenger.scoreChangesApplied ? "positive" : "neutral");
+  els.modelGovernanceDetail.textContent = challenger.detail || "Adaptive changes remain in shadow mode.";
 }
 
 function selectTimeframe(timeframe) {
@@ -3554,7 +3976,8 @@ function initializeAssetPage() {
   els.chartSymbol.textContent = ASSET.label;
   els.canvas.setAttribute("aria-label", `${ASSET.label} candlestick, volume, and RSI chart`);
   els.fearGreedTitle.textContent = ASSET_OPTIONS.continuous || ASSET_OPTIONS.market === "tase" ? "CNN US Market Context" : "CNN Fear & Greed";
-  els.marketConfirmationTile.hidden = API_SYMBOL !== "QQQ";
+  els.marketConfirmationTile.hidden = !new Set(["QQQ", "SPY"]).has(API_SYMBOL);
+  els.broadMarketContextTile.hidden = !new Set(["QQQ", "SPY"]).has(API_SYMBOL);
   try {
     state.lastOptionsAlertKey = window.sessionStorage.getItem(OPTIONS_ALERT_STORAGE_KEY) || "";
   } catch (error) {
@@ -3586,6 +4009,7 @@ async function startRealFeed(config) {
   state.providerLabel = providerLabel(config);
   state.providerErrors = Number(config.providerErrors || 0);
   state.providerMessage = String(config.providerMessage || "");
+  state.serverTradeNotifications = config.tradeNotifications || null;
   applyDataHealth(config.dataHealth);
   state.pollIntervalMs = config.pollIntervalMs || 15000;
   state.pollIntervalMs = Number(state.settings.pollIntervalMs || state.pollIntervalMs);
@@ -3603,28 +4027,26 @@ async function startRealFeed(config) {
   }
 
   state.candles = cleanCandles(history.candles);
-  try {
-    await fetchFiveMinuteHistory();
-  } catch (error) {
-    console.info("Native five-minute history unavailable; using resampled one-minute candles.", error);
-    state.fiveMinuteCandles = Core.resample(state.candles, 5);
-  }
-  try {
-    await fetchServerRecommendations();
-  } catch (error) {
-    console.info("Server recommendations are still starting.", error);
-  }
-  try {
-    await fetchDailyHistory();
-  } catch (error) {
-    console.info("Daily history unavailable; using intraday daily aggregation.", error);
-    state.dailyCandles = Core.resampleDaily(state.candles, ASSET_OPTIONS);
-  }
+  state.fiveMinuteCandles = Core.resample(state.candles, 5);
+  state.dailyCandles = Core.resampleDaily(state.candles, ASSET_OPTIONS);
   state.lastTickAt = Date.now();
   state.marketCandleAt = state.candles.at(-1)?.time || null;
   state.providerErrors = Math.max(state.providerErrors, Number(history.providerErrors || 0));
   assessDataQuality();
   els.sessionState.textContent = state.providerErrors ? `${state.providerLabel} provider issue` : `${state.providerLabel} live`;
+  refresh();
+
+  const secondaryRequests = await Promise.allSettled([
+    fetchFiveMinuteHistory(),
+    fetchServerRecommendations(),
+    fetchDailyHistory(),
+  ]);
+  secondaryRequests.forEach((result, index) => {
+    if (result.status === "fulfilled") return;
+    const labels = ["Native five-minute history", "Server recommendations", "Daily history"];
+    console.info(`${labels[index]} unavailable; using the current fallback.`, result.reason);
+  });
+  assessDataQuality();
   refresh();
   startLatestPolling(state.pollIntervalMs);
   startHistorySync();
@@ -3743,6 +4165,36 @@ els.tradeMode.addEventListener("change", () => {
   refresh();
 });
 
+[els.riskAccountSize, els.riskPerTradePct].forEach((input) => {
+  input.addEventListener("change", () => {
+    state.settings.risk.accountSize = Math.max(0, Number(els.riskAccountSize.value || 0));
+    state.settings.risk.riskPerTradePct = clamp(Number(els.riskPerTradePct.value || 0.5), 0.05, 5);
+    saveSettings();
+    refresh();
+  });
+});
+
+function activateHorizon(button) {
+  [els.dayTradeView, els.swingTradeView, els.contextView].forEach((item) => item.classList.toggle("active", item === button));
+}
+
+els.dayTradeView.addEventListener("click", () => {
+  activateHorizon(els.dayTradeView);
+  if (state.selectedTimeframe === DAILY_TIMEFRAME) selectTimeframe(5);
+  document.querySelector(".chart-section").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+els.swingTradeView.addEventListener("click", () => {
+  activateHorizon(els.swingTradeView);
+  selectTimeframe(DAILY_TIMEFRAME);
+  document.querySelector(".swing-summary").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+els.contextView.addEventListener("click", () => {
+  activateHorizon(els.contextView);
+  document.querySelector(".insights-grid").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
 els.sessionMode.addEventListener("change", () => {
   state.settings.sessionMode = els.sessionMode.value;
   state.lastAlertsByTimeframe = {};
@@ -3766,6 +4218,7 @@ els.sessionMode.addEventListener("change", () => {
 });
 
 els.journalFilter.addEventListener("change", renderJournalRows);
+els.tradeReviewForm.addEventListener("submit", saveTradeReview);
 
 els.feedbackTook.addEventListener("click", () => sendFeedback("took"));
 els.feedbackSkipped.addEventListener("click", () => sendFeedback("skipped"));
@@ -3798,6 +4251,12 @@ if ("Notification" in window && Notification.permission === "granted") {
 }
 loadSettings().then(() => {
   refreshJournalStats(true);
+  refreshPatternStats();
+  refreshScanner();
+  refreshSystemHealth();
+  state.scannerTimer = setInterval(refreshScanner, 30_000);
+  setInterval(refreshSystemHealth, 60_000);
+  setInterval(refreshPatternStats, 5 * 60_000);
   fetchFearGreed();
   state.sentimentTimer = setInterval(fetchFearGreed, 5 * 60_000);
   bootFeed();

@@ -32,3 +32,26 @@ groups:
           severity: warning
         annotations:
           summary: VM root disk has less than 15 percent free space
+
+      - alert: TraderHelperBackupIntegrityFailed
+        expr: trader_helper_database_backup_integrity == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Trader Helper has no verified healthy database backup
+
+      - alert: TraderHelperBackupStale
+        expr: trader_helper_database_backup_age_seconds > 129600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Trader Helper database backup is older than 36 hours
+
+      - alert: TraderHelperTradeNotificationFailure
+        expr: increase(trader_helper_trade_notification_failures[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: A server-side trade notification failed

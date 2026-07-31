@@ -4,6 +4,19 @@
   "alertCooldownMinutes": 15,
   "backtestSlippageBps": 0.5,
   "backtestCommissionPerShare": 0.0,
+  "risk": {
+    "accountSize": 0,
+    "riskPerTradePct": 0.5,
+    "maxPositionValuePct": 30,
+    "maxDailyLossPct": 1.5,
+    "maxOpenRiskPct": 1,
+    "maxConsecutiveLosses": 3
+  },
+  "learning": {
+    "mode": "shadow",
+    "minimumPromotionSamples": 120,
+    "autoPromote": false
+  },
   "pollIntervalMs": 15000,
   "mode": "normal",
   "sessionMode": "regular",
