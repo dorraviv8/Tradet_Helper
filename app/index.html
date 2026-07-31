@@ -7,11 +7,11 @@
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23101214'/%3E%3Cpath d='M7 21l5-5 4 4 8-10' fill='none' stroke='%232fd17c' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
-  <body>
+  <body data-horizon="day">
     <header class="topbar">
       <div class="brand-block">
-        <p id="brandEyebrow" class="eyebrow">QQQ alert assistant</p>
-        <h1>Technical trend alerts</h1>
+        <p id="brandEyebrow" class="eyebrow">QQQ market</p>
+        <h1>Trader Helper</h1>
       </div>
       <nav class="asset-switcher" aria-label="Market selector">
         <label class="asset-selector-label" for="assetSelector">Market</label>
@@ -22,9 +22,14 @@
           <option value="TA125">TA-125 · Tel Aviv 125</option>
         </select>
       </nav>
-      <div class="market-clock">
-        <span id="sessionState">Starting market feed</span>
-        <strong id="clock">--:--:--</strong>
+      <div class="topbar-status">
+        <button id="alertCenterButton" class="status-button" type="button" aria-label="Open alert center">
+          Alerts <span id="alertCenterCount">0</span>
+        </button>
+        <div class="market-clock">
+          <span id="sessionState">Starting market feed</span>
+          <strong id="clock">--:--:--</strong>
+        </div>
       </div>
     </header>
 
@@ -34,22 +39,23 @@
         <strong id="actionNow">Loading market analysis</strong>
         <span id="actionDetail">Waiting for current candles and server recommendations.</span>
       </div>
-      <div class="decision-metric">
+      <div class="decision-metric decision-data">
         <span>Data</span>
         <strong id="actionData">Checking</strong>
       </div>
-      <div class="decision-metric">
+      <div class="decision-metric decision-distance">
         <span>Entry distance</span>
         <strong id="actionDistance">--</strong>
       </div>
-      <div class="decision-metric">
+      <div class="decision-metric decision-risk">
         <span>Planned risk</span>
         <strong id="actionRisk">Not configured</strong>
       </div>
-      <div class="horizon-control segmented-control" aria-label="Trading horizon">
-        <button id="dayTradeView" class="horizon-button active" type="button">Day trade</button>
-        <button id="swingTradeView" class="horizon-button" type="button">Swing</button>
-        <button id="contextView" class="horizon-button" type="button">Context</button>
+      <div class="horizon-control segmented-control" role="tablist" aria-label="Workspace view">
+        <button id="dayTradeView" class="horizon-button active" type="button" role="tab" aria-controls="marketWorkspace" aria-selected="true">Day trade</button>
+        <button id="swingTradeView" class="horizon-button" type="button" role="tab" aria-controls="marketWorkspace" aria-selected="false">Swing</button>
+        <button id="contextView" class="horizon-button" type="button" role="tab" aria-controls="marketWorkspace" aria-selected="false">Context</button>
+        <button id="journalView" class="horizon-button" type="button" role="tab" aria-controls="journalViewPanel" aria-selected="false">Journal</button>
       </div>
     </section>
 
@@ -78,10 +84,6 @@
           <div id="bestSwingDetail" class="swing-callout" aria-live="polite">
             Evaluating closed daily momentum and structure.
           </div>
-          <p class="swing-target-rationale">
-            <strong>Target logic</strong>
-            <span id="bestSwingRationale">Waiting for a daily setup with enough structure and momentum.</span>
-          </p>
           <button id="bestSwingView" class="text-button swing-view-button" type="button" hidden>View 1D chart</button>
         </div>
         <dl class="swing-levels" aria-label="Best swing price levels">
@@ -103,6 +105,10 @@
           </div>
         </dl>
       </div>
+      <details class="swing-rationale-details">
+        <summary>Target rationale</summary>
+        <p id="bestSwingRationale">Waiting for a daily setup with enough structure and momentum.</p>
+      </details>
     </section>
 
     <section class="market-scanner" aria-labelledby="scannerTitle">
@@ -169,7 +175,7 @@
       </div>
     </section>
 
-    <main class="workspace">
+    <main id="marketWorkspace" class="workspace">
       <section class="chart-section">
         <div class="chart-toolbar">
           <div class="symbol-block">
@@ -179,75 +185,89 @@
           </div>
 
           <div class="controls" aria-label="Chart controls">
-            <div class="segmented-control" aria-label="Candle timeframe">
-              <button class="timeframe-button active" type="button" data-timeframe="1">1m</button>
-              <button class="timeframe-button" type="button" data-timeframe="5">5m</button>
-              <button class="timeframe-button" type="button" data-timeframe="15">15m</button>
-              <button class="timeframe-button" type="button" data-timeframe="1440">1D</button>
+            <div class="segmented-control timeframe-control" role="tablist" aria-label="Candle timeframe">
+              <button class="timeframe-button active" type="button" role="tab" aria-controls="priceChart" aria-selected="true" data-timeframe="1">1m</button>
+              <button class="timeframe-button" type="button" role="tab" aria-controls="priceChart" aria-selected="false" data-timeframe="5">5m</button>
+              <button class="timeframe-button" type="button" role="tab" aria-controls="priceChart" aria-selected="false" data-timeframe="15">15m</button>
+              <button class="timeframe-button" type="button" role="tab" aria-controls="priceChart" aria-selected="false" data-timeframe="1440">1D</button>
             </div>
             <div class="chart-navigation" aria-label="Chart navigation">
               <button id="panOlderButton" class="icon-button chart-nav-button" type="button" title="Show older candles" aria-label="Show older candles">&#8592;</button>
               <button id="zoomOutButton" class="icon-button chart-nav-button" type="button" title="Zoom out" aria-label="Zoom out">&#8722;</button>
               <button id="zoomInButton" class="icon-button chart-nav-button" type="button" title="Zoom in" aria-label="Zoom in">+</button>
               <button id="panNewerButton" class="icon-button chart-nav-button" type="button" title="Move candles left and add future space" aria-label="Move candles left and add future space">&#8594;</button>
-              <button id="liveViewButton" class="control-button live-view-button" type="button" title="Return to the latest candles at the default zoom">Live View</button>
+              <button id="liveViewButton" class="control-button live-view-button" type="button" title="Return to the latest candles at the default zoom">Live</button>
               <span id="chartWindowLabel" class="chart-window-label" aria-live="polite">Live</span>
             </div>
-            <button id="graphRefreshButton" class="control-button graph-refresh-button" type="button" title="Fetch latest market data and redraw the chart">Graph Refresh</button>
-            <button id="patternsToggle" class="control-button" type="button" title="Toggle chart pattern overlay">Patterns</button>
-            <button id="notifyButton" class="control-button" type="button">Browser alerts</button>
+            <button id="graphRefreshButton" class="control-button graph-refresh-button" type="button" title="Fetch latest market data and redraw the chart" aria-label="Refresh chart"><span aria-hidden="true">&#8635;</span><span class="button-label">Refresh</span></button>
+            <button id="patternsToggle" class="control-button" type="button" title="Toggle chart pattern overlay" aria-pressed="false">Patterns</button>
+            <details class="chart-settings-menu">
+              <summary class="control-button">Indicators</summary>
+              <div class="chart-options" aria-label="Chart layer controls">
+                <label>
+                  <input id="layerMAs" type="checkbox" checked />
+                  MAs
+                </label>
+                <label id="vwapLayerControl" title="Toggle session VWAP">
+                  <input id="layerVwap" type="checkbox" checked />
+                  <span id="vwapLayerLabel">VWAP</span>
+                </label>
+                <label>
+                  <input id="layerLevels" type="checkbox" checked />
+                  Levels
+                </label>
+                <label>
+                  <input id="layerMarkers" type="checkbox" checked />
+                  Markers
+                </label>
+                <label>
+                  <input id="layerVolume" type="checkbox" checked />
+                  Volume
+                </label>
+                <label>
+                  <input id="layerRsi" type="checkbox" checked />
+                  RSI
+                </label>
+                <label>
+                  Mode
+                  <select id="tradeMode" aria-label="Signal mode">
+                    <option value="scalp">Scalp</option>
+                    <option value="normal" selected>Normal</option>
+                    <option value="strict">Strict</option>
+                  </select>
+                </label>
+                <label>
+                  Session
+                  <select id="sessionMode" aria-label="Chart session">
+                    <option value="regular" selected>Regular hours</option>
+                    <option value="extended">Extended hours</option>
+                  </select>
+                </label>
+                <button id="notifyButton" class="control-button indicator-alert-button" type="button" aria-pressed="false">Browser alerts</button>
+              </div>
+            </details>
           </div>
-        </div>
-
-        <div class="chart-options" aria-label="Chart layer controls">
-          <label>
-            <input id="layerMAs" type="checkbox" checked />
-            MAs
-          </label>
-          <label id="vwapLayerControl" title="Toggle session VWAP">
-            <input id="layerVwap" type="checkbox" checked />
-            <span id="vwapLayerLabel">VWAP</span>
-          </label>
-          <label>
-            <input id="layerLevels" type="checkbox" checked />
-            Levels
-          </label>
-          <label>
-            <input id="layerMarkers" type="checkbox" checked />
-            Markers
-          </label>
-          <label>
-            <input id="layerVolume" type="checkbox" checked />
-            Volume
-          </label>
-          <label>
-            <input id="layerRsi" type="checkbox" checked />
-            RSI
-          </label>
-          <label>
-            Mode
-            <select id="tradeMode">
-              <option value="scalp">Scalp</option>
-              <option value="normal" selected>Normal</option>
-              <option value="strict">Strict</option>
-            </select>
-          </label>
-          <label>
-            Session
-            <select id="sessionMode">
-              <option value="regular" selected>Regular hours</option>
-              <option value="extended">Extended hours</option>
-            </select>
-          </label>
         </div>
 
         <div class="chart-canvas-wrap">
           <canvas id="priceChart" width="1200" height="620" aria-label="QQQ candlestick, volume, and RSI chart"></canvas>
           <canvas id="chartOverlay" width="1200" height="620" aria-hidden="true"></canvas>
+          <aside id="chartPriceLadder" class="chart-price-ladder" aria-label="Active trade price levels" hidden>
+            <div class="ladder-entry"><span>Entry</span><strong id="ladderEntry">--</strong></div>
+            <div class="ladder-stop"><span>Stop</span><strong id="ladderStop">--</strong></div>
+            <div class="ladder-target"><span>T1</span><strong id="ladderTarget1">--</strong></div>
+            <div class="ladder-target"><span>T2</span><strong id="ladderTarget2">--</strong></div>
+          </aside>
         </div>
 
-        <div class="insights-grid" aria-label="Market context and system diagnostics">
-          <section class="insight-tile sentiment-tile">
+        <div id="insightsGrid" class="insights-grid" aria-label="Market context and system diagnostics">
+          <div class="insights-tabs" role="tablist" aria-label="Analysis category">
+            <button class="insight-tab active" type="button" role="tab" aria-controls="insightsGrid" aria-selected="true" data-insight-group="market">Market Context</button>
+            <button class="insight-tab" type="button" role="tab" aria-controls="insightsGrid" aria-selected="false" data-insight-group="validation">Signal Validation</button>
+            <button class="insight-tab" type="button" role="tab" aria-controls="insightsGrid" aria-selected="false" data-insight-group="performance">Performance</button>
+            <button class="insight-tab" type="button" role="tab" aria-controls="insightsGrid" aria-selected="false" data-insight-group="system">System Health</button>
+          </div>
+          <section class="insight-tile sentiment-tile" data-insight-panel="market">
             <div class="section-heading">
               <h2 id="fearGreedTitle">CNN Fear &amp; Greed</h2>
               <span id="fearGreedBadge" class="badge neutral">Loading</span>
@@ -278,7 +298,7 @@
             <p class="tile-footnote"><span id="fearGreedUpdated">Not loaded</span> · <a href="https://www.cnn.com/markets/fear-and-greed" target="_blank" rel="noreferrer">CNN source</a></p>
           </section>
 
-          <section class="insight-tile">
+          <section class="insight-tile" data-insight-panel="market">
             <div class="section-heading">
               <h2>Trend State</h2>
               <span id="trendBadge" class="badge neutral">Loading</span>
@@ -290,7 +310,7 @@
             </div>
           </section>
 
-          <section class="insight-tile">
+          <section class="insight-tile" data-insight-panel="market">
             <div class="section-heading">
               <h2>General Trend</h2>
               <span id="generalTrendBadge" class="badge neutral">Loading</span>
@@ -303,7 +323,7 @@
             </div>
           </section>
 
-          <section class="insight-tile">
+          <section class="insight-tile" data-insight-panel="market">
             <div class="section-heading">
               <h2>Market Regime</h2>
               <span id="regimeBadge" class="badge neutral">Loading</span>
@@ -311,7 +331,7 @@
             <div class="tile-readout"><span id="regimeDetail">--</span></div>
           </section>
 
-          <section class="insight-tile">
+          <section class="insight-tile" data-insight-panel="market">
             <div class="section-heading">
               <h2>Long / Short Bias</h2>
               <span id="biasBadge" class="badge neutral">Mixed</span>
@@ -320,7 +340,7 @@
             <div class="bias-labels"><span>Short</span><strong id="biasScore">0</strong><span>Long</span></div>
           </section>
 
-          <section id="marketConfirmationTile" class="insight-tile" hidden>
+          <section id="marketConfirmationTile" class="insight-tile" data-insight-panel="market" hidden>
             <div class="section-heading">
               <h2>QQQ vs SPY</h2>
               <span id="marketConfirmationBadge" class="badge neutral">Building</span>
@@ -333,7 +353,7 @@
             <p id="marketConfirmationDetail" class="tile-footnote">Waiting for SPY confirmation.</p>
           </section>
 
-          <section id="broadMarketContextTile" class="insight-tile" hidden>
+          <section id="broadMarketContextTile" class="insight-tile" data-insight-panel="market" hidden>
             <div class="section-heading">
               <h2>VIX &amp; Breadth</h2>
               <span id="broadMarketContextBadge" class="badge neutral">Building</span>
@@ -347,7 +367,7 @@
             <p id="contextDetail" class="tile-footnote">Context is loading.</p>
           </section>
 
-          <section class="insight-tile">
+          <section class="insight-tile" data-insight-panel="system">
             <div class="section-heading">
               <h2>Provider Health</h2>
               <span id="providerHealthBadge" class="badge neutral">Loading</span>
@@ -365,7 +385,7 @@
             </div>
           </section>
 
-          <section class="insight-tile insight-wide">
+          <section id="journalStatsTile" class="insight-tile insight-wide" data-insight-panel="performance" hidden>
             <div class="section-heading">
               <h2>Journal Stats</h2>
               <span id="journalTotal" class="score">0</span>
@@ -384,7 +404,12 @@
             </div>
           </section>
 
-          <section class="insight-tile">
+          <section id="performanceEmptyState" class="insight-empty" data-insight-panel="performance">
+            <strong>No completed trade history yet</strong>
+            <span>Journal statistics appear after plans are recorded and resolved.</span>
+          </section>
+
+          <section id="replayTile" class="insight-tile" data-insight-panel="validation" hidden>
             <div class="section-heading">
               <h2>Historical Replay</h2>
               <span id="replayBest" class="badge neutral">Building</span>
@@ -400,7 +425,7 @@
             </div>
           </section>
 
-          <section class="insight-tile">
+          <section class="insight-tile" data-insight-panel="system">
             <div class="section-heading">
               <h2>Model Governance</h2>
               <span id="modelGovernanceBadge" class="badge neutral">Building</span>
@@ -414,7 +439,7 @@
             <p id="modelGovernanceDetail" class="tile-footnote">Adaptive changes remain in shadow mode.</p>
           </section>
 
-          <section class="insight-tile">
+          <section id="patternValidationTile" class="insight-tile" data-insight-panel="validation" hidden>
             <div class="section-heading">
               <h2>Pattern Validation</h2>
               <span id="patternValidationBadge" class="badge neutral">Building</span>
@@ -427,7 +452,12 @@
             <p id="patternValidationDetail" class="tile-footnote">Patterns stay descriptive until outcomes resolve.</p>
           </section>
 
-          <section class="insight-tile insight-full alert-log-block">
+          <section id="validationEmptyState" class="insight-empty" data-insight-panel="validation">
+            <strong>Validation sample is still building</strong>
+            <span>Replay and pattern results appear after enough setups have resolved.</span>
+          </section>
+
+          <section class="insight-tile insight-full alert-log-block" data-insight-panel="system">
             <div class="section-heading">
               <h2>Alert Log</h2>
               <button id="clearLog" class="text-button" type="button">Clear</button>
@@ -437,73 +467,47 @@
         </div>
       </section>
 
-      <aside class="side-panel">
-        <section class="panel-block">
-          <div class="section-heading">
-            <h2>Best Day Trade</h2>
-            <span id="bestOpportunityBadge" class="badge neutral">Scanning</span>
+      <aside id="tradeDecisionPanel" class="side-panel" aria-label="Trade decision">
+        <section class="panel-block trade-decision-panel">
+          <div class="section-heading decision-panel-heading">
+            <div>
+              <span class="eyebrow">Selected timeframe</span>
+              <h2>Trade Decision</h2>
+            </div>
+            <div class="decision-panel-actions">
+              <span id="bestOpportunityBadge" class="badge neutral">Scanning</span>
+              <button id="mobilePlanClose" class="icon-button mobile-plan-close" type="button" aria-label="Close trade decision">&#215;</button>
+            </div>
           </div>
           <div id="bestOpportunityDetail" class="mini-readout" aria-live="polite">
             Evaluating 1m, 5m, and 15m momentum setups.
           </div>
           <button id="bestOpportunityView" class="text-button best-opportunity-view" type="button" hidden>View chart</button>
-        </section>
 
-        <section class="panel-block">
-          <div class="section-heading">
-            <h2>Active Alert</h2>
-            <span id="confidenceScore" class="score" title="Rule-based setup quality, not a probability">--</span>
+          <div class="signal-gates" aria-label="Signal activation gates">
+            <div><span>Setup quality</span><strong id="confidenceScore" class="score" title="Rule-based setup quality, not a probability">--</strong></div>
+            <div><span>Activation</span><strong id="activationState">Waiting</strong></div>
+            <div><span>Blocking gate</span><strong id="activationGate">Building signal</strong></div>
           </div>
+
           <div id="activeAlert" class="active-alert" aria-live="polite">
             Waiting for enough candles.
           </div>
           <div id="scoreDrivers" class="score-drivers"></div>
           <p id="nextCondition" class="next-condition">Waiting for an activation condition.</p>
-        </section>
 
-        <section class="panel-block">
-          <div class="section-heading">
-            <h2>Model Confidence</h2>
-            <span id="calibrationBadge" class="badge neutral">Building</span>
-          </div>
-            <div class="diagnostic-list">
-            <div><span>Live T1 rate</span><strong id="calibrationProbability">--</strong></div>
-            <div><span>Live expected R</span><strong id="calibrationExpectedR">--</strong></div>
-            <div><span>Live samples</span><strong id="calibrationSamples">--</strong></div>
-            <div><span>Live T1 range</span><strong id="calibrationRange">--</strong></div>
-            <div><span>Average MFE / MAE</span><strong id="calibrationExcursion">--</strong></div>
-            <div><span>Average resolved time</span><strong id="calibrationHoldingTime">--</strong></div>
-            </div>
-          <p id="calibrationScope" class="tile-footnote">Waiting for automatically resolved comparable plans.</p>
-        </section>
-
-        <section class="panel-block">
-          <div class="section-heading">
-            <h2>Trade Plan</h2>
+          <div class="section-heading trade-plan-heading">
+            <h3>Price Plan</h3>
             <span id="riskReward">--</span>
           </div>
           <dl class="trade-plan">
-            <div>
-              <dt>Entry trigger</dt>
-              <dd id="entryLevel">--</dd>
-            </div>
-            <div>
-              <dt>Invalidation</dt>
-              <dd id="stopLevel">--</dd>
-            </div>
-            <div>
-              <dt>Target 1</dt>
-              <dd id="targetLevel">--</dd>
-            </div>
-            <div>
-              <dt>Target 2</dt>
-              <dd id="target2Level">--</dd>
-            </div>
-            <div>
-              <dt>Exit warning</dt>
-              <dd id="exitWarning">--</dd>
-            </div>
+            <div><dt>Entry trigger</dt><dd id="entryLevel">--</dd></div>
+            <div><dt>Invalidation</dt><dd id="stopLevel">--</dd></div>
+            <div><dt>Target 1</dt><dd id="targetLevel">--</dd></div>
+            <div><dt>Target 2</dt><dd id="target2Level">--</dd></div>
+            <div><dt>Exit warning</dt><dd id="exitWarning">--</dd></div>
           </dl>
+
           <div class="risk-summary">
             <label><span>Account size</span><input id="riskAccountSize" type="number" min="0" step="1000" inputmode="decimal" placeholder="Set amount" /></label>
             <label><span>Risk / trade</span><input id="riskPerTradePct" type="number" min="0.05" max="5" step="0.05" inputmode="decimal" /></label>
@@ -512,6 +516,12 @@
             <div><span>Position value</span><strong id="riskPositionValue">--</strong></div>
             <div><span>T1 reward</span><strong id="riskTargetReward">--</strong></div>
           </div>
+
+          <div class="lifecycle-inline">
+            <span>Lifecycle</span>
+            <strong id="lifecycleBadge" class="badge neutral">Idle</strong>
+            <p id="lifecycleDetail" aria-live="polite">No active plan is waiting for entry.</p>
+          </div>
           <div class="feedback-actions" aria-label="Trade feedback">
             <button id="feedbackTook" class="text-button" type="button">Took</button>
             <button id="feedbackSkipped" class="text-button" type="button">Skipped</button>
@@ -519,31 +529,35 @@
           </div>
         </section>
 
-        <section class="panel-block">
-          <div class="section-heading">
-            <h2>Lifecycle</h2>
-            <span id="lifecycleBadge" class="badge neutral">Idle</span>
+        <details class="panel-disclosure">
+          <summary><span>Model Confidence</span><span id="calibrationBadge" class="badge neutral">Building</span></summary>
+          <div class="panel-disclosure-body">
+            <div class="diagnostic-list">
+              <div><span>Live T1 rate</span><strong id="calibrationProbability">--</strong></div>
+              <div><span>Live expected R</span><strong id="calibrationExpectedR">--</strong></div>
+              <div><span>Live samples</span><strong id="calibrationSamples">--</strong></div>
+              <div><span>Live T1 range</span><strong id="calibrationRange">--</strong></div>
+              <div><span>Average MFE / MAE</span><strong id="calibrationExcursion">--</strong></div>
+              <div><span>Average resolved time</span><strong id="calibrationHoldingTime">--</strong></div>
+            </div>
+            <p id="calibrationScope" class="tile-footnote">Waiting for automatically resolved comparable plans.</p>
           </div>
-          <div class="mini-readout" aria-live="polite">
-            <span id="lifecycleDetail">No active plan is waiting for entry.</span>
-          </div>
-        </section>
+        </details>
 
-        <section class="panel-block">
-          <div class="section-heading">
-            <h2>Why No Trade</h2>
-            <span id="bestSideBadge" class="badge neutral">--</span>
-          </div>
-          <div id="whyRejected" class="compare-grid"></div>
-        </section>
-
+        <details class="panel-disclosure">
+          <summary><span>Why No Trade</span><span id="bestSideBadge" class="badge neutral">--</span></summary>
+          <div id="whyRejected" class="compare-grid panel-disclosure-body"></div>
+        </details>
       </aside>
     </main>
 
-    <section class="journal-band">
+    <section id="journalViewPanel" class="journal-band" aria-labelledby="journalTitle" hidden>
       <div class="section-heading">
-        <h2>Journal</h2>
-        <select id="journalFilter">
+        <div>
+          <p class="eyebrow">Execution review</p>
+          <h2 id="journalTitle">Trade Journal</h2>
+        </div>
+        <select id="journalFilter" aria-label="Filter journal entries">
           <option value="all">All</option>
           <option value="long">Long</option>
           <option value="short">Short</option>
@@ -622,6 +636,11 @@
     <footer class="disclaimer">
       Alerts are educational decision support only. They do not place trades and do not guarantee outcomes.
     </footer>
+
+    <button id="mobilePlanButton" class="mobile-plan-button" type="button" aria-controls="tradeDecisionPanel" aria-expanded="false">
+      <span>Trade decision</span>
+      <strong id="mobilePlanState">No active trade</strong>
+    </button>
 
     <script src="./market-core.js"></script>
     <script src="./pattern-engine.js"></script>

@@ -8,18 +8,18 @@ const ASSETS = {
 };
 const SUPPORTED_SYMBOLS = new Set(Object.keys(ASSETS));
 const requestedSymbol = new URLSearchParams(window.location.search).get("symbol")?.toUpperCase();
-const API_SYMBOL = SUPPORTED_SYMBOLS.has(requestedSymbol) ? requestedSymbol : "QQQ";
-const ASSET = ASSETS[API_SYMBOL];
-const ASSET_OPTIONS = {
+let API_SYMBOL = SUPPORTED_SYMBOLS.has(requestedSymbol) ? requestedSymbol : "QQQ";
+let ASSET = ASSETS[API_SYMBOL];
+let ASSET_OPTIONS = {
   continuous: Boolean(ASSET.continuous),
   market: ASSET.market,
   hasReliableIntradayVolume: ASSET.hasReliableIntradayVolume !== false,
 };
-const SETTINGS_KEY = `trader-helper-settings:${API_SYMBOL}`;
+let SETTINGS_KEY = `trader-helper-settings:${API_SYMBOL}`;
 const STRATEGY_VERSION = "6.0.0";
 const ALERT_TIMEFRAMES = [1, 5, 15, 1440];
 const DAILY_TIMEFRAME = 1440;
-const OPTIONS_ALERT_STORAGE_KEY = `trader-helper-options-alert:${API_SYMBOL}`;
+let OPTIONS_ALERT_STORAGE_KEY = `trader-helper-options-alert:${API_SYMBOL}`;
 
 const state = {
   candles: [],
@@ -59,6 +59,10 @@ const state = {
       maxOpenRiskPct: 1,
       maxConsecutiveLosses: 3,
     },
+    ui: {
+      horizon: "day",
+      insightGroup: "market",
+    },
   },
   lastStatsAt: 0,
   activePlanIds: {},
@@ -74,6 +78,7 @@ const state = {
   modelGovernance: null,
   patternStats: null,
   serverTradeNotifications: null,
+  systemFindingCount: 0,
   scannerTimer: null,
   selectedJournalPlanId: "",
   optionsOpportunity: null,
@@ -90,6 +95,8 @@ const state = {
   historySyncTimer: null,
   historySyncPending: false,
   graphRefreshPending: false,
+  assetSwitchPending: false,
+  marketRequestController: new AbortController(),
   notifyEnabled: false,
   currentPattern: null,
   currentPatternKey: "",
@@ -103,6 +110,16 @@ const state = {
   chartInteractionFrame: null,
   suppressChartClick: false,
 };
+
+const DEFAULT_SETTINGS = JSON.parse(JSON.stringify(state.settings));
+
+function marketFetch(url, options = {}) {
+  return fetch(url, { ...options, signal: state.marketRequestController.signal });
+}
+
+function isCurrentAsset(symbol) {
+  return symbol === API_SYMBOL;
+}
 
 const els = {
   canvas: document.getElementById("priceChart"),
@@ -120,6 +137,11 @@ const els = {
   dayTradeView: document.getElementById("dayTradeView"),
   swingTradeView: document.getElementById("swingTradeView"),
   contextView: document.getElementById("contextView"),
+  journalView: document.getElementById("journalView"),
+  journalViewPanel: document.getElementById("journalViewPanel"),
+  marketWorkspace: document.getElementById("marketWorkspace"),
+  alertCenterButton: document.getElementById("alertCenterButton"),
+  alertCenterCount: document.getElementById("alertCenterCount"),
   scannerBest: document.getElementById("scannerBest"),
   scannerMarkets: document.getElementById("scannerMarkets"),
   brandEyebrow: document.getElementById("brandEyebrow"),
@@ -136,7 +158,10 @@ const els = {
   chartWindowLabel: document.getElementById("chartWindowLabel"),
   patternsToggle: document.getElementById("patternsToggle"),
   notifyButton: document.getElementById("notifyButton"),
+  chartSettingsMenu: document.querySelector(".chart-settings-menu"),
   timeframeButtons: [...document.querySelectorAll(".timeframe-button")],
+  insightTabs: [...document.querySelectorAll(".insight-tab")],
+  insightsGrid: document.querySelector(".insights-grid"),
   layerMAs: document.getElementById("layerMAs"),
   layerVwap: document.getElementById("layerVwap"),
   vwapLayerControl: document.getElementById("vwapLayerControl"),
@@ -229,6 +254,8 @@ const els = {
   optionsTargets: document.getElementById("optionsTargets"),
   optionsTargetsLabel: document.getElementById("optionsTargetsLabel"),
   confidenceScore: document.getElementById("confidenceScore"),
+  activationState: document.getElementById("activationState"),
+  activationGate: document.getElementById("activationGate"),
   calibrationBadge: document.getElementById("calibrationBadge"),
   calibrationProbability: document.getElementById("calibrationProbability"),
   calibrationExpectedR: document.getElementById("calibrationExpectedR"),
@@ -252,6 +279,11 @@ const els = {
   targetLevel: document.getElementById("targetLevel"),
   target2Level: document.getElementById("target2Level"),
   exitWarning: document.getElementById("exitWarning"),
+  chartPriceLadder: document.getElementById("chartPriceLadder"),
+  ladderEntry: document.getElementById("ladderEntry"),
+  ladderStop: document.getElementById("ladderStop"),
+  ladderTarget1: document.getElementById("ladderTarget1"),
+  ladderTarget2: document.getElementById("ladderTarget2"),
   lifecycleBadge: document.getElementById("lifecycleBadge"),
   lifecycleDetail: document.getElementById("lifecycleDetail"),
   bestSideBadge: document.getElementById("bestSideBadge"),
@@ -264,6 +296,8 @@ const els = {
   rvolMetric: document.getElementById("rvolMetric"),
   alertLog: document.getElementById("alertLog"),
   clearLog: document.getElementById("clearLog"),
+  journalStatsTile: document.getElementById("journalStatsTile"),
+  performanceEmptyState: document.getElementById("performanceEmptyState"),
   journalTotal: document.getElementById("journalTotal"),
   journalTargets: document.getElementById("journalTargets"),
   journalStops: document.getElementById("journalStops"),
@@ -275,6 +309,7 @@ const els = {
   journalExpectancy: document.getElementById("journalExpectancy"),
   journalBestSetup: document.getElementById("journalBestSetup"),
   journalBestTimeframe: document.getElementById("journalBestTimeframe"),
+  replayTile: document.getElementById("replayTile"),
   replayBest: document.getElementById("replayBest"),
   replayAvgTarget: document.getElementById("replayAvgTarget"),
   replayAvgStop: document.getElementById("replayAvgStop"),
@@ -289,6 +324,8 @@ const els = {
   modelSamples: document.getElementById("modelSamples"),
   modelApplied: document.getElementById("modelApplied"),
   modelGovernanceDetail: document.getElementById("modelGovernanceDetail"),
+  patternValidationTile: document.getElementById("patternValidationTile"),
+  validationEmptyState: document.getElementById("validationEmptyState"),
   patternValidationBadge: document.getElementById("patternValidationBadge"),
   patternTracked: document.getElementById("patternTracked"),
   patternResolved: document.getElementById("patternResolved"),
@@ -309,6 +346,10 @@ const els = {
   reviewSnapshot: document.getElementById("reviewSnapshot"),
   saveTradeReview: document.getElementById("saveTradeReview"),
   reviewSnapshotLink: document.getElementById("reviewSnapshotLink"),
+  mobilePlanButton: document.getElementById("mobilePlanButton"),
+  mobilePlanState: document.getElementById("mobilePlanState"),
+  mobilePlanClose: document.getElementById("mobilePlanClose"),
+  sidePanel: document.querySelector(".side-panel"),
 };
 
 function activeTradeThreshold() {
@@ -448,9 +489,7 @@ function renderScanner(data) {
   }).join("");
   els.scannerMarkets.querySelectorAll("[data-symbol]").forEach((button) => {
     button.addEventListener("click", () => {
-      const url = new URL(window.location.href);
-      url.searchParams.set("symbol", button.dataset.symbol);
-      window.location.assign(url);
+      switchAsset(button.dataset.symbol);
     });
   });
 }
@@ -471,12 +510,23 @@ async function refreshSystemHealth() {
     if (!response.ok) throw new Error(`system health failed: ${response.status}`);
     const health = await response.json();
     const findings = health.findings || [];
+    state.systemFindingCount = findings.length;
     els.systemBanner.hidden = !findings.length;
+    els.alertCenterCount.textContent = String(state.systemFindingCount + state.alerts.length);
+    els.alertCenterButton.classList.toggle("negative", findings.some((item) => item.severity === "critical"));
     if (!findings.length) return;
-    const critical = findings.find((item) => item.severity === "critical") || findings[0];
-    els.systemBannerTitle.textContent = `${findings.length} system issue${findings.length === 1 ? "" : "s"}`;
-    els.systemBannerDetail.textContent = critical.message;
-    els.systemBanner.classList.toggle("critical", critical.severity === "critical");
+    const selectedFindings = findings.filter((item) => String(item.key || "").startsWith(`${API_SYMBOL}:`));
+    const relevant = selectedFindings.find((item) => item.severity === "critical") || selectedFindings[0];
+    const fallback = findings.find((item) => item.severity === "critical") || findings[0];
+    const displayed = relevant || fallback;
+    els.systemBanner.classList.toggle("global", !relevant);
+    els.systemBanner.classList.toggle("critical", Boolean(relevant && displayed.severity === "critical"));
+    els.systemBannerTitle.textContent = relevant
+      ? `${ASSET.label} data issue`
+      : `${findings.length} other market issue${findings.length === 1 ? "" : "s"}`;
+    els.systemBannerDetail.textContent = relevant
+      ? displayed.message.replace(`${API_SYMBOL}: `, "")
+      : `${ASSET.label} is not affected. Review system monitoring for details.`;
   } catch (error) {
     console.info("System health banner unavailable.", error);
   }
@@ -521,6 +571,7 @@ function saveSettings() {
     sessionMode: state.settings.sessionMode,
     chartLayers: state.settings.chartLayers,
     risk: state.settings.risk,
+    ui: state.settings.ui,
   }));
 }
 
@@ -540,8 +591,12 @@ function syncSettingsControls() {
   els.layerVolume.checked = Boolean(state.settings.chartLayers.volume);
   els.layerRsi.checked = Boolean(state.settings.chartLayers.rsi);
   els.patternsToggle.classList.toggle("active", Boolean(state.settings.chartLayers.patterns));
+  els.patternsToggle.setAttribute("aria-pressed", String(Boolean(state.settings.chartLayers.patterns)));
+  els.notifyButton.setAttribute("aria-pressed", String(Boolean(state.notifyEnabled)));
   els.riskAccountSize.value = Number(state.settings.risk?.accountSize || 0) || "";
   els.riskPerTradePct.value = Number(state.settings.risk?.riskPerTradePct || 0.5);
+  activateHorizon(state.settings.ui?.horizon || "day", { persist: false, scroll: false });
+  activateInsightGroup(state.settings.ui?.insightGroup || "market", { persist: false });
 }
 
 function syncVwapControl() {
@@ -3333,6 +3388,25 @@ function render(signal, indicators) {
   els.confidenceScore.textContent = `${Number(scoreSubject.score || 0)}/100`;
   renderCalibration(signal);
   const confirmed = signal.direction !== "neutral" && signal.score >= activeTradeThreshold() && !signal.watchOnly;
+  const dataBlocked = state.dataHealth?.tradeAllowed === false;
+  const candidateGate = scoreSubject?.reasons?.find((reason) => /wait|wide|weak|opposes|confirm|chasing|paused|quality|risk/i.test(reason));
+  const activationLabel = dataBlocked
+    ? "Blocked"
+    : confirmed
+      ? "Armed"
+      : scoreSubject?.direction === "long" || scoreSubject?.direction === "short"
+        ? "Watch"
+        : "No setup";
+  const activationGate = dataBlocked
+    ? (state.dataHealth.blockers || ["Data quality"])[0]
+    : confirmed
+      ? "All gates passed"
+      : Number(scoreSubject?.score || 0) < activeTradeThreshold()
+        ? `${activeTradeThreshold() - Number(scoreSubject?.score || 0)} score points needed`
+        : candidateGate || "Entry confirmation needed";
+  els.activationState.textContent = activationLabel;
+  els.activationGate.textContent = activationGate;
+  setTone(els.activationState, dataBlocked ? "negative" : confirmed ? signal.direction === "long" ? "positive" : "negative" : "neutral");
   renderLifecycle(signal, confirmed);
   const statusText = signal.direction === "neutral"
     ? "Watchlist only. No trade alert is active."
@@ -3365,12 +3439,24 @@ function render(signal, indicators) {
   els.target2Level.textContent = signal.target2 ? fmt(signal.target2) : "--";
   els.exitWarning.textContent = signal.exitWarning || "--";
   els.riskReward.textContent = signal.riskReward ? `1:${fmt(signal.riskReward, 1)}` : "--";
+  const ladderSignal = confirmed && !dataBlocked && signal.entry && signal.stop && signal.target && signal.target2
+    ? signal
+    : null;
+  els.chartPriceLadder.hidden = !ladderSignal;
+  if (ladderSignal) {
+    els.ladderEntry.textContent = fmt(Number(ladderSignal.entry));
+    els.ladderStop.textContent = fmt(Number(ladderSignal.stop));
+    els.ladderTarget1.textContent = fmt(Number(ladderSignal.target));
+    els.ladderTarget2.textContent = fmt(Number(ladderSignal.target2));
+  }
   const risk = localRiskPlan(confirmed ? signal : null);
   els.riskQuantity.textContent = risk.quantity == null ? "--" : API_SYMBOL === "BTC-USD" ? fmt(risk.quantity, 6) : String(risk.quantity);
   els.riskDollars.textContent = money(risk.plannedRisk, 0);
   els.riskPositionValue.textContent = money(risk.positionValue, 0);
   els.riskTargetReward.textContent = money(risk.target1Reward, 0);
   renderActionStrip(signal, latest);
+  els.mobilePlanState.textContent = els.actionNow.textContent;
+  setTone(els.mobilePlanState, signal.direction === "long" ? "positive" : signal.direction === "short" ? "negative" : "neutral");
 
   els.vwapMetric.textContent = isDailyTimeframe() ? "--" : fmt(latest.vwap);
   els.smaMetric.textContent = `${fmt(latest.sma20)} / ${fmt(latest.sma50)} / ${fmt(latest.sma150)}`;
@@ -3407,9 +3493,12 @@ function maybeAlert(signal, timeframe = state.selectedTimeframe) {
 }
 
 function renderAlertLog() {
-  els.alertLog.innerHTML = state.alerts
-    .map((alert) => `<li><time>${alert.time.toLocaleTimeString([], { hour12: false })}</time>${escapeHtml(alert.text)}</li>`)
-    .join("");
+  els.alertLog.innerHTML = state.alerts.length
+    ? state.alerts
+      .map((alert) => `<li><time>${alert.time.toLocaleTimeString([], { hour12: false })}</time>${escapeHtml(alert.text)}</li>`)
+      .join("")
+    : '<li class="alert-empty">No alerts for this browser session.</li>';
+  els.alertCenterCount.textContent = String(state.systemFindingCount + state.alerts.length);
 }
 
 function finiteOrNull(value) {
@@ -3509,11 +3598,16 @@ async function refreshJournalStats(force = false) {
   state.lastStatsAt = now;
 
   try {
-    const response = await fetch(`/api/journal/stats?symbol=${encodeURIComponent(API_SYMBOL)}`);
+    const symbol = API_SYMBOL;
+    const response = await marketFetch(`/api/journal/stats?symbol=${encodeURIComponent(symbol)}`);
     if (!response.ok) throw new Error(`stats failed: ${response.status}`);
     const data = await response.json();
+    if (!isCurrentAsset(symbol)) return;
     state.journalStats = data;
     const summary = data.summary || {};
+    const hasHistory = Number(summary.total || 0) > 0;
+    els.journalStatsTile.hidden = !hasHistory;
+    els.performanceEmptyState.hidden = hasHistory;
     const targetHits = Number(summary.target1 || 0) + Number(summary.target2 || 0);
     const stopped = Number(summary.stopped || 0);
     const resolved = Number(summary.resolved || 0);
@@ -3542,28 +3636,37 @@ async function refreshJournalStats(force = false) {
     renderJournalRows();
     refreshReplayStats();
   } catch (error) {
+    if (error.name === "AbortError") return;
     console.info("Journal stats unavailable.", error);
   }
 }
 
 async function refreshReplayStats() {
   try {
-    const response = await fetch(`/api/backtest?symbol=${encodeURIComponent(API_SYMBOL)}`);
+    const symbol = API_SYMBOL;
+    const response = await marketFetch(`/api/backtest?symbol=${encodeURIComponent(symbol)}`);
     if (!response.ok) throw new Error(`replay failed: ${response.status}`);
-    state.replayStats = await response.json();
+    const replayStats = await response.json();
+    if (!isCurrentAsset(symbol)) return;
+    state.replayStats = replayStats;
     renderReplaySummary(state.replayStats);
   } catch (error) {
+    if (error.name === "AbortError") return;
     console.info("Replay stats unavailable.", error);
   }
 }
 
 async function refreshPatternStats() {
   try {
-    const response = await fetch(`/api/pattern/stats?symbol=${encodeURIComponent(API_SYMBOL)}`);
+    const symbol = API_SYMBOL;
+    const response = await marketFetch(`/api/pattern/stats?symbol=${encodeURIComponent(symbol)}`);
     if (!response.ok) throw new Error(`pattern stats failed: ${response.status}`);
-    state.patternStats = await response.json();
+    const patternStats = await response.json();
+    if (!isCurrentAsset(symbol)) return;
+    state.patternStats = patternStats;
     renderPatternValidation();
   } catch (error) {
+    if (error.name === "AbortError") return;
     console.info("Pattern validation stats unavailable.", error);
   }
 }
@@ -3576,6 +3679,8 @@ function renderPatternValidation() {
     .filter((row) => Number(row.resolved || 0) >= 5)
     .sort((a, b) => Number(b.targetRate || 0) - Number(a.targetRate || 0));
   const best = ranked[0];
+  els.patternValidationTile.hidden = tracked === 0;
+  updateValidationEmptyState();
   els.patternTracked.textContent = tracked;
   els.patternResolved.textContent = resolved;
   els.patternBest.textContent = best
@@ -3589,9 +3694,15 @@ function renderPatternValidation() {
     : "Patterns stay descriptive until enough regular-session outcomes resolve.";
 }
 
+function updateValidationEmptyState() {
+  els.validationEmptyState.hidden = !(els.replayTile.hidden && els.patternValidationTile.hidden);
+}
+
 function renderReplaySummary(data) {
   const summary = (data.byTimeframe || {})[String(state.selectedTimeframe)] || data.summary || {};
   const resolved = Number(summary.resolved || 0);
+  els.replayTile.hidden = !resolved && data.status !== "error";
+  updateValidationEmptyState();
   if (!resolved) {
     els.replayBest.textContent = data.status === "error" ? "Error" : "Building";
     setTone(els.replayBest, data.status === "error" ? "negative" : "neutral");
@@ -3634,21 +3745,29 @@ function renderJournalRows() {
     return row.outcome_status === filter;
   });
 
+  if (!rows.length) {
+    const detail = state.journalRecent?.length
+      ? "No journal entries match this filter."
+      : "No trade plans have been recorded for this market yet.";
+    els.journalRows.innerHTML = `<tr class="journal-empty-row"><td colspan="11">${detail}</td></tr>`;
+    return;
+  }
+
   els.journalRows.innerHTML = rows.slice(0, 30).map((row) => {
     const time = new Date(Number(row.created_at)).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
     return `
       <tr class="${row.id === state.selectedJournalPlanId ? "selected" : ""}" data-plan-id="${escapeHtml(row.id)}">
-        <td>${time}</td>
-        <td>${Number(row.timeframe) === DAILY_TIMEFRAME ? "1D" : `${escapeHtml(row.timeframe)}m`}</td>
-        <td class="${row.direction === "long" ? "positive" : "negative"}">${escapeHtml(row.direction)}</td>
-        <td>${escapeHtml(row.setup_type || row.setup || "unknown")}</td>
-        <td>${escapeHtml(row.score)}</td>
-        <td>${escapeHtml(row.outcome_status === "open" ? row.lifecycle_status : row.outcome_status)}</td>
-        <td>${fmt(Number(row.entry))}</td>
-        <td>${fmt(Number(row.target1))}</td>
-        <td>${fmt(Number(row.stop))}</td>
-        <td class="${Number(row.actual_realized_r) > 0 ? "positive" : Number(row.actual_realized_r) < 0 ? "negative" : ""}">${row.actual_realized_r == null ? "--" : `${Number(row.actual_realized_r) >= 0 ? "+" : ""}${fmt(Number(row.actual_realized_r), 2)}R`}</td>
-        <td><button class="text-button journal-review-button" type="button" data-review-id="${escapeHtml(row.id)}">Review</button></td>
+        <td data-label="Time">${time}</td>
+        <td data-label="Timeframe">${Number(row.timeframe) === DAILY_TIMEFRAME ? "1D" : `${escapeHtml(row.timeframe)}m`}</td>
+        <td data-label="Side" class="${row.direction === "long" ? "positive" : "negative"}">${escapeHtml(row.direction)}</td>
+        <td data-label="Setup">${escapeHtml(row.setup_type || row.setup || "unknown")}</td>
+        <td data-label="Score">${escapeHtml(row.score)}</td>
+        <td data-label="State">${escapeHtml(row.outcome_status === "open" ? row.lifecycle_status : row.outcome_status)}</td>
+        <td data-label="Entry">${fmt(Number(row.entry))}</td>
+        <td data-label="Target 1">${fmt(Number(row.target1))}</td>
+        <td data-label="Stop">${fmt(Number(row.stop))}</td>
+        <td data-label="Actual R" class="${Number(row.actual_realized_r) > 0 ? "positive" : Number(row.actual_realized_r) < 0 ? "negative" : ""}">${row.actual_realized_r == null ? "--" : `${Number(row.actual_realized_r) >= 0 ? "+" : ""}${fmt(Number(row.actual_realized_r), 2)}R`}</td>
+        <td data-label="Review"><button class="text-button journal-review-button" type="button" data-review-id="${escapeHtml(row.id)}">Review</button></td>
       </tr>
     `;
   }).join("");
@@ -3774,7 +3893,12 @@ function renderModelGovernance() {
 
 function selectTimeframe(timeframe) {
   state.selectedTimeframe = Number(timeframe);
-  els.timeframeButtons.forEach((item) => item.classList.toggle("active", Number(item.dataset.timeframe) === state.selectedTimeframe));
+  els.timeframeButtons.forEach((item) => {
+    const active = Number(item.dataset.timeframe) === state.selectedTimeframe;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-selected", String(active));
+    item.tabIndex = active ? 0 : -1;
+  });
   syncVwapControl();
   refresh();
   if (state.replayStats) renderReplaySummary(state.replayStats);
@@ -3823,11 +3947,13 @@ function stopHistorySync() {
 
 async function fetchLatestCandle() {
   if (state.feedMode !== "real" || state.latestRequestPending) return false;
+  const symbol = API_SYMBOL;
   state.latestRequestPending = true;
   try {
-    const response = await fetch(`/api/latest?symbol=${API_SYMBOL}&t=${Date.now()}`);
+    const response = await marketFetch(`/api/latest?symbol=${symbol}&t=${Date.now()}`);
     if (!response.ok) throw new Error(`latest failed: ${response.status}`);
     const data = await response.json();
+    if (!isCurrentAsset(symbol)) return false;
     applyDataHealth(data.dataHealth);
     if (data.candle) {
       state.providerErrors = Number(data.providerErrors || 0);
@@ -3840,22 +3966,25 @@ async function fetchLatestCandle() {
     }
     return false;
   } catch (error) {
+    if (error.name === "AbortError" || !isCurrentAsset(symbol)) return false;
     state.providerErrors += 1;
     els.sessionState.textContent = `${state.providerLabel} polling issue`;
     console.info("Latest price refresh skipped.", error);
     return false;
   } finally {
-    state.latestRequestPending = false;
+    if (isCurrentAsset(symbol)) state.latestRequestPending = false;
   }
 }
 
 async function syncIntradayHistory() {
   if (state.feedMode !== "real" || state.historySyncPending) return false;
+  const symbol = API_SYMBOL;
   state.historySyncPending = true;
   try {
-    const response = await fetch(`/api/history?symbol=${API_SYMBOL}&t=${Date.now()}`);
+    const response = await marketFetch(`/api/history?symbol=${symbol}&t=${Date.now()}`);
     if (!response.ok) throw new Error(`History sync failed: ${response.status}`);
     const data = await response.json();
+    if (!isCurrentAsset(symbol)) return false;
     applyDataHealth(data.dataHealth);
     const incoming = cleanCandles(data.candles || []);
     if (!incoming.length) return false;
@@ -3870,25 +3999,30 @@ async function syncIntradayHistory() {
     refresh();
     return true;
   } catch (error) {
+    if (error.name === "AbortError" || !isCurrentAsset(symbol)) return false;
     console.info("Intraday history resync skipped.", error);
     return false;
   } finally {
-    state.historySyncPending = false;
+    if (isCurrentAsset(symbol)) state.historySyncPending = false;
   }
 }
 
 async function fetchDailyHistory() {
-  const response = await fetch(`/api/daily?symbol=${API_SYMBOL}`);
+  const symbol = API_SYMBOL;
+  const response = await marketFetch(`/api/daily?symbol=${symbol}`);
   if (!response.ok) throw new Error(`Daily history request failed: ${response.status}`);
   const data = await response.json();
+  if (!isCurrentAsset(symbol)) return;
   state.dailyCandles = Core.resampleDaily(data.candles || [], ASSET_OPTIONS).slice(-520);
   refreshCurrentDailyCandle();
 }
 
 async function fetchFiveMinuteHistory() {
-  const response = await fetch(`/api/five-minute?symbol=${API_SYMBOL}`);
+  const symbol = API_SYMBOL;
+  const response = await marketFetch(`/api/five-minute?symbol=${symbol}`);
   if (!response.ok) throw new Error(`Five-minute history request failed: ${response.status}`);
   const data = await response.json();
+  if (!isCurrentAsset(symbol)) return;
   const candles = cleanCandles(data.candles || []);
   if (candles.length < 160) throw new Error("Not enough five-minute candles returned");
   state.fiveMinuteCandles = candles.slice(-20_000);
@@ -3896,9 +4030,11 @@ async function fetchFiveMinuteHistory() {
 
 async function fetchServerRecommendations() {
   if (!state.serverOwnsSignals) return;
-  const response = await fetch(`/api/recommendations?symbol=${encodeURIComponent(API_SYMBOL)}`);
+  const symbol = API_SYMBOL;
+  const response = await marketFetch(`/api/recommendations?symbol=${encodeURIComponent(symbol)}`);
   if (!response.ok) throw new Error(`Recommendations request failed: ${response.status}`);
-  applyServerRecommendations(await response.json());
+  const recommendations = await response.json();
+  if (isCurrentAsset(symbol)) applyServerRecommendations(recommendations);
 }
 
 async function refreshGraphData() {
@@ -3970,9 +4106,9 @@ function providerLabel(config) {
   return "Provider";
 }
 
-function initializeAssetPage() {
+function renderAssetPage() {
   document.title = `${ASSET.label} Trader Alert Helper`;
-  els.brandEyebrow.textContent = `${ASSET.label} alert assistant`;
+  els.brandEyebrow.textContent = `${ASSET.label} market`;
   els.chartSymbol.textContent = ASSET.label;
   els.canvas.setAttribute("aria-label", `${ASSET.label} candlestick, volume, and RSI chart`);
   els.fearGreedTitle.textContent = ASSET_OPTIONS.continuous || ASSET_OPTIONS.market === "tase" ? "CNN US Market Context" : "CNN Fear & Greed";
@@ -3983,22 +4119,163 @@ function initializeAssetPage() {
   } catch (error) {
     state.lastOptionsAlertKey = "";
   }
-  if (ASSET_OPTIONS.continuous) {
-    [...els.sessionMode.options].forEach((option) => {
-      option.textContent = "All hours (24/7)";
-    });
-  }
+  const [regularOption, extendedOption] = [...els.sessionMode.options];
+  regularOption.hidden = ASSET_OPTIONS.continuous;
+  regularOption.textContent = "Regular hours";
+  extendedOption.textContent = ASSET_OPTIONS.continuous ? "All hours (24/7)" : "Extended hours";
   els.assetSelector.value = API_SYMBOL;
+}
+
+function resetMarketState() {
+  state.marketRequestController.abort();
+  state.marketRequestController = new AbortController();
+  if (state.chartInteractionFrame) cancelAnimationFrame(state.chartInteractionFrame);
+  state.candles = [];
+  state.fiveMinuteCandles = [];
+  state.dailyCandles = [];
+  state.alerts = [];
+  state.lastAlertsByTimeframe = {};
+  state.feedMode = "loading";
+  state.providerLabel = "Starting";
+  state.providerErrors = 0;
+  state.providerMessage = "";
+  state.serverTradeNotifications = null;
+  state.serverOwnsSignals = false;
+  state.analysisEngine = "unavailable";
+  state.lastTickAt = null;
+  state.lastStreamAt = null;
+  state.marketCandleAt = null;
+  state.dataQualityIssues = [];
+  state.localDataQualityIssues = [];
+  state.dataHealth = null;
+  state.selectedTimeframe = 1;
+  state.settings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  state.settings.sessionMode = ASSET_OPTIONS.continuous ? "extended" : "regular";
+  state.activePlanIds = {};
+  state.lastJournalKeys = {};
+  state.timeframeAnalyses = {};
+  state.bestOpportunityTimeframe = null;
+  state.bestSwingTimeframe = null;
+  state.serverRecommendations = null;
+  state.activePlans = [];
+  state.modelGovernance = null;
+  state.patternStats = null;
+  state.selectedJournalPlanId = "";
+  state.optionsOpportunity = null;
+  state.lastOptionsAlertKey = "";
+  state.journalRecent = [];
+  state.journalStats = null;
+  state.replayStats = null;
+  state.currentPattern = null;
+  state.currentPatternKey = "";
+  state.lastPatternObservationKey = "";
+  state.patternHitZones = [];
+  state.patternProjectionVisible = false;
+  state.chartGeometry = null;
+  state.chartHover = null;
+  state.chartViews = {};
+  state.chartDrag = null;
+  state.chartInteractionFrame = null;
+  state.suppressChartClick = false;
+  state.lastStatsAt = 0;
+  state.latestRequestPending = false;
+  state.historySyncPending = false;
+  state.graphRefreshPending = false;
+  els.lastPrice.textContent = "--";
+  els.priceChange.textContent = "--";
+  els.sessionState.textContent = `Loading ${ASSET.label}`;
+  els.actionNow.textContent = `Loading ${ASSET.label}`;
+  els.actionDetail.textContent = "Waiting for current candles and server recommendations.";
+  els.actionData.textContent = "Checking";
+  els.actionDistance.textContent = "--";
+  els.actionRisk.textContent = "Not configured";
+  els.mobilePlanState.textContent = "Loading market";
+  renderBestOpportunity(null);
+  renderBestSwing(null);
+  els.confidenceScore.textContent = "--";
+  els.activationState.textContent = "Waiting";
+  els.activationGate.textContent = "Building signal";
+  els.activeAlert.textContent = "Loading market analysis.";
+  els.scoreDrivers.innerHTML = "";
+  els.nextCondition.textContent = "Waiting for an activation condition.";
+  els.entryLevel.textContent = "--";
+  els.stopLevel.textContent = "--";
+  els.targetLevel.textContent = "--";
+  els.target2Level.textContent = "--";
+  els.exitWarning.textContent = "--";
+  els.riskReward.textContent = "--";
+  els.lifecycleBadge.textContent = "Idle";
+  els.lifecycleDetail.textContent = "No active plan is waiting for entry.";
+  els.chartPriceLadder.hidden = true;
+  els.journalStatsTile.hidden = true;
+  els.performanceEmptyState.hidden = false;
+  els.replayTile.hidden = true;
+  els.patternValidationTile.hidden = true;
+  updateValidationEmptyState();
+  renderAlertLog();
+  renderJournalRows();
+  const contexts = [els.canvas.getContext("2d"), els.chartOverlay.getContext("2d")];
+  contexts.forEach((context) => context.clearRect(0, 0, context.canvas.width, context.canvas.height));
+}
+
+async function switchAsset(symbol, { updateHistory = true } = {}) {
+  if (!SUPPORTED_SYMBOLS.has(symbol) || symbol === API_SYMBOL || state.assetSwitchPending) return;
+  state.assetSwitchPending = true;
+  document.body.classList.add("market-switching");
+  els.assetSelector.disabled = true;
+  els.canvas.setAttribute("aria-busy", "true");
+  if (state.stream) state.stream.close();
+  state.stream = null;
+  stopLatestPolling();
+  stopHistorySync();
+  API_SYMBOL = symbol;
+  ASSET = ASSETS[symbol];
+  ASSET_OPTIONS = {
+    continuous: Boolean(ASSET.continuous),
+    market: ASSET.market,
+    hasReliableIntradayVolume: ASSET.hasReliableIntradayVolume !== false,
+  };
+  SETTINGS_KEY = `trader-helper-settings:${API_SYMBOL}`;
+  OPTIONS_ALERT_STORAGE_KEY = `trader-helper-options-alert:${API_SYMBOL}`;
+  if (updateHistory) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("symbol", API_SYMBOL);
+    window.history.pushState({ symbol: API_SYMBOL }, "", url);
+  }
+  resetMarketState();
+  renderAssetPage();
+  try {
+    await loadSettings();
+    await Promise.allSettled([
+      refreshJournalStats(true),
+      refreshPatternStats(),
+      fetchFearGreed(),
+    ]);
+    await bootFeed();
+    refreshScanner();
+    refreshSystemHealth();
+  } finally {
+    state.assetSwitchPending = false;
+    document.body.classList.remove("market-switching");
+    els.assetSelector.disabled = false;
+    els.canvas.removeAttribute("aria-busy");
+  }
+}
+
+function initializeAssetPage() {
+  renderAssetPage();
   els.assetSelector.addEventListener("change", () => {
     const symbol = els.assetSelector.value;
-    if (!SUPPORTED_SYMBOLS.has(symbol) || symbol === API_SYMBOL) return;
-    const url = new URL(window.location.href);
-    url.searchParams.set("symbol", symbol);
-    window.location.assign(url);
+    switchAsset(symbol);
+  });
+  window.addEventListener("popstate", () => {
+    const symbol = new URLSearchParams(window.location.search).get("symbol")?.toUpperCase() || "QQQ";
+    if (SUPPORTED_SYMBOLS.has(symbol) && symbol !== API_SYMBOL) switchAsset(symbol, { updateHistory: false });
   });
 }
 
 async function startRealFeed(config) {
+  const symbol = API_SYMBOL;
   if (state.stream) state.stream.close();
   stopLatestPolling();
   stopHistorySync();
@@ -4015,12 +4292,13 @@ async function startRealFeed(config) {
   state.pollIntervalMs = Number(state.settings.pollIntervalMs || state.pollIntervalMs);
   els.sessionState.textContent = `Loading ${state.providerLabel}`;
 
-  const historyResponse = await fetch(`/api/history?symbol=${API_SYMBOL}`);
+  const historyResponse = await marketFetch(`/api/history?symbol=${symbol}`);
   if (!historyResponse.ok) {
     throw new Error(`History request failed: ${historyResponse.status}`);
   }
 
   const history = await historyResponse.json();
+  if (!isCurrentAsset(symbol)) return;
   applyDataHealth(history.dataHealth);
   if (!history.candles || history.candles.length < 60) {
     throw new Error("Not enough provider minute candles returned");
@@ -4051,8 +4329,9 @@ async function startRealFeed(config) {
   startLatestPolling(state.pollIntervalMs);
   startHistorySync();
 
-  state.stream = new EventSource(`/api/stream?symbol=${API_SYMBOL}`);
+  state.stream = new EventSource(`/api/stream?symbol=${symbol}`);
   state.stream.addEventListener("candle", (event) => {
+    if (!isCurrentAsset(symbol)) return;
     state.lastStreamAt = Date.now();
     state.providerErrors = 0;
     state.lastTickAt = Date.now();
@@ -4060,6 +4339,7 @@ async function startRealFeed(config) {
     els.sessionState.textContent = `${state.providerLabel} live`;
   });
   state.stream.addEventListener("status", (event) => {
+    if (!isCurrentAsset(symbol)) return;
     const status = JSON.parse(event.data || "{}");
     state.lastStreamAt = Date.now();
     state.lastTickAt = Number(status.lastSuccessAt || Date.now());
@@ -4067,6 +4347,7 @@ async function startRealFeed(config) {
     applyDataHealth(status.dataHealth);
   });
   state.stream.addEventListener("provider_error", (event) => {
+    if (!isCurrentAsset(symbol)) return;
     const status = JSON.parse(event.data || "{}");
     state.lastStreamAt = Date.now();
     state.providerErrors = Number(status.count || state.providerErrors + 1);
@@ -4074,14 +4355,17 @@ async function startRealFeed(config) {
     els.sessionState.textContent = `${state.providerLabel} provider issue`;
   });
   state.stream.addEventListener("recommendations", (event) => {
+    if (!isCurrentAsset(symbol)) return;
     applyServerRecommendations(JSON.parse(event.data || "{}"));
     refresh();
   });
   state.stream.addEventListener("options_opportunity", (event) => {
+    if (!isCurrentAsset(symbol)) return;
     state.optionsOpportunity = JSON.parse(event.data || "{}");
     refresh();
   });
   state.stream.addEventListener("error", () => {
+    if (!isCurrentAsset(symbol)) return;
     state.providerErrors += 1;
     els.sessionState.textContent = `${state.providerLabel} reconnecting / polling`;
     fetchLatestCandle();
@@ -4089,15 +4373,18 @@ async function startRealFeed(config) {
 }
 
 async function bootFeed() {
+  const symbol = API_SYMBOL;
   try {
-    const response = await fetch(`/api/config?symbol=${encodeURIComponent(API_SYMBOL)}`);
+    const response = await marketFetch(`/api/config?symbol=${encodeURIComponent(symbol)}`);
     if (!response.ok) throw new Error("No local API server");
     const config = await response.json();
+    if (!isCurrentAsset(symbol)) return;
     if (config.realTimeEnabled) {
       await startRealFeed(config);
       return;
     }
   } catch (error) {
+    if (error.name === "AbortError" || !isCurrentAsset(symbol)) return;
     console.info("Market feed unavailable.", error);
     state.feedMode = "offline";
     state.providerErrors += 1;
@@ -4128,6 +4415,7 @@ els.patternsToggle.addEventListener("click", () => {
   state.settings.chartLayers.patterns = !state.settings.chartLayers.patterns;
   if (!state.settings.chartLayers.patterns) state.patternProjectionVisible = false;
   els.patternsToggle.classList.toggle("active", state.settings.chartLayers.patterns);
+  els.patternsToggle.setAttribute("aria-pressed", String(state.settings.chartLayers.patterns));
   saveSettings();
   refresh();
 });
@@ -4152,6 +4440,7 @@ els.notifyButton.addEventListener("click", async () => {
   const permission = await Notification.requestPermission();
   state.notifyEnabled = permission === "granted";
   els.notifyButton.classList.toggle("active", state.notifyEnabled);
+  els.notifyButton.setAttribute("aria-pressed", String(state.notifyEnabled));
 });
 
 els.clearLog.addEventListener("click", () => {
@@ -4174,25 +4463,127 @@ els.tradeMode.addEventListener("change", () => {
   });
 });
 
-function activateHorizon(button) {
-  [els.dayTradeView, els.swingTradeView, els.contextView].forEach((item) => item.classList.toggle("active", item === button));
+function closeMobilePlan() {
+  els.sidePanel.classList.remove("mobile-open");
+  els.mobilePlanButton.setAttribute("aria-expanded", "false");
+  syncMobilePlanAccessibility();
 }
 
-els.dayTradeView.addEventListener("click", () => {
-  activateHorizon(els.dayTradeView);
-  if (state.selectedTimeframe === DAILY_TIMEFRAME) selectTimeframe(5);
-  document.querySelector(".chart-section").scrollIntoView({ behavior: "smooth", block: "start" });
+function syncMobilePlanAccessibility() {
+  const mobile = window.matchMedia("(max-width: 620px)").matches;
+  const open = mobile && els.sidePanel.classList.contains("mobile-open");
+  if (mobile) els.sidePanel.setAttribute("aria-hidden", String(!open));
+  else els.sidePanel.removeAttribute("aria-hidden");
+  els.sidePanel.inert = mobile && !open;
+}
+
+function activateHorizon(horizon, { persist = true, scroll = true } = {}) {
+  const normalized = new Set(["day", "swing", "context", "journal"]).has(horizon) ? horizon : "day";
+  const buttons = {
+    day: els.dayTradeView,
+    swing: els.swingTradeView,
+    context: els.contextView,
+    journal: els.journalView,
+  };
+  Object.entries(buttons).forEach(([name, item]) => {
+    const active = name === normalized;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-selected", String(active));
+    item.tabIndex = active ? 0 : -1;
+  });
+  document.body.dataset.horizon = normalized;
+  els.marketWorkspace.hidden = normalized === "journal";
+  els.journalViewPanel.hidden = normalized !== "journal";
+  state.settings.ui = { ...(state.settings.ui || {}), horizon: normalized };
+  closeMobilePlan();
+
+  const timeframe = normalized === "swing"
+    ? DAILY_TIMEFRAME
+    : normalized === "day" && state.selectedTimeframe === DAILY_TIMEFRAME
+      ? 5
+      : state.selectedTimeframe;
+  if (timeframe !== state.selectedTimeframe) {
+    if (state.candles.length) selectTimeframe(timeframe);
+    else {
+      state.selectedTimeframe = timeframe;
+      els.timeframeButtons.forEach((item) => {
+        const active = Number(item.dataset.timeframe) === timeframe;
+        item.classList.toggle("active", active);
+        item.setAttribute("aria-selected", String(active));
+        item.tabIndex = active ? 0 : -1;
+      });
+    }
+  }
+  if (persist) saveSettings();
+  if (!scroll) return;
+  const target = normalized === "journal" ? els.journalViewPanel : document.querySelector(".workspace");
+  target?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function activateInsightGroup(group, { persist = true } = {}) {
+  const normalized = new Set(["market", "validation", "performance", "system"]).has(group) ? group : "market";
+  els.insightsGrid.dataset.activeGroup = normalized;
+  els.insightTabs.forEach((item) => {
+    const active = item.dataset.insightGroup === normalized;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-selected", String(active));
+    item.tabIndex = active ? 0 : -1;
+  });
+  state.settings.ui = { ...(state.settings.ui || {}), insightGroup: normalized };
+  if (persist) saveSettings();
+}
+
+els.dayTradeView.addEventListener("click", () => activateHorizon("day"));
+els.swingTradeView.addEventListener("click", () => activateHorizon("swing"));
+els.contextView.addEventListener("click", () => activateHorizon("context"));
+els.journalView.addEventListener("click", () => activateHorizon("journal"));
+
+els.insightTabs.forEach((button) => {
+  button.addEventListener("click", () => activateInsightGroup(button.dataset.insightGroup));
 });
 
-els.swingTradeView.addEventListener("click", () => {
-  activateHorizon(els.swingTradeView);
-  selectTimeframe(DAILY_TIMEFRAME);
-  document.querySelector(".swing-summary").scrollIntoView({ behavior: "smooth", block: "start" });
+function enableTabKeyboard(buttons) {
+  buttons.forEach((button, index) => {
+    button.addEventListener("keydown", (event) => {
+      const keyOffsets = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+      let nextIndex;
+      if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = buttons.length - 1;
+      else if (event.key in keyOffsets) nextIndex = (index + keyOffsets[event.key] + buttons.length) % buttons.length;
+      else return;
+      event.preventDefault();
+      buttons[nextIndex].click();
+      buttons[nextIndex].focus();
+    });
+  });
+}
+
+enableTabKeyboard(els.timeframeButtons);
+enableTabKeyboard([els.dayTradeView, els.swingTradeView, els.contextView, els.journalView]);
+enableTabKeyboard(els.insightTabs);
+
+els.alertCenterButton.addEventListener("click", () => {
+  activateHorizon("context", { scroll: false });
+  activateInsightGroup("system");
+  els.insightsGrid.scrollIntoView({ behavior: "smooth", block: "start" });
 });
 
-els.contextView.addEventListener("click", () => {
-  activateHorizon(els.contextView);
-  document.querySelector(".insights-grid").scrollIntoView({ behavior: "smooth", block: "start" });
+els.mobilePlanButton.addEventListener("click", () => {
+  const open = !els.sidePanel.classList.contains("mobile-open");
+  els.sidePanel.classList.toggle("mobile-open", open);
+  els.mobilePlanButton.setAttribute("aria-expanded", String(open));
+  syncMobilePlanAccessibility();
+  if (open) els.mobilePlanClose.focus();
+});
+els.mobilePlanClose.addEventListener("click", () => {
+  closeMobilePlan();
+  els.mobilePlanButton.focus();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && els.sidePanel.classList.contains("mobile-open")) {
+    closeMobilePlan();
+    els.mobilePlanButton.focus();
+  }
 });
 
 els.sessionMode.addEventListener("change", () => {
@@ -4224,7 +4615,10 @@ els.feedbackTook.addEventListener("click", () => sendFeedback("took"));
 els.feedbackSkipped.addEventListener("click", () => sendFeedback("skipped"));
 els.feedbackBad.addEventListener("click", () => sendFeedback("bad"));
 
-window.addEventListener("resize", () => refresh());
+window.addEventListener("resize", () => {
+  syncMobilePlanAccessibility();
+  refresh();
+});
 window.addEventListener("online", () => {
   fetchLatestCandle();
   syncIntradayHistory();
@@ -4243,11 +4637,14 @@ document.addEventListener("visibilitychange", () => {
 });
 
 initializeAssetPage();
+renderAlertLog();
+renderJournalRows();
 updateClock();
 setInterval(updateClock, 1000);
 if ("Notification" in window && Notification.permission === "granted") {
   state.notifyEnabled = true;
   els.notifyButton.classList.add("active");
+  els.notifyButton.setAttribute("aria-pressed", "true");
 }
 loadSettings().then(() => {
   refreshJournalStats(true);
