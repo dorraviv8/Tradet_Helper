@@ -113,7 +113,7 @@ services:
     volumes:
       - ./monitoring/alloy-config.alloy:/etc/alloy/config.alloy:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - alloy-data:/var/lib/alloy/data
+      - alloy-data:/var/lib/alloy
     user: "0:0"
     read_only: true
     tmpfs:
