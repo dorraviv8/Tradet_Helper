@@ -106,7 +106,7 @@ The SQLite journal is backed up to the persistent `trader-data` volume every 24 
 
 ## Grafana Operations Dashboard
 
-The Compose stack includes private Prometheus, Node Exporter, Loki, and Promtail services plus Grafana at `https://PUBLIC_HOST/grafana/`. Grafana has its own login; set `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` in the private `.env` file. Prometheus scrapes application and VM metrics every 30 seconds. Loki retains container logs for 14 days and exposes them in the operations dashboard. Caddy blocks public access to `/metrics`; only Grafana is exposed through HTTPS.
+The Compose stack includes private Prometheus, Node Exporter, Loki, and Grafana Alloy services plus Grafana at `https://PUBLIC_HOST/grafana/`. Grafana has its own login; set `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` in the private `.env` file. Prometheus scrapes application and VM metrics every 30 seconds. Alloy collects Docker logs with persistent read positions, and Loki retains those logs for 14 days for the operations dashboard. Caddy blocks public access to `/metrics`; only Grafana is exposed through HTTPS.
 
 ## Post-deploy Checks
 
