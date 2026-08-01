@@ -298,6 +298,7 @@ def init_db():
     connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_created_at ON plans(created_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_outcome ON plans(outcome_status)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_learning ON plans(eligible_for_learning, strategy_version)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_symbol_learning ON plans(symbol, eligible_for_learning, strategy_version)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_time ON candles(symbol, time)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_candles_symbol_time ON daily_candles(symbol, time)")
     connection.execute("""
@@ -3332,6 +3333,37 @@ def learning_filter():
   return "symbol = ? AND eligible_for_learning = 1 AND strategy_version = ?"
 
 
+def recommendation_scoreboard(connection):
+  placeholders = ", ".join("?" for _ in SUPPORTED_SYMBOLS)
+  rows = connection.execute(f"""
+    SELECT
+      symbol,
+      COUNT(*) AS recommended,
+      COALESCE(SUM(CASE WHEN realized_r IS NOT NULL THEN 1 ELSE 0 END), 0) AS resolved,
+      COALESCE(SUM(CASE WHEN realized_r > 0 THEN 1 ELSE 0 END), 0) AS successful
+    FROM plans
+    WHERE symbol IN ({placeholders})
+      AND eligible_for_learning = 1
+      AND strategy_version = ?
+    GROUP BY symbol
+  """, (*SUPPORTED_SYMBOLS, STRATEGY_VERSION)).fetchall()
+  by_symbol = {row["symbol"]: dict(row) for row in rows}
+  markets = []
+  for symbol in SUPPORTED_SYMBOLS:
+    row = by_symbol.get(symbol, {})
+    recommended = int(row.get("recommended") or 0)
+    resolved = int(row.get("resolved") or 0)
+    successful = int(row.get("successful") or 0)
+    markets.append({
+      "symbol": symbol,
+      "recommended": recommended,
+      "resolved": resolved,
+      "successful": successful,
+      "successRate": round(successful * 100 / resolved, 1) if resolved else None,
+    })
+  return markets
+
+
 class Handler(SimpleHTTPRequestHandler):
   server_version = "QQQAlertHelper/3.0"
 
@@ -3625,6 +3657,9 @@ class Handler(SimpleHTTPRequestHandler):
       return
     if parsed.path == "/api/journal/stats":
       self.handle_journal_stats(parsed)
+      return
+    if parsed.path == "/api/journal/scoreboard":
+      self.handle_journal_scoreboard()
       return
     if parsed.path == "/api/journal/replay":
       self.handle_journal_replay(parsed)
@@ -4004,6 +4039,15 @@ class Handler(SimpleHTTPRequestHandler):
         "byPhase": [dict(row) for row in by_phase],
         "recent": [dict(row) for row in recent],
       })
+    except Exception as error:
+      status, payload = self.api_error(error)
+      self.send_json(status, payload)
+
+  def handle_journal_scoreboard(self):
+    try:
+      with db() as connection:
+        markets = recommendation_scoreboard(connection)
+      self.send_json(200, {"generatedAt": now_ms(), "markets": markets})
     except Exception as error:
       status, payload = self.api_error(error)
       self.send_json(status, payload)

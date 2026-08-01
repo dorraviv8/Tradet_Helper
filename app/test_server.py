@@ -420,6 +420,29 @@ class ServerTests(unittest.TestCase):
       snapshot = server.load_learning_snapshot(connection, "QQQ")
     self.assertEqual(snapshot["resolvedSamples"], 1)
 
+  def test_recommendation_scoreboard_reports_resolved_successes_per_market(self):
+    self.insert_plan("qqq-win", realized_r=1.3, outcome_status="target2", lifecycle_status="closed")
+    self.insert_plan("qqq-loss", realized_r=-1.0, outcome_status="stopped", lifecycle_status="closed")
+    self.insert_plan("qqq-open", realized_r=None, outcome_status="open", lifecycle_status="waiting")
+    self.insert_plan("spy-win", symbol="SPY", realized_r=0.5, outcome_status="target1", lifecycle_status="closed")
+    self.insert_plan(
+      "ignored-old-version",
+      strategy_version="5.0.0",
+      realized_r=1.0,
+      outcome_status="target2",
+      lifecycle_status="closed",
+    )
+    with server.db() as connection:
+      scoreboard = {row["symbol"]: row for row in server.recommendation_scoreboard(connection)}
+    self.assertEqual(scoreboard["QQQ"], {
+      "symbol": "QQQ", "recommended": 3, "resolved": 2, "successful": 1, "successRate": 50.0,
+    })
+    self.assertEqual(scoreboard["SPY"], {
+      "symbol": "SPY", "recommended": 1, "resolved": 1, "successful": 1, "successRate": 100.0,
+    })
+    self.assertEqual(scoreboard["BTC-USD"]["successRate"], None)
+    self.assertEqual(scoreboard["TA125"]["recommended"], 0)
+
   def test_cnn_fear_greed_payload_is_normalized(self):
     result = server.normalize_fear_greed({
       "fear_and_greed": {

@@ -80,6 +80,7 @@ const state = {
   serverTradeNotifications: null,
   systemFindingCount: 0,
   scannerTimer: null,
+  scoreboardTimer: null,
   selectedJournalPlanId: "",
   optionsOpportunity: null,
   lastOptionsAlertKey: "",
@@ -142,6 +143,7 @@ const els = {
   marketWorkspace: document.getElementById("marketWorkspace"),
   alertCenterButton: document.getElementById("alertCenterButton"),
   alertCenterCount: document.getElementById("alertCenterCount"),
+  recommendationScoreboard: document.getElementById("recommendationScoreboard"),
   scannerBest: document.getElementById("scannerBest"),
   scannerMarkets: document.getElementById("scannerMarkets"),
   brandEyebrow: document.getElementById("brandEyebrow"),
@@ -501,6 +503,37 @@ async function refreshScanner() {
     renderScanner(await response.json());
   } catch (error) {
     console.info("Market scanner unavailable.", error);
+  }
+}
+
+function renderRecommendationScoreboard(markets = []) {
+  const bySymbol = new Map(markets.map((market) => [market.symbol, market]));
+  els.recommendationScoreboard.innerHTML = Object.keys(ASSETS).map((symbol) => {
+    const market = bySymbol.get(symbol) || {};
+    const resolved = Number(market.resolved || 0);
+    const successful = Number(market.successful || 0);
+    const rate = market.successRate == null ? null : Number(market.successRate);
+    const rateLabel = Number.isFinite(rate) ? `${fmt(rate, rate % 1 ? 1 : 0)}%` : "--";
+    const detail = resolved
+      ? `${successful} successful / ${resolved} resolved`
+      : "No resolved recommendations";
+    const tone = !resolved ? "neutral" : rate >= 50 ? "positive" : "negative";
+    return `<div class="scoreboard-market ${tone}" title="A successful recommendation has positive realized R.">
+      <span>${escapeHtml(ASSETS[symbol].label)}</span>
+      <strong>${rateLabel}</strong>
+      <small>${detail}</small>
+    </div>`;
+  }).join("");
+}
+
+async function refreshRecommendationScoreboard() {
+  try {
+    const response = await fetch(`/api/journal/scoreboard?t=${Date.now()}`);
+    if (!response.ok) throw new Error(`scoreboard failed: ${response.status}`);
+    const data = await response.json();
+    renderRecommendationScoreboard(data.markets || []);
+  } catch (error) {
+    console.info("Recommendation scoreboard unavailable.", error);
   }
 }
 
@@ -3635,6 +3668,7 @@ async function refreshJournalStats(force = false) {
     });
     renderJournalRows();
     refreshReplayStats();
+    refreshRecommendationScoreboard();
   } catch (error) {
     if (error.name === "AbortError") return;
     console.info("Journal stats unavailable.", error);
@@ -4650,8 +4684,10 @@ loadSettings().then(() => {
   refreshJournalStats(true);
   refreshPatternStats();
   refreshScanner();
+  refreshRecommendationScoreboard();
   refreshSystemHealth();
   state.scannerTimer = setInterval(refreshScanner, 30_000);
+  state.scoreboardTimer = setInterval(refreshRecommendationScoreboard, 60_000);
   setInterval(refreshSystemHealth, 60_000);
   setInterval(refreshPatternStats, 5 * 60_000);
   fetchFearGreed();
