@@ -420,6 +420,34 @@ class ServerTests(unittest.TestCase):
       snapshot = server.load_learning_snapshot(connection, "QQQ")
     self.assertEqual(snapshot["resolvedSamples"], 1)
 
+  def test_setup_quality_gate_blocks_statistically_weak_comparable_setup(self):
+    for index in range(20):
+      self.insert_plan(
+        f"weak-breakout-{index}", setup_type="breakout", timeframe=5, direction="long",
+        realized_r=-1.0, outcome_status="stopped", lifecycle_status="closed", closed_at=100_000 + index,
+      )
+    with server.db() as connection:
+      snapshot = server.build_learning_snapshot(connection, "QQQ")
+    candidate = {"direction": "long", "setupType": "breakout", "timeframe": 5, "score": 82, "reasons": []}
+    recommendations = {5: {**candidate, "bestLong": candidate, "bestShort": None}}
+    result = server.apply_setup_quality_gate(recommendations, snapshot)
+    self.assertEqual(result[5]["qualityGate"]["status"], "Blocked")
+    self.assertTrue(result[5]["watchOnly"])
+    self.assertIn("Blocked: 20 comparable breakout 5m long", result[5]["reasons"][-1])
+
+  def test_setup_quality_gate_prefers_positive_comparable_setup(self):
+    for index in range(30):
+      self.insert_plan(
+        f"strong-breakout-{index}", setup_type="breakout", timeframe=5, direction="long",
+        realized_r=1.0, outcome_status="target2", lifecycle_status="closed", closed_at=100_000 + index,
+      )
+    with server.db() as connection:
+      snapshot = server.build_learning_snapshot(connection, "QQQ")
+    candidate = {"direction": "long", "setupType": "breakout", "timeframe": 5, "score": 82, "reasons": []}
+    result = server.apply_setup_quality_gate({5: candidate}, snapshot)
+    self.assertEqual(result[5]["qualityGate"]["status"], "Preferred")
+    self.assertEqual(result[5]["score"], 85)
+
   def test_recommendation_scoreboard_reports_all_recorded_alert_outcomes_per_market(self):
     self.insert_plan("qqq-win", realized_r=1.3, outcome_status="target2", lifecycle_status="closed")
     self.insert_plan("qqq-loss", realized_r=-1.0, outcome_status="stopped", lifecycle_status="closed")

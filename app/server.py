@@ -1531,6 +1531,56 @@ def attach_signal_learning_confidence(signal, snapshot):
   return signal
 
 
+def setup_quality_gate(snapshot, candidate):
+  if not isinstance(candidate, dict) or candidate.get("direction") not in {"long", "short"}:
+    return {"status": "Building", "sampleSize": 0, "detail": "No actionable setup to evaluate."}
+  setup_type = candidate.get("setupType") or strategy_engine.setup_type(candidate.get("setup", ""))
+  timeframe = str(candidate.get("timeframe") or "")
+  key = "|".join((setup_type, timeframe, candidate["direction"]))
+  row = ((snapshot.get("groups") or {}).get("bySetupTimeframeDirection") or {}).get(key)
+  if not row:
+    return {
+      "status": "Building", "sampleSize": 0,
+      "detail": "This setup/timeframe/side is collecting its first comparable outcomes.",
+    }
+  samples = int(row.get("sample_size") or 0)
+  expected_r = float(row.get("calibrated_expected_r") or 0)
+  win_rate = float(row.get("win_rate") or 0.5)
+  if samples >= 20 and expected_r < -0.10 and win_rate <= 0.45:
+    return {
+      "status": "Blocked", "sampleSize": samples, "expectedR": expected_r, "winRate": win_rate,
+      "detail": f"Blocked: {samples} comparable {setup_type} {timeframe}m {candidate['direction']} outcomes have {expected_r:+.2f}R expectancy and {win_rate * 100:.0f}% calibrated win rate.",
+    }
+  if samples >= 30 and expected_r >= 0.10 and win_rate >= 0.55:
+    return {
+      "status": "Preferred", "sampleSize": samples, "expectedR": expected_r, "winRate": win_rate,
+      "detail": f"Preferred: {samples} comparable outcomes show {expected_r:+.2f}R expectancy and {win_rate * 100:.0f}% calibrated win rate.",
+    }
+  return {
+    "status": "Developing" if samples >= 10 else "Building", "sampleSize": samples,
+    "expectedR": expected_r, "winRate": win_rate,
+    "detail": f"{samples} comparable outcomes recorded; quality gate remains observational until the sample is larger.",
+  }
+
+
+def apply_setup_quality_gate(recommendations, snapshot):
+  for signal in (recommendations or {}).values():
+    seen = set()
+    for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
+      if not isinstance(candidate, dict) or id(candidate) in seen:
+        continue
+      seen.add(id(candidate))
+      gate = setup_quality_gate(snapshot, candidate)
+      candidate["qualityGate"] = gate
+      if gate["status"] == "Blocked":
+        candidate["watchOnly"] = True
+        candidate.setdefault("reasons", []).append(gate["detail"])
+      elif gate["status"] == "Preferred":
+        candidate["score"] = min(100, int(candidate.get("score") or 0) + 3)
+        candidate.setdefault("reasons", []).append("Quality gate preference: comparable outcomes are positive.")
+  return recommendations
+
+
 def schedule_historical_replay(symbol=SYMBOL):
   runtime = market_runtime_snapshot(symbol)
   current_time = now_ms()
@@ -2437,6 +2487,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
             candidate["broadMarketContext"] = broad_context
       attach_signal_calibration(signal, replay_trades)
       attach_signal_learning_confidence(signal, learning_snapshot)
+      apply_setup_quality_gate({timeframe: signal}, learning_snapshot)
       risk_engine.attach_position_plan(signal, settings, symbol)
       plan_ids[int(timeframe)] = persist_generated_signal(
         connection, provider, int(timeframe), signal, settings, symbol

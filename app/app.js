@@ -3037,6 +3037,7 @@ function setTone(element, tone) {
 
 function candidateBlocker(candidate) {
   if (!candidate) return "No setup candidate";
+  if (candidate.qualityGate?.status === "Blocked") return candidate.qualityGate.detail;
   if (candidate.score < activeTradeThreshold()) return `Score below ${activeTradeThreshold()} threshold`;
   if (candidate.watchOnly) return "Risk/reward or target distance is not clean";
   return "Eligible";
@@ -3336,6 +3337,7 @@ function renderCalibration(signal) {
   const modelMfe = Number(model.avgMfeR);
   const modelMae = Number(model.avgMaeR);
   const modelHoldingMs = Number(model.avgHoldingMs);
+  const qualityGate = subject?.qualityGate || {};
   const samples = Number(calibration.sampleSize || 0);
   const probability = Number(calibration.probabilityT1);
   const expectedR = Number(calibration.expectedR);
@@ -3358,7 +3360,7 @@ function renderCalibration(signal) {
       ? `${fmt(modelMfe, 2)}R / ${fmt(modelMae, 2)}R`
       : "--";
     els.calibrationHoldingTime.textContent = fmtDuration(modelHoldingMs);
-    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model uses ${model.scope || "comparable"} outcomes, with a neutral prior and conservative range until the sample grows.`;
+    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. ${qualityGate.detail || `Live model uses ${model.scope || "comparable"} outcomes, with a neutral prior and conservative range until the sample grows.`}`;
     return;
   }
   if (!samples || !Number.isFinite(probability)) {
@@ -3370,7 +3372,7 @@ function renderCalibration(signal) {
     els.calibrationRange.textContent = "--";
     els.calibrationExcursion.textContent = "--";
     els.calibrationHoldingTime.textContent = "--";
-    els.calibrationScope.textContent = "Waiting for automatically resolved comparable plans and historical replay data.";
+    els.calibrationScope.textContent = qualityGate.detail || "Waiting for automatically resolved comparable plans and historical replay data.";
     return;
   }
   els.calibrationBadge.textContent = calibration.calibrated ? "Replay baseline" : "Replay only";
@@ -3384,7 +3386,7 @@ function renderCalibration(signal) {
     : "--";
   els.calibrationExcursion.textContent = "--";
   els.calibrationHoldingTime.textContent = "--";
-  els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.sampleType || "historical replay"} ${calibration.scope || "baseline"} with a neutral prior.`;
+  els.calibrationScope.textContent = qualityGate.detail || `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.sampleType || "historical replay"} ${calibration.scope || "baseline"} with a neutral prior.`;
 }
 
 function render(signal, indicators) {
