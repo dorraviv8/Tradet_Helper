@@ -144,7 +144,6 @@ def db():
   ensure_data_dir()
   connection = sqlite3.connect(DB_PATH, timeout=10)
   connection.row_factory = sqlite3.Row
-  connection.execute("PRAGMA journal_mode=WAL")
   connection.execute("PRAGMA busy_timeout=10000")
   connection.execute("PRAGMA foreign_keys=ON")
   try:
@@ -165,6 +164,9 @@ def add_column(connection, existing, name, definition):
 
 def init_db():
   with db() as connection:
+    # WAL mode is a database-wide setting. Applying it per request can block
+    # read handlers while another connection is writing.
+    connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("""
       CREATE TABLE IF NOT EXISTS plans (
         id TEXT PRIMARY KEY,
