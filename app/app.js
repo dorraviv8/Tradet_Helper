@@ -311,6 +311,18 @@ const els = {
   journalExpectancy: document.getElementById("journalExpectancy"),
   journalBestSetup: document.getElementById("journalBestSetup"),
   journalBestTimeframe: document.getElementById("journalBestTimeframe"),
+  modelValidationTile: document.getElementById("modelValidationTile"),
+  modelValidationVersion: document.getElementById("modelValidationVersion"),
+  modelValidationBadge: document.getElementById("modelValidationBadge"),
+  modelValidationSamples: document.getElementById("modelValidationSamples"),
+  modelValidationRecord: document.getElementById("modelValidationRecord"),
+  modelValidationWinRate: document.getElementById("modelValidationWinRate"),
+  modelValidationRange: document.getElementById("modelValidationRange"),
+  modelValidationExpectancy: document.getElementById("modelValidationExpectancy"),
+  modelValidationDrawdown: document.getElementById("modelValidationDrawdown"),
+  modelValidationReplay: document.getElementById("modelValidationReplay"),
+  modelValidationRequirements: document.getElementById("modelValidationRequirements"),
+  modelValidationBreakdown: document.getElementById("modelValidationBreakdown"),
   replayTile: document.getElementById("replayTile"),
   replayBest: document.getElementById("replayBest"),
   replayAvgTarget: document.getElementById("replayAvgTarget"),
@@ -3669,11 +3681,67 @@ async function refreshJournalStats(force = false) {
       }
     });
     renderJournalRows();
+    refreshModelValidation();
     refreshReplayStats();
     refreshRecommendationScoreboard();
   } catch (error) {
     if (error.name === "AbortError") return;
     console.info("Journal stats unavailable.", error);
+  }
+}
+
+function renderValidationRows(title, rows, label) {
+  const row = (rows || []).find((item) => Number(item.resolved || 0) >= 2);
+  if (!row) return `<div><span>${title}</span><strong>Building sample</strong></div>`;
+  const rate = Number(row.winRate || 0);
+  const expectancy = Number(row.expectedR || 0);
+  return `<div><span>${title}</span><strong>${escapeHtml(String(row.key))} · ${fmt(rate, 0)}% · ${expectancy >= 0 ? "+" : ""}${fmt(expectancy, 2)}R</strong><small>${row.resolved} resolved ${label}</small></div>`;
+}
+
+function renderModelValidation(data) {
+  const criteria = data.criteria || {};
+  const passed = Object.values(criteria).filter(Boolean).length;
+  const samples = Number(data.resolved || 0);
+  const winRate = data.winRate == null ? null : Number(data.winRate);
+  const range = data.winRateConfidence || {};
+  const expectancy = data.expectedR == null ? null : Number(data.expectedR);
+  const drawdown = Number(data.maxDrawdownR || 0);
+  const status = data.status || "Building";
+  const tone = status === "Validated" ? "positive" : status === "Developing" ? "warning" : "neutral";
+  els.modelValidationVersion.textContent = `Forward evaluation · strategy v${data.strategyVersion || "--"}`;
+  els.modelValidationBadge.textContent = status;
+  setTone(els.modelValidationBadge, tone);
+  els.modelValidationSamples.textContent = `${samples} / 30`;
+  els.modelValidationRecord.textContent = samples ? `${data.winners} / ${data.losses}` : "--";
+  els.modelValidationWinRate.textContent = winRate === null ? "--" : `${fmt(winRate, 0)}%`;
+  els.modelValidationRange.textContent = range.low == null ? "--" : `${fmt(Number(range.low), 0)}–${fmt(Number(range.high), 0)}%`;
+  els.modelValidationExpectancy.textContent = expectancy === null ? "--" : `${expectancy >= 0 ? "+" : ""}${fmt(expectancy, 2)}R`;
+  setTone(els.modelValidationExpectancy, expectancy > 0 ? "positive" : expectancy < 0 ? "negative" : "neutral");
+  els.modelValidationDrawdown.textContent = samples ? `${fmt(drawdown, 2)}R` : "--";
+  const replay = data.outOfSample || {};
+  els.modelValidationReplay.textContent = replay.status === "validated"
+    ? `Validated · ${replay.resolved || 0}`
+    : replay.status === "provisional" ? `Provisional · ${replay.resolved || 0}` : "Building";
+  els.modelValidationRequirements.textContent = `${passed} / 4 passed`;
+  els.modelValidationBreakdown.innerHTML = [
+    renderValidationRows("Best setup", data.bySetup, "in this setup"),
+    renderValidationRows("Best timeframe", data.byTimeframe, "in this timeframe"),
+    renderValidationRows("Best regime", data.byRegime, "in this regime"),
+  ].join("");
+  updateValidationEmptyState();
+}
+
+async function refreshModelValidation() {
+  try {
+    const symbol = API_SYMBOL;
+    const response = await marketFetch(`/api/model-validation?symbol=${encodeURIComponent(symbol)}`);
+    if (!response.ok) throw new Error(`model validation failed: ${response.status}`);
+    const data = await response.json();
+    if (!isCurrentAsset(symbol)) return;
+    state.modelValidation = data;
+    renderModelValidation(data);
+  } catch (error) {
+    if (error.name !== "AbortError") console.info("Model validation unavailable.", error);
   }
 }
 
@@ -3731,7 +3799,7 @@ function renderPatternValidation() {
 }
 
 function updateValidationEmptyState() {
-  els.validationEmptyState.hidden = !(els.replayTile.hidden && els.patternValidationTile.hidden);
+  els.validationEmptyState.hidden = true;
 }
 
 function renderReplaySummary(data) {
@@ -4245,7 +4313,20 @@ function resetMarketState() {
   els.chartPriceLadder.hidden = true;
   els.journalStatsTile.hidden = true;
   els.performanceEmptyState.hidden = false;
+  els.modelValidationVersion.textContent = "Forward evaluation · current strategy";
+  els.modelValidationBadge.textContent = "Building";
+  setTone(els.modelValidationBadge, "neutral");
+  els.modelValidationSamples.textContent = "0 / 30";
+  els.modelValidationRecord.textContent = "--";
+  els.modelValidationWinRate.textContent = "--";
+  els.modelValidationRange.textContent = "--";
+  els.modelValidationExpectancy.textContent = "--";
+  els.modelValidationDrawdown.textContent = "--";
+  els.modelValidationReplay.textContent = "Building";
+  els.modelValidationRequirements.textContent = "0 / 4 passed";
+  els.modelValidationBreakdown.innerHTML = "";
   els.replayTile.hidden = true;
+  els.modelValidationTile.hidden = false;
   els.patternValidationTile.hidden = true;
   updateValidationEmptyState();
   renderAlertLog();

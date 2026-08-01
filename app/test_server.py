@@ -446,6 +446,26 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(scoreboard["BTC-USD"]["unsuccessful"], 0)
     self.assertEqual(scoreboard["TA125"]["recommended"], 0)
 
+  def test_model_validation_requires_forward_sample_and_quality_gates(self):
+    for index in range(30):
+      self.insert_plan(
+        f"validation-{index}",
+        realized_r=1.0 if index < 24 else -1.0,
+        outcome_status="target2" if index < 24 else "stopped",
+        lifecycle_status="closed",
+        closed_at=100_000 + index,
+      )
+    with server.db() as connection:
+      snapshot = server.model_validation_snapshot(connection, "QQQ")
+    self.assertEqual(snapshot["status"], "Developing")
+    self.assertEqual(snapshot["resolved"], 30)
+    self.assertEqual(snapshot["winners"], 24)
+    self.assertTrue(snapshot["criteria"]["minimumSamples"])
+    self.assertTrue(snapshot["criteria"]["positiveExpectancy"])
+    self.assertTrue(snapshot["criteria"]["winRateConfidence"])
+    self.assertFalse(snapshot["criteria"]["outOfSample"])
+    self.assertEqual(snapshot["byTimeframe"][0]["key"], "1")
+
   def test_cnn_fear_greed_payload_is_normalized(self):
     result = server.normalize_fear_greed({
       "fear_and_greed": {

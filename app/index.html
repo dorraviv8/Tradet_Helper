@@ -425,6 +425,27 @@
             <span>Journal statistics appear after plans are recorded and resolved.</span>
           </section>
 
+          <section id="modelValidationTile" class="insight-tile insight-wide" data-insight-panel="validation">
+            <div class="section-heading">
+              <div>
+                <h2>Model Validation</h2>
+                <p id="modelValidationVersion" class="tile-footnote">Current strategy</p>
+              </div>
+              <span id="modelValidationBadge" class="badge neutral">Building</span>
+            </div>
+            <div class="journal-grid">
+              <div><span>Forward samples</span><strong id="modelValidationSamples">0 / 30</strong></div>
+              <div><span>Wins / losses</span><strong id="modelValidationRecord">--</strong></div>
+              <div><span>Win rate</span><strong id="modelValidationWinRate">--</strong></div>
+              <div><span>95% rate range</span><strong id="modelValidationRange">--</strong></div>
+              <div><span>Expectancy</span><strong id="modelValidationExpectancy">--</strong></div>
+              <div><span>Max drawdown</span><strong id="modelValidationDrawdown">--</strong></div>
+              <div><span>Out-of-sample</span><strong id="modelValidationReplay">Building</strong></div>
+              <div><span>Requirements</span><strong id="modelValidationRequirements">0 / 4</strong></div>
+            </div>
+            <div id="modelValidationBreakdown" class="validation-breakdown"></div>
+          </section>
+
           <section id="replayTile" class="insight-tile" data-insight-panel="validation" hidden>
             <div class="section-heading">
               <h2>Historical Replay</h2>

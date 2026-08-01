@@ -289,6 +289,38 @@ h2 {
 .scoreboard-market.neutral strong,
 .scoreboard-market.loading strong { color: var(--muted); }
 
+.validation-breakdown {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.validation-breakdown > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px 12px 0 0;
+}
+
+.validation-breakdown > div + div {
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+.validation-breakdown span,
+.validation-breakdown small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.validation-breakdown strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .scanner-heading {
   margin-bottom: 10px;
 }
@@ -2682,6 +2714,16 @@ body[data-horizon="journal"] .lower-band {
 
   .scoreboard-market:nth-child(-n + 2) {
     border-bottom: 1px solid var(--line);
+  }
+
+  .validation-breakdown {
+    grid-template-columns: 1fr;
+  }
+
+  .validation-breakdown > div,
+  .validation-breakdown > div + div {
+    padding: 8px 0 0;
+    border-left: 0;
   }
 
   .swing-summary {

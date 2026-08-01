@@ -3373,6 +3373,92 @@ def recommendation_scoreboard(connection):
   return markets
 
 
+def validation_breakdown(rows, field):
+  groups = {}
+  for row in rows:
+    key = str(row[field] or "unknown")
+    item = groups.setdefault(key, {"key": key, "resolved": 0, "winners": 0, "totalR": 0.0})
+    item["resolved"] += 1
+    item["winners"] += int(float(row["realized_r"]) > 0)
+    item["totalR"] += float(row["realized_r"])
+  output = []
+  for item in groups.values():
+    resolved = item["resolved"]
+    output.append({
+      "key": item["key"],
+      "resolved": resolved,
+      "winners": item["winners"],
+      "winRate": round(item["winners"] * 100 / resolved, 1),
+      "expectedR": round(item["totalR"] / resolved, 3),
+    })
+  return sorted(output, key=lambda item: (-item["resolved"], item["key"]))
+
+
+def max_drawdown_r(rows):
+  equity = 0.0
+  peak = 0.0
+  maximum = 0.0
+  for row in rows:
+    equity += float(row["realized_r"])
+    peak = max(peak, equity)
+    maximum = max(maximum, peak - equity)
+  return round(maximum, 3)
+
+
+def model_validation_snapshot(connection, symbol=SYMBOL):
+  rows = connection.execute("""
+    SELECT realized_r, setup_type, timeframe, market_regime
+    FROM plans
+    WHERE symbol = ? AND eligible_for_learning = 1 AND strategy_version = ?
+      AND realized_r IS NOT NULL
+    ORDER BY COALESCE(closed_at, updated_at), id
+  """, (symbol, STRATEGY_VERSION)).fetchall()
+  resolved = len(rows)
+  winners = sum(float(row["realized_r"]) > 0 for row in rows)
+  expected_r = sum(float(row["realized_r"]) for row in rows) / resolved if resolved else None
+  low, high = wilson_interval(winners, resolved)
+  replay = load_latest_backtest(connection, symbol) or {}
+  replay_validation = replay.get("validation") or {}
+  out_of_sample = replay_validation.get("outOfSample") or {}
+  criteria = {
+    "minimumSamples": resolved >= 30,
+    "positiveExpectancy": expected_r is not None and expected_r > 0,
+    "winRateConfidence": low is not None and low > 0.5,
+    "outOfSample": replay_validation.get("status") == "validated",
+  }
+  if all(criteria.values()):
+    status = "Validated"
+  elif resolved >= 10:
+    status = "Developing"
+  else:
+    status = "Building"
+  return {
+    "symbol": symbol,
+    "strategyVersion": STRATEGY_VERSION,
+    "status": status,
+    "resolved": resolved,
+    "winners": winners,
+    "losses": resolved - winners,
+    "winRate": round(winners * 100 / resolved, 1) if resolved else None,
+    "winRateConfidence": {
+      "low": round(low * 100, 1) if low is not None else None,
+      "high": round(high * 100, 1) if high is not None else None,
+    },
+    "expectedR": round(expected_r, 3) if expected_r is not None else None,
+    "maxDrawdownR": max_drawdown_r(rows),
+    "criteria": criteria,
+    "outOfSample": {
+      "status": replay_validation.get("status") or "building",
+      "resolved": int(out_of_sample.get("resolved") or 0),
+      "expectedR": finite_or_none(out_of_sample.get("expectedR")),
+      "profitFactor": finite_or_none(out_of_sample.get("profitFactor")),
+    },
+    "bySetup": validation_breakdown(rows, "setup_type"),
+    "byTimeframe": validation_breakdown(rows, "timeframe"),
+    "byRegime": validation_breakdown(rows, "market_regime"),
+  }
+
+
 class Handler(SimpleHTTPRequestHandler):
   server_version = "QQQAlertHelper/3.0"
 
@@ -3566,6 +3652,12 @@ class Handler(SimpleHTTPRequestHandler):
       with db() as connection:
         rows = pattern_validation_stats(connection, symbol)
       self.send_json(200, {"symbol": symbol, "patterns": rows})
+      return
+    if parsed.path == "/api/model-validation":
+      params = parse_qs(parsed.query)
+      symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
+      with db() as connection:
+        self.send_json(200, model_validation_snapshot(connection, symbol))
       return
     if parsed.path == "/api/config":
       params = parse_qs(parsed.query)
