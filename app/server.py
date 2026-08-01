@@ -87,7 +87,9 @@ ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
 MONITOR_INTERVAL_SECONDS = max(30, int(os.environ.get("MONITOR_INTERVAL_SECONDS", "60")))
 MONITOR_FAILURE_THRESHOLD = max(1, int(os.environ.get("MONITOR_FAILURE_THRESHOLD", "3")))
 SSE_MAX_CONNECTION_SECONDS = 75
-MAX_REQUEST_THREADS = 32
+# Live browser sessions hold an SSE request open for long periods. Keep enough
+# request capacity for normal chart/history calls alongside those connections.
+MAX_REQUEST_THREADS = max(32, int(os.environ.get("MAX_REQUEST_THREADS", "96")))
 FETCH_CACHE = {}
 FETCH_CACHE_LOCK = threading.Lock()
 MARKET_CONTEXT_LOCK = threading.Lock()
@@ -4393,7 +4395,7 @@ class Handler(SimpleHTTPRequestHandler):
 class AppHTTPServer(ThreadingHTTPServer):
   daemon_threads = True
   allow_reuse_address = True
-  request_queue_size = 64
+  request_queue_size = 128
 
   def __init__(self, *args, **kwargs):
     self.request_slots = threading.BoundedSemaphore(MAX_REQUEST_THREADS)
@@ -4401,7 +4403,16 @@ class AppHTTPServer(ThreadingHTTPServer):
 
   def process_request(self, request, client_address):
     if not self.request_slots.acquire(blocking=False):
-      self.shutdown_request(request)
+      try:
+        request.sendall(
+          b"HTTP/1.1 503 Service Unavailable\r\n"
+          b"Content-Type: application/json\r\n"
+          b"Content-Length: 40\r\n"
+          b"Connection: close\r\n\r\n"
+          b'{"error":"server_busy","retryable":true}'
+        )
+      finally:
+        self.shutdown_request(request)
       return
 
     def run_request():
