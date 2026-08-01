@@ -4251,8 +4251,6 @@ class Handler(SimpleHTTPRequestHandler):
       symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
       daily_cache, fetched_at = load_daily_candles(symbol, limit=3000)
       if len(daily_cache) >= 400 and fetched_at and now_ms() - int(fetched_at) < DAILY_CACHE_TTL_MS:
-        with MARKET_RUNTIME_LOCK:
-          MARKET_RUNTIMES[symbol]["daily_history"] = daily_cache
         self.send_json(200, {
           "symbol": symbol,
           "provider": "yahoo",
@@ -4264,8 +4262,6 @@ class Handler(SimpleHTTPRequestHandler):
       try:
         candles = fetch_daily_candles(symbol)
         save_daily_candles(symbol, "yahoo", candles)
-        with MARKET_RUNTIME_LOCK:
-          MARKET_RUNTIMES[symbol]["daily_history"] = candles[-3000:]
         self.send_json(200, {
           "symbol": symbol,
           "provider": "yahoo",
