@@ -420,13 +420,13 @@ class ServerTests(unittest.TestCase):
       snapshot = server.load_learning_snapshot(connection, "QQQ")
     self.assertEqual(snapshot["resolvedSamples"], 1)
 
-  def test_recommendation_scoreboard_reports_resolved_successes_per_market(self):
+  def test_recommendation_scoreboard_reports_all_recorded_alert_outcomes_per_market(self):
     self.insert_plan("qqq-win", realized_r=1.3, outcome_status="target2", lifecycle_status="closed")
     self.insert_plan("qqq-loss", realized_r=-1.0, outcome_status="stopped", lifecycle_status="closed")
     self.insert_plan("qqq-open", realized_r=None, outcome_status="open", lifecycle_status="waiting")
     self.insert_plan("spy-win", symbol="SPY", realized_r=0.5, outcome_status="target1", lifecycle_status="closed")
     self.insert_plan(
-      "ignored-old-version",
+      "older-qqq-win",
       strategy_version="5.0.0",
       realized_r=1.0,
       outcome_status="target2",
@@ -435,12 +435,15 @@ class ServerTests(unittest.TestCase):
     with server.db() as connection:
       scoreboard = {row["symbol"]: row for row in server.recommendation_scoreboard(connection)}
     self.assertEqual(scoreboard["QQQ"], {
-      "symbol": "QQQ", "recommended": 3, "resolved": 2, "successful": 1, "successRate": 50.0,
+      "symbol": "QQQ", "recommended": 4, "resolved": 3, "successful": 2,
+      "unsuccessful": 1, "active": 1, "successRate": 66.7,
     })
     self.assertEqual(scoreboard["SPY"], {
-      "symbol": "SPY", "recommended": 1, "resolved": 1, "successful": 1, "successRate": 100.0,
+      "symbol": "SPY", "recommended": 1, "resolved": 1, "successful": 1,
+      "unsuccessful": 0, "active": 0, "successRate": 100.0,
     })
     self.assertEqual(scoreboard["BTC-USD"]["successRate"], None)
+    self.assertEqual(scoreboard["BTC-USD"]["unsuccessful"], 0)
     self.assertEqual(scoreboard["TA125"]["recommended"], 0)
 
   def test_cnn_fear_greed_payload_is_normalized(self):

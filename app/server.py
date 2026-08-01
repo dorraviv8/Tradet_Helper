@@ -3340,13 +3340,18 @@ def recommendation_scoreboard(connection):
       symbol,
       COUNT(*) AS recommended,
       COALESCE(SUM(CASE WHEN realized_r IS NOT NULL THEN 1 ELSE 0 END), 0) AS resolved,
-      COALESCE(SUM(CASE WHEN realized_r > 0 THEN 1 ELSE 0 END), 0) AS successful
+      COALESCE(SUM(CASE WHEN realized_r > 0 THEN 1 ELSE 0 END), 0) AS successful,
+      COALESCE(SUM(CASE WHEN realized_r <= 0 THEN 1 ELSE 0 END), 0) AS unsuccessful,
+      COALESCE(SUM(CASE
+        WHEN outcome_status IN ('open', 'target1')
+          AND COALESCE(lifecycle_status, 'waiting') IN ('waiting', 'entered')
+        THEN 1 ELSE 0
+      END), 0) AS active
     FROM plans
     WHERE symbol IN ({placeholders})
-      AND eligible_for_learning = 1
-      AND strategy_version = ?
+      AND status = 'alert'
     GROUP BY symbol
-  """, (*SUPPORTED_SYMBOLS, STRATEGY_VERSION)).fetchall()
+  """, SUPPORTED_SYMBOLS).fetchall()
   by_symbol = {row["symbol"]: dict(row) for row in rows}
   markets = []
   for symbol in SUPPORTED_SYMBOLS:
@@ -3354,11 +3359,15 @@ def recommendation_scoreboard(connection):
     recommended = int(row.get("recommended") or 0)
     resolved = int(row.get("resolved") or 0)
     successful = int(row.get("successful") or 0)
+    unsuccessful = int(row.get("unsuccessful") or 0)
+    active = int(row.get("active") or 0)
     markets.append({
       "symbol": symbol,
       "recommended": recommended,
       "resolved": resolved,
       "successful": successful,
+      "unsuccessful": unsuccessful,
+      "active": active,
       "successRate": round(successful * 100 / resolved, 1) if resolved else None,
     })
   return markets

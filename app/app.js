@@ -512,13 +512,15 @@ function renderRecommendationScoreboard(markets = []) {
     const market = bySymbol.get(symbol) || {};
     const resolved = Number(market.resolved || 0);
     const successful = Number(market.successful || 0);
+    const unsuccessful = Number(market.unsuccessful || 0);
+    const active = Number(market.active || 0);
     const rate = market.successRate == null ? null : Number(market.successRate);
     const rateLabel = Number.isFinite(rate) ? `${fmt(rate, rate % 1 ? 1 : 0)}%` : "--";
     const detail = resolved
-      ? `${successful} successful / ${resolved} resolved`
-      : "No resolved recommendations";
+      ? `${successful} wins / ${unsuccessful} losses${active ? ` · ${active} active` : ""}`
+      : active ? `${active} active · no closed trades` : "No closed recommendations";
     const tone = !resolved ? "neutral" : rate >= 50 ? "positive" : "negative";
-    return `<div class="scoreboard-market ${tone}" title="A successful recommendation has positive realized R.">
+    return `<div class="scoreboard-market ${tone}" title="All recorded server alerts. A win has positive realized R.">
       <span>${escapeHtml(ASSETS[symbol].label)}</span>
       <strong>${rateLabel}</strong>
       <small>${detail}</small>
