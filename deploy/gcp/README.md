@@ -83,7 +83,7 @@ sudo apt-get install -y docker.io docker-compose
 sudo systemctl enable --now docker
 ```
 
-On the VM, create a private `.env` file from `.env.example`. Set a unique, long `APP_PASSWORD` and the public hostname in `PUBLIC_HOST`. Do not commit this file. `MARKETDATA_TOKEN` is optional: without it, the QQQ Options Opportunity section provides strike, delta, and DTE guidance; with it, the server can select a delayed exact contract after applying liquidity and quote-quality gates. The application caches chains for 30 minutes and enforces a persistent 80-credit daily ceiling.
+On the VM, create a private `.env` file from `.env.example`. Set a unique, long `APP_PASSWORD` and the public hostname in `PUBLIC_HOST`. Do not commit this file. Set `FINNHUB_API_KEY` to independently verify QQQ and SPY prices without a brokerage account; BTC-USD is verified against the public Coinbase Exchange ticker automatically. TA-125 remains marked unverified until a licensed compatible source is configured. Two consecutive price mismatches, two stale verifier checks, or three verifier failures block new alerts during an active session. `MARKETDATA_TOKEN` is optional: without it, the QQQ Options Opportunity section provides strike, delta, and DTE guidance; with it, the server can select a delayed exact contract after applying liquidity and quote-quality gates. The application caches chains for 30 minutes and enforces a persistent 80-credit daily ceiling.
 
 ```bash
 cp .env.example .env

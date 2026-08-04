@@ -224,6 +224,64 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(candles, cached)
     self.assertTrue(degraded)
 
+  def test_secondary_quote_requires_two_mismatches_before_blocking_status(self):
+    now = 1_780_000_000_000
+    profile = {
+      "provider": "test",
+      "name": "Independent test feed",
+      "configured": True,
+      "tolerancePct": 0.5,
+      "freshnessMs": 180_000,
+    }
+    primary = candle(now, 100, 101, 99, 100, 1_000)
+    with patch.object(server, "secondary_provider_profile", return_value=profile), patch.object(
+      server, "fetch_secondary_quote", return_value={"price": 102, "time": now}
+    ):
+      first = server.validate_secondary_quote("QQQ", primary, timestamp=now)
+      second = server.validate_secondary_quote("QQQ", primary, first, timestamp=now + 60_000)
+    self.assertEqual(first["status"], "checking")
+    self.assertEqual(first["mismatchCount"], 1)
+    self.assertEqual(second["status"], "mismatch")
+    self.assertEqual(second["mismatchCount"], 2)
+    self.assertGreater(second["driftPct"], 1.9)
+
+  def test_secondary_quote_verifies_close_prices_within_tolerance(self):
+    now = 1_780_000_000_000
+    profile = {
+      "provider": "test",
+      "name": "Independent test feed",
+      "configured": True,
+      "tolerancePct": 0.5,
+      "freshnessMs": 180_000,
+    }
+    with patch.object(server, "secondary_provider_profile", return_value=profile), patch.object(
+      server, "fetch_secondary_quote", return_value={"price": 100.1, "time": now - 10_000}
+    ):
+      result = server.validate_secondary_quote(
+        "QQQ", candle(now, 100, 101, 99, 100, 1_000), timestamp=now
+      )
+    self.assertEqual(result["status"], "verified")
+    self.assertEqual(result["failures"], 0)
+    self.assertLess(result["driftPct"], result["tolerancePct"])
+
+  def test_secondary_quote_waits_for_three_failures_before_unavailable(self):
+    profile = {
+      "provider": "test",
+      "name": "Independent test feed",
+      "configured": True,
+      "tolerancePct": 0.5,
+      "freshnessMs": 180_000,
+    }
+    primary = candle(1_780_000_000_000, 100, 101, 99, 100, 1_000)
+    result = None
+    with patch.object(server, "secondary_provider_profile", return_value=profile), patch.object(
+      server, "fetch_secondary_quote", side_effect=server.URLError("offline")
+    ):
+      for index in range(3):
+        result = server.validate_secondary_quote("QQQ", primary, result, 1_780_000_000_000 + index * 60_000)
+    self.assertEqual(result["status"], "unavailable")
+    self.assertEqual(result["failures"], 3)
+
   def test_monitoring_incidents_open_update_and_resolve_without_repeat_alerts(self):
     notifications = []
     notifier = lambda event, incident: notifications.append((event, incident["incident_key"])) or True
@@ -246,6 +304,8 @@ class ServerTests(unittest.TestCase):
     self.assertIn("trader_helper_up 1", metrics)
     self.assertIn('trader_helper_provider_errors{symbol="QQQ"}', metrics)
     self.assertIn('trader_helper_trade_alerts_allowed{symbol="BTC-USD"}', metrics)
+    self.assertIn('trader_helper_secondary_price_drift_pct{symbol="BTC-USD"}', metrics)
+    self.assertIn('trader_helper_secondary_price_verified{symbol="QQQ"}', metrics)
 
   def test_supported_symbols_include_bitcoin_and_spy(self):
     self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")
@@ -351,6 +411,34 @@ class ServerTests(unittest.TestCase):
     self.assertTrue(health["timeframes"]["5"]["tradeAllowed"])
     self.assertFalse(health["timeframes"]["15"]["tradeAllowed"])
     self.assertIn("15m not enough recent bars", health["warnings"])
+
+  def test_data_health_blocks_confirmed_secondary_price_mismatch(self):
+    now = int(datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    runtime = server.new_market_runtime()
+    runtime["history"] = [
+      candle(now - (70 - index) * server.MINUTE_MS, 100, 101, 99, 100.5, 1_000)
+      for index in range(70)
+    ]
+    runtime["candle"] = candle(now, 100, 101, 99, 100.5, 1_000)
+    runtime["five_minute_history"] = [
+      candle(now - (180 - index * 5) * server.MINUTE_MS, 100, 101, 99, 100.5, 2_000)
+      for index in range(36)
+    ]
+    runtime["daily_history"] = [
+      candle(now - (220 - index) * 86_400_000, 100, 101, 99, 100.5, 2_000)
+      for index in range(220)
+    ]
+    runtime["last_success_at"] = now
+    runtime["secondary_validation"] = {
+      "status": "mismatch",
+      "providerName": "Independent test feed",
+      "configured": True,
+      "driftPct": 1.2,
+      "detail": "Primary and independent prices differ by 1.20%",
+    }
+    health = server.evaluate_data_health("QQQ", runtime, now)
+    self.assertFalse(health["tradeAllowed"])
+    self.assertIn("Primary and independent prices differ", " ".join(health["blockers"]))
 
   def test_data_health_marks_directional_candidates_watch_only(self):
     candidate = {"direction": "long", "watchOnly": False, "reasons": []}

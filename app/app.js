@@ -176,6 +176,7 @@ const els = {
   sessionMode: document.getElementById("sessionMode"),
   providerHealthBadge: document.getElementById("providerHealthBadge"),
   providerSource: document.getElementById("providerSource"),
+  providerCrossCheck: document.getElementById("providerCrossCheck"),
   providerLastTick: document.getElementById("providerLastTick"),
   providerErrors: document.getElementById("providerErrors"),
   providerTradeAlerts: document.getElementById("providerTradeAlerts"),
@@ -744,6 +745,25 @@ function renderProviderHealth() {
   els.providerHealthBadge.textContent = dataHealth?.status || (stale ? "Stale" : healthy ? (marketOpen ? "Live" : "Connected") : state.feedMode === "real" ? "Issue" : "Demo");
   setTone(els.providerHealthBadge, dataHealth?.tone || (healthy ? "positive" : stale || state.providerErrors ? "negative" : "neutral"));
   els.providerSource.textContent = state.providerLabel;
+  const crossValidation = dataHealth?.crossValidation || {};
+  const crossStatus = crossValidation.status || "building";
+  const crossProvider = crossValidation.providerName || "Independent source";
+  const crossDrift = Number(crossValidation.driftPct);
+  els.providerCrossCheck.textContent = crossStatus === "verified"
+    ? `${crossProvider} ${Number.isFinite(crossDrift) ? `${fmt(crossDrift, 3)}%` : "verified"}`
+    : crossStatus === "mismatch"
+      ? `Mismatch ${Number.isFinite(crossDrift) ? `${fmt(crossDrift, 2)}%` : ""}`.trim()
+      : crossStatus === "unconfigured"
+        ? "Not configured"
+        : crossStatus === "unavailable"
+          ? "Unavailable"
+          : crossStatus === "stale"
+            ? "Stale"
+            : "Checking";
+  setTone(
+    els.providerCrossCheck,
+    crossStatus === "verified" ? "positive" : ["mismatch", "unavailable", "stale"].includes(crossStatus) ? "negative" : "neutral",
+  );
   const refreshAge = refreshAgeMs === null ? "--" : `${Math.max(0, Math.round(refreshAgeMs / 1000))}s refresh`;
   const candleAge = marketAgeMs === null ? "--" : `${Math.max(0, Math.round(marketAgeMs / 1000))}s candle`;
   els.providerLastTick.textContent = `${refreshAge} / ${candleAge}`;

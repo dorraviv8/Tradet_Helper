@@ -47,6 +47,9 @@ CNN_FEAR_GREED_PAGE = "https://edition.cnn.com/markets/fear-and-greed"
 CNN_FEAR_GREED_API = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 MARKETDATA_TOKEN = os.environ.get("MARKETDATA_TOKEN", "")
 MARKETDATA_BASE = os.environ.get("MARKETDATA_BASE_URL", "https://api.marketdata.app")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+FINNHUB_BASE = os.environ.get("FINNHUB_BASE_URL", "https://finnhub.io/api/v1")
+COINBASE_EXCHANGE_BASE = os.environ.get("COINBASE_EXCHANGE_BASE_URL", "https://api.exchange.coinbase.com")
 IBKR_HOST = os.environ.get("IBKR_HOST", "127.0.0.1")
 IBKR_PORT = int(os.environ.get("IBKR_PORT", "7496"))
 IBKR_CLIENT_ID = int(os.environ.get("IBKR_CLIENT_ID", "17"))
@@ -82,6 +85,7 @@ OPTIONS_PROVIDER_DAILY_LIMIT = 80
 OPTIONS_PROVIDER_REQUEST_CREDITS = 4
 BACKTEST_MIN_REPLAY_INTERVAL_MS = 60 * 60 * 1000
 BACKTEST_MAX_CONCURRENCY = max(1, int(os.environ.get("BACKTEST_MAX_CONCURRENCY", "1")))
+SECONDARY_VALIDATION_INTERVAL_SECONDS = max(30, int(os.environ.get("SECONDARY_VALIDATION_INTERVAL_SECONDS", "60")))
 LEARNING_SNAPSHOT_VERSION = 2
 ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
 MONITOR_INTERVAL_SECONDS = max(30, int(os.environ.get("MONITOR_INTERVAL_SECONDS", "60")))
@@ -118,6 +122,14 @@ def new_market_runtime():
     "backtest_error": None,
     "backtest_last_started_at": None,
     "source_metadata": {},
+    "secondary_validation": {
+      "status": "building",
+      "provider": None,
+      "configured": False,
+      "failures": 0,
+      "mismatchCount": 0,
+      "staleCount": 0,
+    },
   }
 
 
@@ -729,6 +741,162 @@ def yahoo_get(path, params=None):
   })
   with urlopen(fallback_request, timeout=12) as response:
     return json.loads(response.read().decode("utf-8"))
+
+
+def secondary_provider_profile(symbol):
+  symbol = validate_symbol(symbol)
+  if symbol == "BTC-USD":
+    return {
+      "provider": "coinbase",
+      "name": "Coinbase Exchange",
+      "configured": True,
+      "tolerancePct": 0.75,
+      "freshnessMs": 3 * MINUTE_MS,
+    }
+  if symbol in {"QQQ", "SPY"} and FINNHUB_API_KEY:
+    return {
+      "provider": "finnhub",
+      "name": "Finnhub",
+      "configured": True,
+      "tolerancePct": 0.5,
+      "freshnessMs": 5 * MINUTE_MS,
+    }
+  if symbol in {"QQQ", "SPY"} and POLYGON_API_KEY and active_provider(symbol) != "polygon":
+    return {
+      "provider": "polygon",
+      "name": "Massive market data",
+      "configured": True,
+      "tolerancePct": 0.35,
+      "freshnessMs": 5 * MINUTE_MS,
+    }
+  detail = (
+    "Set FINNHUB_API_KEY to independently verify US ETF prices"
+    if symbol in {"QQQ", "SPY"}
+    else "No independent TA-125 quote source is configured"
+  )
+  return {
+    "provider": None,
+    "name": "Not configured",
+    "configured": False,
+    "tolerancePct": None,
+    "freshnessMs": None,
+    "detail": detail,
+  }
+
+
+def fetch_finnhub_quote(symbol):
+  if not FINNHUB_API_KEY:
+    raise RuntimeError("FINNHUB_API_KEY is not set")
+  url = f"{FINNHUB_BASE}/quote?{urlencode({'symbol': symbol, 'token': FINNHUB_API_KEY})}"
+  request = Request(url, headers={"Accept": "application/json", "User-Agent": "TraderHelper/6.0"})
+  with urlopen(request, timeout=10) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+  price = finite_number(payload.get("c"))
+  quote_time = finite_number(payload.get("t"))
+  if price is None or price <= 0 or quote_time is None or quote_time <= 0:
+    raise ValueError("Finnhub returned an invalid quote")
+  return {"price": price, "time": int(quote_time * 1000)}
+
+
+def fetch_coinbase_quote():
+  request = Request(
+    f"{COINBASE_EXCHANGE_BASE}/products/BTC-USD/ticker",
+    headers={"Accept": "application/json", "User-Agent": "TraderHelper/6.0"},
+  )
+  with urlopen(request, timeout=10) as response:
+    payload = json.loads(response.read().decode("utf-8"))
+  price = finite_number(payload.get("price"))
+  if price is None or price <= 0 or not payload.get("time"):
+    raise ValueError("Coinbase returned an invalid quote")
+  return {"price": price, "time": parse_rfc3339_millis(payload["time"])}
+
+
+def fetch_secondary_quote(symbol, profile=None):
+  profile = profile or secondary_provider_profile(symbol)
+  provider = profile.get("provider")
+  if provider == "coinbase":
+    return fetch_coinbase_quote()
+  if provider == "finnhub":
+    return fetch_finnhub_quote(symbol)
+  if provider == "polygon":
+    candle = fetch_latest_candle("polygon", symbol)
+    if not candle:
+      raise ValueError("Massive returned no quote")
+    return {"price": float(candle["close"]), "time": int(candle["time"])}
+  raise RuntimeError(profile.get("detail") or "Secondary quote provider is not configured")
+
+
+def validate_secondary_quote(symbol, primary_candle, previous=None, timestamp=None):
+  timestamp = int(timestamp or now_ms())
+  previous = previous or {}
+  profile = secondary_provider_profile(symbol)
+  base = {
+    "provider": profile.get("provider"),
+    "providerName": profile.get("name"),
+    "configured": bool(profile.get("configured")),
+    "checkedAt": timestamp,
+    "tolerancePct": profile.get("tolerancePct"),
+    "failures": int(previous.get("failures") or 0),
+    "mismatchCount": int(previous.get("mismatchCount") or 0),
+    "staleCount": int(previous.get("staleCount") or 0),
+    "lastVerifiedAt": previous.get("lastVerifiedAt"),
+  }
+  if not profile.get("configured"):
+    return {
+      **base,
+      "status": "unconfigured",
+      "detail": profile.get("detail"),
+      "failures": 0,
+      "mismatchCount": 0,
+      "staleCount": 0,
+    }
+  primary_price = finite_number((primary_candle or {}).get("close"))
+  if primary_price is None or primary_price <= 0:
+    return {**base, "status": "building", "detail": "Waiting for a primary market price"}
+  try:
+    quote = fetch_secondary_quote(symbol, profile)
+    secondary_price = float(quote["price"])
+    quote_time = int(quote["time"])
+    quote_age = max(0, timestamp - quote_time)
+    drift = abs(primary_price - secondary_price) / max(primary_price, secondary_price) * 100
+    stale = quote_age > int(profile["freshnessMs"])
+    mismatch = drift > float(profile["tolerancePct"])
+    mismatch_count = int(previous.get("mismatchCount") or 0) + 1 if mismatch else 0
+    stale_count = int(previous.get("staleCount") or 0) + 1 if stale else 0
+    if mismatch_count >= 2:
+      status = "mismatch"
+      detail = f"Primary and {profile['name']} prices differ by {drift:.2f}%"
+    elif stale_count >= 2:
+      status = "stale"
+      detail = f"{profile['name']} quote is {round(quote_age / 1000)} seconds old"
+    elif mismatch or stale:
+      status = "checking"
+      detail = "Waiting for a second confirmation before blocking alerts"
+    else:
+      status = "verified"
+      detail = f"Primary price agrees with {profile['name']} within {drift:.3f}%"
+    return {
+      **base,
+      "status": status,
+      "detail": detail,
+      "primaryPrice": round(primary_price, 6),
+      "secondaryPrice": round(secondary_price, 6),
+      "secondaryTime": quote_time,
+      "ageMs": quote_age,
+      "driftPct": round(drift, 4),
+      "failures": 0,
+      "mismatchCount": mismatch_count,
+      "staleCount": stale_count,
+      "lastVerifiedAt": timestamp if status == "verified" else previous.get("lastVerifiedAt"),
+    }
+  except Exception as error:
+    failures = int(previous.get("failures") or 0) + 1
+    return {
+      **base,
+      "status": "unavailable" if failures >= 3 else "checking",
+      "detail": f"{profile['name']} verification failed: {str(error)[:160]}",
+      "failures": failures,
+    }
 
 
 def fear_greed_rating(score):
@@ -2316,6 +2484,21 @@ def evaluate_data_health(symbol, runtime, timestamp=None):
   source = runtime.get("source_metadata") or provider_metadata(active_provider(symbol), symbol)
   if source.get("tier") == "best_effort":
     warnings.append("best-effort source is not exchange-certified real-time data")
+  cross_validation = runtime.get("secondary_validation") or {
+    "status": "building",
+    "configured": False,
+    "detail": "Independent price verification is starting",
+  }
+  cross_status = cross_validation.get("status")
+  if cross_status == "mismatch":
+    blockers.append(cross_validation.get("detail") or "independent price verification found a mismatch")
+  elif cross_status in {"stale", "unavailable"}:
+    detail = cross_validation.get("detail") or "independent price verification is unavailable"
+    (blockers if active_session else warnings).append(detail)
+  elif cross_status in {"checking", "building"}:
+    warnings.append(cross_validation.get("detail") or "independent price verification is building")
+  elif cross_status == "unconfigured":
+    warnings.append(cross_validation.get("detail") or "independent price verification is not configured")
   if int(runtime.get("error_count") or 0) > 0:
     blockers.append("market-data provider has recent errors")
   if active_session and (provider_age is None or provider_age > provider_limit):
@@ -2413,6 +2596,7 @@ def evaluate_data_health(symbol, runtime, timestamp=None):
     "providerAgeMs": max(0, provider_age) if provider_age is not None else None,
     "providerFresh": provider_age is not None and provider_age <= provider_limit,
     "source": source,
+    "crossValidation": cross_validation,
     "dataConfidence": "low" if blockers else "medium" if warnings else "high",
     "reconciliation": reconciliation,
     "blockers": list(dict.fromkeys(blockers)),
@@ -2641,6 +2825,11 @@ def monitoring_findings(timestamp=None):
         findings[f"{symbol}:stale_data"] = ("critical", f"{symbol}: market data is stale for {round(provider_age / MINUTE_MS)} minutes")
     if health.get("tradeAllowed") is False and health.get("blockers"):
       findings[f"{symbol}:data_health"] = ("warning", f"{symbol}: trade alerts paused - {'; '.join(health['blockers'])}")
+    cross_validation = health.get("crossValidation") or {}
+    if cross_validation.get("status") == "mismatch":
+      findings[f"{symbol}:price_mismatch"] = ("critical", f"{symbol}: {cross_validation.get('detail')}")
+    elif cross_validation.get("status") in {"stale", "unavailable"}:
+      findings[f"{symbol}:secondary_provider"] = ("warning", f"{symbol}: {cross_validation.get('detail')}")
   backup_age = timestamp - int(BACKUP_STATE.get("last_success_at") or 0) if BACKUP_STATE.get("last_success_at") else None
   if BACKUP_STATE.get("last_error"):
     findings["database:backup_failed"] = ("critical", f"Database backup failed: {BACKUP_STATE['last_error']}")
@@ -2759,6 +2948,10 @@ def prometheus_metrics():
     "# TYPE trader_helper_provider_age_seconds gauge",
     "# HELP trader_helper_trade_alerts_allowed Whether new trade alerts are permitted by data health.",
     "# TYPE trader_helper_trade_alerts_allowed gauge",
+    "# HELP trader_helper_secondary_price_drift_pct Absolute percentage drift between primary and secondary prices.",
+    "# TYPE trader_helper_secondary_price_drift_pct gauge",
+    "# HELP trader_helper_secondary_price_verified Whether the latest independent price check passed.",
+    "# TYPE trader_helper_secondary_price_verified gauge",
   ]
   delivery = notification_engine.delivery_status()
   lines.extend([
@@ -2774,9 +2967,13 @@ def prometheus_metrics():
     health = runtime.get("data_health") or evaluate_data_health(symbol, runtime, timestamp)
     age = health.get("providerAgeMs")
     labels = f'symbol="{symbol}"'
+    cross_validation = health.get("crossValidation") or {}
+    drift = cross_validation.get("driftPct")
     lines.append(f"trader_helper_provider_errors{{{labels}}} {int(runtime.get('error_count') or 0)}")
     lines.append(f"trader_helper_provider_age_seconds{{{labels}}} {(float(age) / 1000) if age is not None else -1}")
     lines.append(f"trader_helper_trade_alerts_allowed{{{labels}}} {1 if health.get('tradeAllowed') else 0}")
+    lines.append(f"trader_helper_secondary_price_drift_pct{{{labels}}} {float(drift) if drift is not None else -1}")
+    lines.append(f"trader_helper_secondary_price_verified{{{labels}}} {1 if cross_validation.get('status') == 'verified' else 0}")
   return "\n".join(lines) + "\n"
 
 
@@ -2811,6 +3008,7 @@ def market_data_loop(symbol):
   next_history_at = 0
   next_five_minute_at = 0
   next_daily_at = 0
+  next_secondary_validation_at = 0
   cached = load_cached_candles(symbol)
   cached_daily, daily_fetched_at = load_daily_candles(symbol, limit=3000)
   cached_five_minute = load_market_bars(symbol, 5, limit=50_000)
@@ -2877,6 +3075,12 @@ def market_data_loop(symbol):
         MARKET_RUNTIMES[symbol]["error_count"] = 0
         MARKET_RUNTIMES[symbol]["last_error"] = None
         MARKET_RUNTIMES[symbol]["source_metadata"] = provider_metadata(provider, symbol)
+      if current_time >= next_secondary_validation_at:
+        previous_validation = market_runtime_snapshot(symbol).get("secondary_validation") or {}
+        validation = validate_secondary_quote(symbol, candle, previous_validation)
+        with MARKET_RUNTIME_LOCK:
+          MARKET_RUNTIMES[symbol]["secondary_validation"] = validation
+        next_secondary_validation_at = current_time + SECONDARY_VALIDATION_INTERVAL_SECONDS
       refresh_server_recommendations(provider, symbol)
       schedule_historical_replay(symbol)
       delay = base_interval

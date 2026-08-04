@@ -123,8 +123,28 @@
       "type": "stat"
     },
     {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 3, "min": 0, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 29},
+      "id": 14,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "trader_helper_secondary_price_drift_pct >= 0", "legendFormat": "{{symbol}}", "refId": "A"}],
+      "title": "Independent Price Drift",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 29},
+      "id": 15,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "trader_helper_secondary_price_verified", "legendFormat": "{{symbol}}", "refId": "A"}],
+      "title": "Independent Price Verification",
+      "type": "timeseries"
+    },
+    {
       "datasource": {"type": "loki", "uid": "loki"},
-      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 29},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 37},
       "id": 13,
       "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
       "targets": [{"datasource": {"type": "loki", "uid": "loki"}, "expr": "{job=\"docker\"}", "refId": "A"}],
@@ -139,5 +159,5 @@
   "time": {"from": "now-6h", "to": "now"},
   "title": "Trader Helper Operations",
   "uid": "trader-helper-operations",
-  "version": 2
+  "version": 3
 }
