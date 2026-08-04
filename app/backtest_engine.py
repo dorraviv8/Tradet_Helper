@@ -298,16 +298,20 @@ def replay_daily(raw_candles, settings=None, max_bars=None, symbol=strategy_engi
   return trades
 
 
-def run_replay(one_minute=None, five_minute=None, daily=None, settings=None, symbol=strategy_engine.DEFAULT_SYMBOL):
+def run_replay(
+  one_minute=None, five_minute=None, daily=None, settings=None,
+  symbol=strategy_engine.DEFAULT_SYMBOL, five_minute_max_bars=50_000,
+  daily_max_bars=3_000,
+):
   settings = settings or {}
   trades = []
   if one_minute:
     trades.extend(replay_intraday(one_minute, 1, 1, settings, max_bars=25_000, symbol=symbol))
   if five_minute:
-    trades.extend(replay_intraday(five_minute, 5, 5, settings, max_bars=50_000, symbol=symbol))
-    trades.extend(replay_intraday(five_minute, 15, 5, settings, max_bars=50_000, symbol=symbol))
+    trades.extend(replay_intraday(five_minute, 5, 5, settings, max_bars=five_minute_max_bars, symbol=symbol))
+    trades.extend(replay_intraday(five_minute, 15, 5, settings, max_bars=five_minute_max_bars, symbol=symbol))
   if daily:
-    trades.extend(replay_daily(daily, settings, max_bars=3_000, symbol=symbol))
+    trades.extend(replay_daily(daily, settings, max_bars=daily_max_bars, symbol=symbol))
   validation = chronological_validation(trades)
   return {
     "symbol": symbol,

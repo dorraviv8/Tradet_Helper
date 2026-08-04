@@ -1620,7 +1620,7 @@ def save_shadow_experiment_result(connection, source_signature, variant, result,
   generated_at = int(result.get("generatedAt") or now_ms())
   stored_result = {
     key: result.get(key)
-    for key in ("symbol", "summary", "byTimeframe", "groups", "validation", "method", "generatedAt")
+    for key in ("symbol", "summary", "byTimeframe", "groups", "validation", "method", "generatedAt", "evaluationWindow")
   }
   connection.execute("""
     INSERT INTO shadow_experiment_runs (
@@ -1704,7 +1704,9 @@ def build_shadow_experiment_snapshot(champion, experiments, settings):
   variants = []
   for experiment in experiments or []:
     definition = definitions.get(experiment.get("id"), {})
-    comparison = shadow_engine.compare(champion or {}, experiment.get("result") or {}, minimum)
+    experiment_result = experiment.get("result") or {}
+    comparison_champion = champion_for_shadow_window(champion or {}, experiment_result)
+    comparison = shadow_engine.compare(comparison_champion, experiment_result, minimum)
     variants.append({
       "id": experiment.get("id"),
       "version": experiment.get("version"),
@@ -1726,6 +1728,35 @@ def build_shadow_experiment_snapshot(champion, experiments, settings):
     "autoPromote": False,
     "variants": variants,
     "bestVariantId": variants[0]["id"] if variants else None,
+  }
+
+
+def shadow_evaluation_window(trades):
+  signal_times = [int(row["signalTime"]) for row in trades or [] if row.get("signalTime") is not None]
+  return {
+    "start": min(signal_times) if signal_times else None,
+    "end": max(signal_times) if signal_times else None,
+    "timeframes": sorted({int(row["timeframe"]) for row in trades or [] if row.get("timeframe") is not None}),
+  }
+
+
+def champion_for_shadow_window(champion, challenger):
+  window = (challenger or {}).get("evaluationWindow") or {}
+  start = window.get("start")
+  end = window.get("end")
+  timeframes = {int(value) for value in window.get("timeframes") or []}
+  if start is None or end is None or not timeframes:
+    return champion
+  trades = [
+    row for row in (champion or {}).get("trades") or []
+    if int(row.get("timeframe") or 0) in timeframes
+    and int(start) <= int(row.get("signalTime") or 0) <= int(end)
+  ]
+  return {
+    "summary": backtest_engine.summarize(trades),
+    "byTimeframe": backtest_engine.timeframe_summaries(trades),
+    "groups": backtest_engine.grouped_summaries(trades),
+    "validation": backtest_engine.chronological_validation(trades),
   }
 
 
@@ -1963,14 +1994,16 @@ def schedule_historical_replay(symbol=SYMBOL):
       experiments = []
       for variant in shadow_engine.variants(settings, STRATEGY_VERSION):
         variant_result = backtest_engine.run_replay(
-          one_minute=runtime["history"],
           five_minute=runtime["five_minute_history"],
           daily=runtime["daily_history"],
           settings=variant["settings"],
           symbol=symbol,
+          five_minute_max_bars=shadow_engine.SHADOW_FIVE_MINUTE_MAX_BARS,
+          daily_max_bars=shadow_engine.SHADOW_DAILY_MAX_BARS,
         )
         variant_result["generatedAt"] = result["generatedAt"]
         variant_result["strategyVersion"] = variant["version"]
+        variant_result["evaluationWindow"] = shadow_evaluation_window(variant_result.get("trades") or [])
         experiments.append({
           "id": variant["id"],
           "version": variant["version"],

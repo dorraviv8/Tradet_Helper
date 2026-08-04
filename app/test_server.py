@@ -419,6 +419,23 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(snapshot["variants"][0]["comparison"]["status"], "eligible_for_review")
     self.assertFalse(snapshot["autoPromote"])
 
+  def test_shadow_comparison_filters_champion_to_same_window_and_timeframes(self):
+    def trade(timeframe, signal_time, realized_r):
+      return {
+        "timeframe": timeframe, "signalTime": signal_time, "enteredAt": signal_time + 1,
+        "closedAt": signal_time + 2, "outcome": "target2" if realized_r > 0 else "stopped",
+        "realizedR": realized_r, "target1Hit": realized_r > 0, "mfeR": 1.2,
+        "maeR": 0.3, "timeToTarget1Ms": 1 if realized_r > 0 else None,
+        "setupType": "breakout", "marketPhase": "morning", "marketRegime": "trend_up",
+        "direction": "long",
+      }
+    champion = {"trades": [trade(1, 150, -1.0), trade(5, 50, -1.0), trade(5, 150, 1.0), trade(1440, 180, 0.5), trade(5, 250, -1.0)]}
+    challenger = {"evaluationWindow": {"start": 100, "end": 200, "timeframes": [5, 1440]}}
+    comparable = server.champion_for_shadow_window(champion, challenger)
+    self.assertEqual(comparable["summary"]["resolved"], 2)
+    self.assertEqual(comparable["summary"]["totalR"], 1.5)
+    self.assertEqual(set(comparable["byTimeframe"]), {"5", "1440"})
+
   def test_historical_replay_is_throttled_after_starting(self):
     runtime = server.new_market_runtime()
     runtime["five_minute_history"] = [candle(index * 300_000, 100, 101, 99, 100) for index in range(160)]

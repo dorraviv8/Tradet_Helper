@@ -72,7 +72,7 @@ Each actionable long or short plan includes entry, invalidation, Target 1, Targe
 
 The server runs a bounded background candle-by-candle replay over persistent 1m history, up to 50,000 native 5m bars, resampled 15m bars, and up to 3,000 daily bars. Replay calls the same Python setup and scoring functions used by live recommendations. It uses chronological holdouts and rolling forward folds, models opening fills, stop gaps and session-dependent slippage, excludes ambiguous OHLC paths, and keeps simulated trades separate from the live journal.
 
-Each replay also runs two versioned shadow challengers: a four-point higher quality threshold and the strict confirmation profile. Their trades are persisted separately with entry, stop, targets, setup, timeframe, direction, regime, MFE, MAE, and realized R. Model Governance compares each challenger with the fixed production champion on holdout expectancy after execution costs, profit factor, drawdown, sample coverage, and fold stability.
+Each replay also runs two versioned shadow challengers over a bounded recent 5m, 15m, and 1D evaluation window: a four-point higher quality threshold and the strict confirmation profile. Their trades are persisted separately with entry, stop, targets, setup, timeframe, direction, regime, MFE, MAE, and realized R. Model Governance filters the fixed production champion to the identical timeframes and date window, then compares holdout expectancy after execution costs, profit factor, drawdown, sample coverage, and fold stability.
 
 Default replay execution assumptions are 0.5 basis points of slippage per side and zero per-share commission. Configure `backtestSlippageBps` and `backtestCommissionPerShare` in `settings.json` if the expected execution environment differs.
 

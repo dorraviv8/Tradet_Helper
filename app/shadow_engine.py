@@ -20,6 +20,8 @@ VARIANT_DEFINITIONS = (
     "mode": "strict",
   },
 )
+SHADOW_FIVE_MINUTE_MAX_BARS = 12_000
+SHADOW_DAILY_MAX_BARS = 1_500
 
 
 def variants(settings, champion_version):
