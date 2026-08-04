@@ -265,6 +265,23 @@
           </div>
         </div>
 
+        <section id="tradeRecommendation" class="trade-recommendation" aria-label="Active trade recommendation" aria-live="polite" hidden>
+          <div class="trade-recommendation-summary">
+            <span id="tradeRecommendationDirection" class="trade-direction">Trade</span>
+            <div>
+              <span id="tradeRecommendationState" class="trade-recommendation-state">Plan armed</span>
+              <strong id="tradeRecommendationSetup">--</strong>
+              <small id="tradeRecommendationMeta">--</small>
+            </div>
+          </div>
+          <dl class="trade-recommendation-levels" aria-label="Recommended entry and exit prices">
+            <div class="recommendation-entry"><dt id="tradeRecommendationEntryLabel">Entry</dt><dd id="tradeRecommendationEntry">--</dd></div>
+            <div class="recommendation-stop"><dt id="tradeRecommendationStopLabel">Stop</dt><dd id="tradeRecommendationStop">--</dd></div>
+            <div class="recommendation-target"><dt id="tradeRecommendationTarget1Label">Target 1</dt><dd id="tradeRecommendationTarget1">--</dd></div>
+            <div class="recommendation-target"><dt id="tradeRecommendationTarget2Label">Target 2</dt><dd id="tradeRecommendationTarget2">--</dd></div>
+          </dl>
+        </section>
+
         <div class="chart-canvas-wrap">
           <canvas id="priceChart" width="1200" height="620" aria-label="QQQ candlestick, volume, and RSI chart"></canvas>
           <canvas id="chartOverlay" width="1200" height="620" aria-hidden="true"></canvas>

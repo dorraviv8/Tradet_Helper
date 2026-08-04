@@ -286,6 +286,19 @@ const els = {
   ladderStop: document.getElementById("ladderStop"),
   ladderTarget1: document.getElementById("ladderTarget1"),
   ladderTarget2: document.getElementById("ladderTarget2"),
+  tradeRecommendation: document.getElementById("tradeRecommendation"),
+  tradeRecommendationDirection: document.getElementById("tradeRecommendationDirection"),
+  tradeRecommendationState: document.getElementById("tradeRecommendationState"),
+  tradeRecommendationSetup: document.getElementById("tradeRecommendationSetup"),
+  tradeRecommendationMeta: document.getElementById("tradeRecommendationMeta"),
+  tradeRecommendationEntryLabel: document.getElementById("tradeRecommendationEntryLabel"),
+  tradeRecommendationEntry: document.getElementById("tradeRecommendationEntry"),
+  tradeRecommendationStopLabel: document.getElementById("tradeRecommendationStopLabel"),
+  tradeRecommendationStop: document.getElementById("tradeRecommendationStop"),
+  tradeRecommendationTarget1Label: document.getElementById("tradeRecommendationTarget1Label"),
+  tradeRecommendationTarget1: document.getElementById("tradeRecommendationTarget1"),
+  tradeRecommendationTarget2Label: document.getElementById("tradeRecommendationTarget2Label"),
+  tradeRecommendationTarget2: document.getElementById("tradeRecommendationTarget2"),
   lifecycleBadge: document.getElementById("lifecycleBadge"),
   lifecycleDetail: document.getElementById("lifecycleDetail"),
   bestSideBadge: document.getElementById("bestSideBadge"),
@@ -447,6 +460,67 @@ function strongestCandidate(signal) {
     .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0] || null;
 }
 
+function activePlanForTimeframe(timeframe = state.selectedTimeframe) {
+  const plan = state.activePlans.find((item) => Number(item.timeframe) === Number(timeframe));
+  if (!plan) return null;
+  const entry = Number(plan.entry);
+  const stop = Number(plan.stop);
+  const target = Number(plan.target1 ?? plan.target);
+  const target2 = Number(plan.target2);
+  if (![entry, stop, target, target2].every(Number.isFinite)) return null;
+  return {
+    ...plan,
+    entry,
+    stop,
+    target,
+    target1: target,
+    target2,
+    score: Number(plan.score || 0),
+    riskReward: Number(plan.risk_reward ?? plan.riskReward) || null,
+    signalCandleTime: Number(plan.signal_candle_time ?? plan.created_at) || null,
+    exitWarning: plan.exitWarning || "Exit at the invalidation level or the displayed profit targets.",
+    persisted: true,
+    watchOnly: false,
+  };
+}
+
+function displayedTradePlan(signal) {
+  const activePlan = activePlanForTimeframe();
+  if (activePlan) return activePlan;
+  if (state.dataHealth?.tradeAllowed === false || !isActionableSignal(signal)) return null;
+  return signal;
+}
+
+function tradePlanState(plan) {
+  if (!plan) return "";
+  if (!plan.persisted) return "New recommendation - waiting for entry";
+  if (plan.outcome_status === "target1") return "Target 1 reached - managing exit";
+  if (plan.lifecycle_status === "entered") return "Entry triggered - trade active";
+  return "Recommendation active - waiting for entry";
+}
+
+function renderTradeRecommendation(plan) {
+  els.tradeRecommendation.hidden = !plan;
+  if (!plan) return;
+  const long = plan.direction === "long";
+  els.tradeRecommendation.classList.toggle("long", long);
+  els.tradeRecommendation.classList.toggle("short", !long);
+  els.tradeRecommendationDirection.textContent = long ? "BUY / LONG" : "SELL / SHORT";
+  els.tradeRecommendationState.textContent = tradePlanState(plan);
+  els.tradeRecommendationSetup.textContent = plan.setup || `${long ? "Long" : "Short"} momentum setup`;
+  const score = Number(plan.score || 0);
+  const rr = Number(plan.riskReward);
+  els.tradeRecommendationMeta.textContent = `${timeframeLabel(Number(plan.timeframe))} · Score ${score}/100${Number.isFinite(rr) && rr > 0 ? ` · Reward/risk 1:${fmt(rr, 1)}` : ""}`;
+  els.tradeRecommendationEntryLabel.textContent = long ? "Buy entry" : "Short entry";
+  els.tradeRecommendationStopLabel.textContent = long ? "Sell if invalid" : "Cover if invalid";
+  els.tradeRecommendationTarget1Label.textContent = long ? "Sell target 1" : "Cover target 1";
+  els.tradeRecommendationTarget2Label.textContent = long ? "Sell target 2" : "Cover target 2";
+  els.tradeRecommendationEntry.textContent = fmt(plan.entry);
+  els.tradeRecommendationStop.textContent = fmt(plan.stop);
+  els.tradeRecommendationTarget1.textContent = fmt(plan.target);
+  els.tradeRecommendationTarget2.textContent = fmt(plan.target2);
+}
+
 function nextTradeCondition(signal, candidate = strongestCandidate(signal)) {
   if (state.dataHealth?.tradeAllowed === false) {
     return `Trading paused: ${(state.dataHealth.blockers || []).join("; ") || "market data is not clean"}.`;
@@ -460,7 +534,7 @@ function nextTradeCondition(signal, candidate = strongestCandidate(signal)) {
 
 function renderActionStrip(signal, latest) {
   const candidate = strongestCandidate(signal);
-  const activePlan = state.activePlans.find((plan) => Number(plan.timeframe) === state.selectedTimeframe);
+  const activePlan = activePlanForTimeframe();
   const actionable = isActionableSignal(signal);
   els.actionData.textContent = state.dataHealth?.status || "Checking";
   setTone(els.actionData, state.dataHealth?.tone || "neutral");
@@ -468,21 +542,24 @@ function renderActionStrip(signal, latest) {
     const label = String(activePlan.tradeState || "armed").replaceAll("_", " ");
     els.actionNow.textContent = `${activePlan.direction.toUpperCase()} ${timeframeLabel(Number(activePlan.timeframe))} · ${label}`;
     setTone(els.actionNow, activePlan.direction === "long" ? "positive" : "negative");
+    els.actionDetail.textContent = `Entry ${fmt(activePlan.entry)} · Stop ${fmt(activePlan.stop)} · T1 ${fmt(activePlan.target)} · T2 ${fmt(activePlan.target2)}`;
   } else if (actionable) {
     els.actionNow.textContent = `${signal.direction.toUpperCase()} ${timeframeLabel()} plan armed`;
     setTone(els.actionNow, signal.direction === "long" ? "positive" : "negative");
+    els.actionDetail.textContent = nextTradeCondition(signal, candidate);
   } else {
     els.actionNow.textContent = "No active trade";
     setTone(els.actionNow, "neutral");
+    els.actionDetail.textContent = nextTradeCondition(signal, candidate);
   }
-  els.actionDetail.textContent = nextTradeCondition(signal, candidate);
-  if (candidate?.entry && latest?.close) {
-    const distance = (Number(candidate.entry) - Number(latest.close)) / Number(latest.close) * 100;
+  const distancePlan = activePlan || candidate;
+  if (distancePlan?.entry && latest?.close) {
+    const distance = (Number(distancePlan.entry) - Number(latest.close)) / Number(latest.close) * 100;
     els.actionDistance.textContent = `${distance >= 0 ? "+" : ""}${fmt(distance, 2)}%`;
   } else {
     els.actionDistance.textContent = "--";
   }
-  const risk = localRiskPlan(candidate);
+  const risk = localRiskPlan(activePlan || candidate);
   els.actionRisk.textContent = risk.configured ? money(risk.plannedRisk, 0) : "Not configured";
 }
 
@@ -1796,7 +1873,8 @@ function drawChart(indicators, signal) {
 
   const width = rect.width;
   const height = rect.height;
-  const pad = { top: 18, right: 62, bottom: 30, left: 16 };
+  const requestedTradeOverlay = displayedTradePlan(signal);
+  const pad = { top: 18, right: requestedTradeOverlay && width >= 700 ? 116 : 62, bottom: 30, left: 16 };
   const chartW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const showVolume = Boolean(state.settings.chartLayers.volume);
@@ -1830,17 +1908,10 @@ function drawChart(indicators, signal) {
     && state.currentPatternKey === technicalPatternKey
     ? technicalPattern.projection
     : null;
-  const hasActiveTrade = signal
-    && signal.direction !== "neutral"
-    && !signal.watchOnly
-    && signal.score >= activeTradeThreshold()
-    && Number.isFinite(signal.entry);
   const timeframeMs = state.selectedTimeframe * 60_000;
   const signalIsVisible = Number(signal?.signalCandleTime) >= visible[0].time - timeframeMs
     && Number(signal?.signalCandleTime) <= visible.at(-1).time + timeframeMs;
-  const tradeOverlay = hasActiveTrade && signalIsVisible
-    ? signal
-    : null;
+  const tradeOverlay = (requestedTradeOverlay?.persisted || signalIsVisible) ? requestedTradeOverlay : null;
   const candlePrices = visible.flatMap((c) => [c.open, c.high, c.low, c.close]).filter(Number.isFinite);
   const qLow = percentile(candlePrices, 0.02);
   const qHigh = percentile(candlePrices, 0.98);
@@ -1925,6 +1996,8 @@ function drawChart(indicators, signal) {
     ctx.font = "12px ui-sans-serif";
     ctx.fillText(fmt(price), width - 54, gy + 4);
   }
+
+  drawTradeZones(ctx, tradeOverlay, width, pad, y, visible, x);
 
   if (showVolume) drawVolumePane(ctx, visible, x, candleW, width, pad, volumeTop, volumeH);
   if (showRsi) drawRsiPane(ctx, visible, x, width, pad, rsiTop, rsiH);
@@ -2862,6 +2935,37 @@ function drawJournalMarkers(ctx, visible, x, y, plans = visibleJournalPlans(visi
   });
 }
 
+function drawTradeZones(ctx, signal, width, pad, y, visible, x) {
+  if (!signal || !Number.isFinite(signal.entry) || !visible.length) return;
+  const signalTime = Number(signal.signalCandleTime || signal.created_at);
+  let markerIndex = visible.findIndex((candle) => candle.time >= signalTime);
+  if (markerIndex < 0) markerIndex = signal.persisted ? 0 : visible.length - 1;
+  const startX = clamp(x(markerIndex) - 5, pad.left, width - pad.right);
+  const endX = width - pad.right;
+  const zoneWidth = Math.max(0, endX - startX);
+  if (!zoneWidth) return;
+
+  const fillZone = (first, second, color) => {
+    if (!Number.isFinite(first) || !Number.isFinite(second)) return;
+    const top = Math.min(y(first), y(second));
+    const height = Math.max(2, Math.abs(y(first) - y(second)));
+    ctx.fillStyle = color;
+    ctx.fillRect(startX, top, zoneWidth, height);
+  };
+
+  ctx.save();
+  fillZone(signal.entry, signal.stop, "rgba(255, 92, 102, 0.09)");
+  fillZone(signal.entry, signal.target, "rgba(47, 209, 124, 0.10)");
+  fillZone(signal.target, signal.target2, "rgba(88, 166, 255, 0.07)");
+  ctx.setLineDash([3, 5]);
+  ctx.strokeStyle = "rgba(215, 221, 226, 0.25)";
+  ctx.beginPath();
+  ctx.moveTo(startX, y(signal.stop));
+  ctx.lineTo(startX, y(signal.target2));
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawTradePlan(ctx, signal, width, pad, y, visible, x) {
   if (!signal || signal.direction === "neutral" || !Number.isFinite(signal.entry)) return;
 
@@ -2871,12 +2975,14 @@ function drawTradePlan(ctx, signal, width, pad, y, visible, x) {
     {
       price: signal.entry,
       label: long ? "BUY TRIGGER" : "SHORT TRIGGER",
+      axisLabel: "ENTRY",
       color: long ? "#2fd17c" : "#ff5c66",
       width: 2.5,
     },
     {
       price: signal.stop,
       label: long ? "SELL IF INVALID" : "COVER IF INVALID",
+      axisLabel: "STOP",
       color: "#ff5c66",
       width: 2,
       dash: [7, 5],
@@ -2884,12 +2990,14 @@ function drawTradePlan(ctx, signal, width, pad, y, visible, x) {
     {
       price: signal.target,
       label: long ? "SELL TARGET 1" : "COVER TARGET 1",
+      axisLabel: "TARGET 1",
       color: "#f4c95d",
       width: 2,
     },
     {
       price: signal.target2,
       label: long ? "SELL TARGET 2" : "COVER TARGET 2",
+      axisLabel: "TARGET 2",
       color: "#58a6ff",
       width: 2,
       dash: [4, 4],
@@ -2900,7 +3008,8 @@ function drawTradePlan(ctx, signal, width, pad, y, visible, x) {
   const labelRight = width - 8;
   const lineStart = pad.left;
   const lineEnd = chartRight;
-  const labelSlots = [];
+  const latestPrice = Number(visible.at(-1)?.close);
+  const labelSlots = Number.isFinite(latestPrice) ? [y(latestPrice) - 12] : [];
 
   levels.forEach((level) => {
     const py = y(level.price);
@@ -2915,12 +3024,13 @@ function drawTradePlan(ctx, signal, width, pad, y, visible, x) {
     ctx.stroke();
     ctx.restore();
 
-    const text = `${level.label} ${fmt(level.price)}`;
     ctx.save();
     ctx.font = "11px ui-sans-serif";
+    const usePriceGutter = pad.right >= 100;
+    const text = `${usePriceGutter ? level.axisLabel : level.label} ${fmt(level.price)}`;
     const textWidth = ctx.measureText(text).width;
-    const boxWidth = Math.min(textWidth + 12, 176);
-    const boxX = Math.max(lineStart + 4, labelRight - boxWidth);
+    const boxWidth = usePriceGutter ? pad.right - 8 : Math.min(textWidth + 12, 176);
+    const boxX = usePriceGutter ? chartRight + 4 : Math.max(lineStart + 4, labelRight - boxWidth);
     const minY = pad.top + 2;
     const maxY = ctx.canvas.height / (window.devicePixelRatio || 1) - 28;
     let boxY = Math.max(minY, Math.min(py - 12, maxY));
@@ -2936,14 +3046,19 @@ function drawTradePlan(ctx, signal, width, pad, y, visible, x) {
     ctx.fill();
     ctx.stroke();
     ctx.fillStyle = level.color;
-    ctx.fillText(text, boxX + 6, boxY + 15);
+    ctx.fillText(text, boxX + 6, boxY + 15, boxWidth - 12);
     ctx.restore();
   });
 
-  const markerIndex = visible.length - 1;
+  const signalTime = Number(signal.signalCandleTime || signal.created_at);
+  const markerIndex = Number.isFinite(signalTime)
+    && signalTime >= visible[0].time
+    && signalTime <= visible.at(-1).time
+    ? visible.findIndex((candle) => candle.time >= signalTime)
+    : -1;
   const marker = visible[markerIndex];
   if (marker) {
-    const markerX = clamp(width - pad.right - 140, pad.left + 18, width - pad.right - 18);
+    const markerX = clamp(x(markerIndex), pad.left + 18, width - pad.right - 18);
     drawEntryArrow(ctx, markerX, y(signal.entry), signal.direction);
   }
 }
@@ -3137,6 +3252,15 @@ function isActionableSignal(signal) {
 }
 
 function renderBestOpportunity(opportunity) {
+  const activePlan = activePlanForTimeframe();
+  if (activePlan && Number(activePlan.timeframe) !== DAILY_TIMEFRAME) {
+    state.bestOpportunityTimeframe = Number(activePlan.timeframe);
+    els.bestOpportunityBadge.textContent = `${timeframeLabel(Number(activePlan.timeframe))} ${activePlan.direction}`;
+    setTone(els.bestOpportunityBadge, activePlan.direction === "long" ? "positive" : "negative");
+    els.bestOpportunityDetail.textContent = `${activePlan.setup}. Entry ${fmt(activePlan.entry)}, invalidation ${fmt(activePlan.stop)}, T1 ${fmt(activePlan.target)}, score ${activePlan.score}/100.`;
+    els.bestOpportunityView.hidden = true;
+    return;
+  }
   if (!opportunity) {
     state.bestOpportunityTimeframe = null;
     els.bestOpportunityBadge.textContent = "No trade";
@@ -3398,9 +3522,11 @@ function render(signal, indicators) {
   const reference = previousClose || today[0]?.open || latest.open || latest.close;
   const change = latest.close - reference;
   const changePct = (change / reference) * 100;
-  const planLabels = signal.direction === "short"
+  const tradePlan = displayedTradePlan(signal);
+  const planDirection = tradePlan?.direction || signal.direction;
+  const planLabels = planDirection === "short"
     ? { entry: "Short trigger", stop: "Cover if invalid", target1: "Cover target 1", target2: "Cover target 2" }
-    : signal.direction === "long"
+    : planDirection === "long"
       ? { entry: "Buy trigger", stop: "Sell if invalid", target1: "Sell target 1", target2: "Sell target 2" }
       : { entry: "Entry trigger", stop: "Invalidation", target1: "Target 1", target2: "Target 2" };
 
@@ -3433,7 +3559,7 @@ function render(signal, indicators) {
   renderBroadMarketContext(signal);
   renderCandidateComparison(signal);
 
-  const scoreSubject = strongestCandidate(signal) || signal;
+  const scoreSubject = tradePlan || strongestCandidate(signal) || signal;
   els.confidenceScore.textContent = `${Number(scoreSubject.score || 0)}/100`;
   renderCalibration(signal);
   const confirmed = signal.direction !== "neutral" && signal.score >= activeTradeThreshold() && !signal.watchOnly;
@@ -3441,6 +3567,8 @@ function render(signal, indicators) {
   const candidateGate = scoreSubject?.reasons?.find((reason) => /wait|wide|weak|opposes|confirm|chasing|paused|quality|risk/i.test(reason));
   const activationLabel = dataBlocked
     ? "Blocked"
+    : tradePlan?.persisted
+      ? tradePlan.lifecycle_status === "entered" ? "Active" : "Armed"
     : confirmed
       ? "Armed"
       : scoreSubject?.direction === "long" || scoreSubject?.direction === "short"
@@ -3448,6 +3576,8 @@ function render(signal, indicators) {
         : "No setup";
   const activationGate = dataBlocked
     ? (state.dataHealth.blockers || ["Data quality"])[0]
+    : tradePlan?.persisted
+      ? tradePlanState(tradePlan)
     : confirmed
       ? "All gates passed"
       : Number(scoreSubject?.score || 0) < activeTradeThreshold()
@@ -3455,18 +3585,22 @@ function render(signal, indicators) {
         : candidateGate || "Entry confirmation needed";
   els.activationState.textContent = activationLabel;
   els.activationGate.textContent = activationGate;
-  setTone(els.activationState, dataBlocked ? "negative" : confirmed ? signal.direction === "long" ? "positive" : "negative" : "neutral");
+  setTone(els.activationState, dataBlocked ? "negative" : tradePlan ? tradePlan.direction === "long" ? "positive" : "negative" : "neutral");
   renderLifecycle(signal, confirmed);
-  const statusText = signal.direction === "neutral"
+  renderTradeRecommendation(tradePlan);
+  const statusText = tradePlan?.persisted
+    ? `${tradePlan.direction.toUpperCase()} plan. ${tradePlanState(tradePlan)}.`
+    : signal.direction === "neutral"
     ? "Watchlist only. No trade alert is active."
     : confirmed
       ? `${signal.direction.toUpperCase()} entry candidate. You decide whether to trade.`
       : `${signal.direction.toUpperCase()} watch plan. Waiting for confirmation.`;
+  const alertSubject = tradePlan || signal;
   els.activeAlert.innerHTML = `
-    <span class="alert-title">${escapeHtml(signal.setup)}</span>
+    <span class="alert-title">${escapeHtml(alertSubject.setup)}</span>
     <span>${escapeHtml(statusText)}</span>
-    <ul class="alert-reasons">${signal.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>
-    <ul class="alert-reasons">${signal.exitRules.map((rule) => `<li>${escapeHtml(rule)}</li>`).join("")}</ul>
+    <ul class="alert-reasons">${(alertSubject.reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>
+    <ul class="alert-reasons">${(alertSubject.exitRules || []).map((rule) => `<li>${escapeHtml(rule)}</li>`).join("")}</ul>
   `;
   const contributions = (scoreSubject.scoreContributions || [])
     .filter((item) => Number(item.points))
@@ -3475,37 +3609,37 @@ function render(signal, indicators) {
   els.scoreDrivers.innerHTML = contributions.length
     ? contributions.map((item) => `<span class="score-driver ${Number(item.points) > 0 ? "positive" : "negative"}"><b>${Number(item.points) > 0 ? "+" : ""}${escapeHtml(item.points)}</b>${escapeHtml(item.label)}</span>`).join("")
     : "";
-  els.nextCondition.textContent = nextTradeCondition(signal, scoreSubject);
+  els.nextCondition.textContent = tradePlan
+    ? `${tradePlanState(tradePlan)} at ${fmt(tradePlan.entry)}.`
+    : nextTradeCondition(signal, scoreSubject);
 
   document.querySelector("#entryLevel").previousElementSibling.textContent = planLabels.entry;
   document.querySelector("#stopLevel").previousElementSibling.textContent = planLabels.stop;
   document.querySelector("#targetLevel").previousElementSibling.textContent = planLabels.target1;
   document.querySelector("#target2Level").previousElementSibling.textContent = planLabels.target2;
 
-  els.entryLevel.textContent = signal.entry ? fmt(signal.entry) : "--";
-  els.stopLevel.textContent = signal.stop ? fmt(signal.stop) : "--";
-  els.targetLevel.textContent = signal.target ? fmt(signal.target) : "--";
-  els.target2Level.textContent = signal.target2 ? fmt(signal.target2) : "--";
-  els.exitWarning.textContent = signal.exitWarning || "--";
-  els.riskReward.textContent = signal.riskReward ? `1:${fmt(signal.riskReward, 1)}` : "--";
-  const ladderSignal = confirmed && !dataBlocked && signal.entry && signal.stop && signal.target && signal.target2
-    ? signal
-    : null;
-  els.chartPriceLadder.hidden = !ladderSignal;
+  els.entryLevel.textContent = tradePlan?.entry ? fmt(tradePlan.entry) : "--";
+  els.stopLevel.textContent = tradePlan?.stop ? fmt(tradePlan.stop) : "--";
+  els.targetLevel.textContent = tradePlan?.target ? fmt(tradePlan.target) : "--";
+  els.target2Level.textContent = tradePlan?.target2 ? fmt(tradePlan.target2) : "--";
+  els.exitWarning.textContent = tradePlan?.exitWarning || signal.exitWarning || "--";
+  els.riskReward.textContent = tradePlan?.riskReward ? `1:${fmt(tradePlan.riskReward, 1)}` : "--";
+  const ladderSignal = tradePlan;
+  els.chartPriceLadder.hidden = true;
   if (ladderSignal) {
     els.ladderEntry.textContent = fmt(Number(ladderSignal.entry));
     els.ladderStop.textContent = fmt(Number(ladderSignal.stop));
     els.ladderTarget1.textContent = fmt(Number(ladderSignal.target));
     els.ladderTarget2.textContent = fmt(Number(ladderSignal.target2));
   }
-  const risk = localRiskPlan(confirmed ? signal : null);
+  const risk = localRiskPlan(tradePlan);
   els.riskQuantity.textContent = risk.quantity == null ? "--" : API_SYMBOL === "BTC-USD" ? fmt(risk.quantity, 6) : String(risk.quantity);
   els.riskDollars.textContent = money(risk.plannedRisk, 0);
   els.riskPositionValue.textContent = money(risk.positionValue, 0);
   els.riskTargetReward.textContent = money(risk.target1Reward, 0);
   renderActionStrip(signal, latest);
   els.mobilePlanState.textContent = els.actionNow.textContent;
-  setTone(els.mobilePlanState, signal.direction === "long" ? "positive" : signal.direction === "short" ? "negative" : "neutral");
+  setTone(els.mobilePlanState, planDirection === "long" ? "positive" : planDirection === "short" ? "negative" : "neutral");
 
   els.vwapMetric.textContent = isDailyTimeframe() ? "--" : fmt(latest.vwap);
   els.smaMetric.textContent = `${fmt(latest.sma20)} / ${fmt(latest.sma50)} / ${fmt(latest.sma150)}`;
@@ -4312,6 +4446,8 @@ function resetMarketState() {
   els.riskReward.textContent = "--";
   els.lifecycleBadge.textContent = "Idle";
   els.lifecycleDetail.textContent = "No active plan is waiting for entry.";
+  els.tradeRecommendation.hidden = true;
+  els.tradeRecommendation.classList.remove("long", "short");
   els.chartPriceLadder.hidden = true;
   els.journalStatsTile.hidden = true;
   els.performanceEmptyState.hidden = false;
