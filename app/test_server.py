@@ -348,6 +348,77 @@ class ServerTests(unittest.TestCase):
       self.assertEqual(server.load_latest_backtest(connection, "QQQ")["summary"]["resolved"], 10)
       self.assertEqual(server.load_latest_backtest(connection, "BTC-USD")["summary"]["resolved"], 20)
 
+  def test_shadow_experiment_persists_deduplicated_trade_outcomes(self):
+    variant = {
+      "id": "quality-threshold-v1",
+      "version": f"{server.STRATEGY_VERSION}-shadow-quality-threshold-v1",
+      "settings": {"activeTradeThreshold": 66, "mode": "normal"},
+    }
+    result = {
+      "generatedAt": 123_456,
+      "symbol": "QQQ",
+      "summary": {"resolved": 1, "expectedR": 0.4},
+      "byTimeframe": {"5": {"resolved": 1}},
+      "groups": [],
+      "validation": {"status": "building", "outOfSample": {"resolved": 0}},
+      "method": {"lookAheadSafe": True},
+      "trades": [{
+        "timeframe": 5,
+        "direction": "long",
+        "setup": "Long 5m breakout",
+        "setupType": "breakout",
+        "marketPhase": "morning",
+        "marketRegime": "trend_up",
+        "qualityScore": 78,
+        "signalTime": 60_000,
+        "entry": 100.0,
+        "stop": 99.0,
+        "target1": 101.0,
+        "target2": 102.0,
+        "enteredAt": 120_000,
+        "closedAt": 180_000,
+        "outcome": "target2",
+        "target1Hit": True,
+        "realizedR": 1.9,
+        "mfeR": 2.1,
+        "maeR": 0.2,
+      }],
+    }
+    with server.db() as connection:
+      server.save_shadow_experiment_result(connection, "source-a", variant, result, "QQQ")
+      result["trades"][0]["mfeR"] = 2.2
+      server.save_shadow_experiment_result(connection, "source-a", variant, result, "QQQ")
+    with server.db() as connection:
+      experiments = server.load_latest_shadow_results(connection, "QQQ")
+      trade = connection.execute("SELECT * FROM shadow_trade_results").fetchone()
+      run_count = connection.execute("SELECT COUNT(*) AS total FROM shadow_experiment_runs").fetchone()["total"]
+    self.assertEqual(run_count, 1)
+    self.assertEqual(len(experiments), 1)
+    self.assertEqual(trade["market_regime"], "trend_up")
+    self.assertEqual(trade["realized_r"], 1.9)
+    self.assertEqual(trade["mfe_r"], 2.2)
+
+  def test_shadow_snapshot_ranks_review_eligible_variant_first(self):
+    def replay(expected_r):
+      return {
+        "summary": {"resolved": 300, "expectedR": expected_r},
+        "groups": [],
+        "validation": {
+          "outOfSample": {"resolved": 140, "expectedR": expected_r, "profitFactor": 1.5, "maxDrawdownR": 4.0},
+          "folds": [{"test": {"resolved": 40, "expectedR": 0.1}} for _ in range(3)],
+        },
+      }
+    champion = replay(0.10)
+    definitions = server.shadow_engine.variants(server.load_strategy_settings(), server.STRATEGY_VERSION)
+    experiments = [
+      {"id": definitions[0]["id"], "version": definitions[0]["version"], "generatedAt": 100, "result": replay(0.18)},
+      {"id": definitions[1]["id"], "version": definitions[1]["version"], "generatedAt": 100, "result": replay(0.05)},
+    ]
+    snapshot = server.build_shadow_experiment_snapshot(champion, experiments, server.load_strategy_settings())
+    self.assertEqual(snapshot["bestVariantId"], "quality-threshold-v1")
+    self.assertEqual(snapshot["variants"][0]["comparison"]["status"], "eligible_for_review")
+    self.assertFalse(snapshot["autoPromote"])
+
   def test_historical_replay_is_throttled_after_starting(self):
     runtime = server.new_market_runtime()
     runtime["five_minute_history"] = [candle(index * 300_000, 100, 101, 99, 100) for index in range(160)]

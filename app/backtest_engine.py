@@ -166,8 +166,13 @@ def _trade_record(signal, timeframe, outcome, entered_at, closed_at, favorable, 
     "setup": signal["setup"],
     "setupType": signal.get("setupType", strategy_engine.setup_type(signal["setup"])),
     "marketPhase": signal.get("marketPhase", "swing" if timeframe == strategy_engine.DAILY_TIMEFRAME else "unknown"),
+    "marketRegime": (signal.get("regime") or {}).get("type") or signal.get("marketRegime") or "unknown",
     "qualityScore": int(signal.get("score") or 0),
     "signalTime": int(signal["signalCandleTime"]),
+    "entry": float(signal["entry"]),
+    "stop": float(signal["stop"]),
+    "target1": float(signal["target"]),
+    "target2": float(signal["target2"]),
     "enteredAt": entered_at,
     "closedAt": closed_at,
     "outcome": outcome,
@@ -422,17 +427,18 @@ def chronological_validation(trades, holdout_fraction=0.4, folds=3):
 def grouped_summaries(trades):
   groups = defaultdict(list)
   for trade in trades:
-    groups[(trade["timeframe"], trade["setupType"], trade["marketPhase"], trade["direction"])].append(trade)
+    groups[(trade["timeframe"], trade["setupType"], trade["marketPhase"], trade.get("marketRegime", "unknown"), trade["direction"])].append(trade)
   output = []
-  for (timeframe, setup_type, phase, direction), rows in groups.items():
+  for (timeframe, setup_type, phase, regime, direction), rows in groups.items():
     output.append({
       "timeframe": timeframe,
       "setupType": setup_type,
       "marketPhase": phase,
+      "marketRegime": regime,
       "direction": direction,
       **summarize(rows),
     })
-  return sorted(output, key=lambda row: (row["timeframe"], row["setupType"], row["marketPhase"], row["direction"]))
+  return sorted(output, key=lambda row: (row["timeframe"], row["setupType"], row["marketPhase"], row["marketRegime"], row["direction"]))
 
 
 def timeframe_summaries(trades):

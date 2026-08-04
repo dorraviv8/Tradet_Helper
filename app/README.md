@@ -72,6 +72,8 @@ Each actionable long or short plan includes entry, invalidation, Target 1, Targe
 
 The server runs a bounded background candle-by-candle replay over persistent 1m history, up to 50,000 native 5m bars, resampled 15m bars, and up to 3,000 daily bars. Replay calls the same Python setup and scoring functions used by live recommendations. It uses chronological holdouts and rolling forward folds, models opening fills, stop gaps and session-dependent slippage, excludes ambiguous OHLC paths, and keeps simulated trades separate from the live journal.
 
+Each replay also runs two versioned shadow challengers: a four-point higher quality threshold and the strict confirmation profile. Their trades are persisted separately with entry, stop, targets, setup, timeframe, direction, regime, MFE, MAE, and realized R. Model Governance compares each challenger with the fixed production champion on holdout expectancy after execution costs, profit factor, drawdown, sample coverage, and fold stability.
+
 Default replay execution assumptions are 0.5 basis points of slippage per side and zero per-share commission. Configure `backtestSlippageBps` and `backtestCommissionPerShare` in `settings.json` if the expected execution environment differs.
 
 Historical Edge reports a neutral-prior estimate of Target 1 occurring before the stop, expected net return in R, profit factor, maximum drawdown, comparable sample size, and a 95% Wilson interval. The most specific group with enough observations is selected in this order: setup/timeframe/direction, setup/timeframe, timeframe/direction, timeframe, then all replay trades. Replay statistics describe the retained sample and do not guarantee future results.
@@ -90,7 +92,7 @@ Strategy version `6.0.0` records the signal candle separately from the time the 
 
 The server owns candle persistence and outcome evaluation. Browser clients cannot submit outcome candles. Older strategy versions remain in SQLite but are excluded from adaptive statistics.
 
-Adaptive suggestions remain in shadow mode and cannot alter production scores. Promotion requires at least 120 forward outcomes plus a separate comparison against the fixed-rule champion; automatic promotion is disabled. The execution review stores actual fill, quantity, exit, realized R, notes, and an optional chart snapshot. Pattern projections maintain a separate outcome sample and remain descriptive until validated.
+Challengers remain in shadow mode and cannot alter production scores. A challenger needs at least 120 resolved holdout trades, positive net expectancy, profit factor of at least 1.10, controlled drawdown, sufficient champion coverage, stable positive folds, and at least +0.03R improvement over the champion before it becomes eligible for manual review. Automatic promotion is disabled. The execution review stores actual fill, quantity, exit, realized R, notes, and an optional chart snapshot. Pattern projections maintain a separate outcome sample and remain descriptive until validated.
 
 The journal path defaults to:
 
@@ -153,7 +155,7 @@ node app/test_pattern_engine.js
 python3 -m unittest discover -s app -p 'test_*.py'
 node --check app/app.js
 node --check app/pattern-engine.js
-python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/ibkr_provider.py
+python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/shadow_engine.py app/ibkr_provider.py
 ```
 
 This tool is educational decision support, not financial advice. It does not guarantee outcomes.

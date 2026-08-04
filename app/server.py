@@ -27,6 +27,7 @@ import ibkr_provider
 import options_engine
 import notification_engine
 import risk_engine
+import shadow_engine
 
 
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -121,6 +122,7 @@ def new_market_runtime():
     "backtest_status": "not_started",
     "backtest_error": None,
     "backtest_last_started_at": None,
+    "shadow_experiments": None,
     "source_metadata": {},
     "secondary_validation": {
       "status": "building",
@@ -370,6 +372,52 @@ def init_db():
     if "symbol" not in backtest_columns:
       connection.execute("ALTER TABLE backtest_runs ADD COLUMN symbol TEXT NOT NULL DEFAULT 'QQQ'")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_backtest_symbol_version_time ON backtest_runs(symbol, strategy_version, generated_at DESC)")
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS shadow_experiment_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        champion_version TEXT NOT NULL,
+        variant_id TEXT NOT NULL,
+        variant_version TEXT NOT NULL,
+        source_signature TEXT NOT NULL,
+        generated_at INTEGER NOT NULL,
+        settings_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        UNIQUE(symbol, champion_version, variant_version, source_signature)
+      )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_shadow_runs_latest ON shadow_experiment_runs(symbol, champion_version, generated_at DESC)")
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS shadow_trade_results (
+        symbol TEXT NOT NULL,
+        champion_version TEXT NOT NULL,
+        variant_id TEXT NOT NULL,
+        variant_version TEXT NOT NULL,
+        timeframe INTEGER NOT NULL,
+        direction TEXT NOT NULL,
+        setup TEXT NOT NULL,
+        setup_type TEXT NOT NULL,
+        market_phase TEXT,
+        market_regime TEXT,
+        signal_time INTEGER NOT NULL,
+        quality_score INTEGER,
+        entry REAL NOT NULL,
+        stop REAL NOT NULL,
+        target1 REAL NOT NULL,
+        target2 REAL NOT NULL,
+        entered_at INTEGER,
+        closed_at INTEGER,
+        outcome TEXT NOT NULL,
+        target1_hit INTEGER NOT NULL DEFAULT 0,
+        realized_r REAL,
+        mfe_r REAL,
+        mae_r REAL,
+        source_signature TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (symbol, variant_version, timeframe, direction, setup, signal_time)
+      )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_shadow_trades_comparison ON shadow_trade_results(symbol, champion_version, variant_version, timeframe, direction, setup_type, market_regime)")
     connection.execute("""
       CREATE TABLE IF NOT EXISTS learning_snapshots (
         symbol TEXT NOT NULL,
@@ -1568,6 +1616,119 @@ def save_backtest_result(connection, source_signature, result, symbol=SYMBOL):
   """, (symbol, STRATEGY_VERSION, symbol))
 
 
+def save_shadow_experiment_result(connection, source_signature, variant, result, symbol=SYMBOL):
+  generated_at = int(result.get("generatedAt") or now_ms())
+  stored_result = {
+    key: result.get(key)
+    for key in ("symbol", "summary", "byTimeframe", "groups", "validation", "method", "generatedAt")
+  }
+  connection.execute("""
+    INSERT INTO shadow_experiment_runs (
+      symbol, champion_version, variant_id, variant_version, source_signature,
+      generated_at, settings_json, result_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(symbol, champion_version, variant_version, source_signature) DO UPDATE SET
+      generated_at = excluded.generated_at,
+      settings_json = excluded.settings_json,
+      result_json = excluded.result_json
+  """, (
+    symbol, STRATEGY_VERSION, variant["id"], variant["version"], source_signature,
+    generated_at, json.dumps(variant["settings"], separators=(",", ":")),
+    json.dumps(stored_result, separators=(",", ":")),
+  ))
+  rows = []
+  for trade in result.get("trades") or []:
+    if not all(trade.get(key) is not None for key in ("timeframe", "direction", "setup", "signalTime", "entry", "stop", "target1", "target2", "outcome")):
+      continue
+    rows.append((
+      symbol, STRATEGY_VERSION, variant["id"], variant["version"], int(trade["timeframe"]),
+      trade["direction"], trade["setup"], trade.get("setupType") or "unknown",
+      trade.get("marketPhase"), trade.get("marketRegime"), int(trade["signalTime"]),
+      int(trade.get("qualityScore") or 0), float(trade["entry"]), float(trade["stop"]),
+      float(trade["target1"]), float(trade["target2"]), trade.get("enteredAt"),
+      trade.get("closedAt"), trade["outcome"], 1 if trade.get("target1Hit") else 0,
+      finite_or_none(trade.get("realizedR")), finite_or_none(trade.get("mfeR")),
+      finite_or_none(trade.get("maeR")), source_signature, generated_at,
+    ))
+  if rows:
+    connection.executemany("""
+      INSERT INTO shadow_trade_results (
+        symbol, champion_version, variant_id, variant_version, timeframe, direction,
+        setup, setup_type, market_phase, market_regime, signal_time, quality_score,
+        entry, stop, target1, target2, entered_at, closed_at, outcome, target1_hit,
+        realized_r, mfe_r, mae_r, source_signature, updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(symbol, variant_version, timeframe, direction, setup, signal_time) DO UPDATE SET
+        quality_score = excluded.quality_score,
+        entered_at = excluded.entered_at,
+        closed_at = excluded.closed_at,
+        outcome = excluded.outcome,
+        target1_hit = excluded.target1_hit,
+        realized_r = excluded.realized_r,
+        mfe_r = excluded.mfe_r,
+        mae_r = excluded.mae_r,
+        source_signature = excluded.source_signature,
+        updated_at = excluded.updated_at
+    """, rows)
+
+
+def load_latest_shadow_results(connection, symbol=SYMBOL):
+  rows = connection.execute("""
+    SELECT variant_id, variant_version, generated_at, settings_json, result_json
+    FROM shadow_experiment_runs
+    WHERE symbol = ? AND champion_version = ?
+    ORDER BY generated_at DESC, id DESC
+  """, (symbol, STRATEGY_VERSION)).fetchall()
+  latest = {}
+  for row in rows:
+    if row["variant_id"] in latest:
+      continue
+    try:
+      result = json.loads(row["result_json"])
+      settings = json.loads(row["settings_json"])
+    except (TypeError, ValueError):
+      continue
+    latest[row["variant_id"]] = {
+      "id": row["variant_id"],
+      "version": row["variant_version"],
+      "generatedAt": row["generated_at"],
+      "settings": settings,
+      "result": result,
+    }
+  return list(latest.values())
+
+
+def build_shadow_experiment_snapshot(champion, experiments, settings):
+  definitions = {row["id"]: row for row in shadow_engine.variants(settings, STRATEGY_VERSION)}
+  minimum = max(30, int((settings.get("learning") or {}).get("minimumPromotionSamples") or 120))
+  variants = []
+  for experiment in experiments or []:
+    definition = definitions.get(experiment.get("id"), {})
+    comparison = shadow_engine.compare(champion or {}, experiment.get("result") or {}, minimum)
+    variants.append({
+      "id": experiment.get("id"),
+      "version": experiment.get("version"),
+      "label": definition.get("label") or experiment.get("id"),
+      "description": definition.get("description"),
+      "generatedAt": experiment.get("generatedAt"),
+      "summary": (experiment.get("result") or {}).get("summary") or {},
+      "comparison": comparison,
+    })
+  rank = {"eligible_for_review": 3, "observing": 2, "building": 1, "underperforming": 0}
+  variants.sort(key=lambda row: (
+    rank.get((row.get("comparison") or {}).get("status"), -1),
+    float((row.get("comparison") or {}).get("expectancyImprovement") or 0),
+  ), reverse=True)
+  return {
+    "championVersion": STRATEGY_VERSION,
+    "generatedAt": max((int(row.get("generatedAt") or 0) for row in variants), default=None),
+    "minimumPromotionSamples": minimum,
+    "autoPromote": False,
+    "variants": variants,
+    "bestVariantId": variants[0]["id"] if variants else None,
+  }
+
+
 def backtest_source_signature(runtime, settings, symbol=SYMBOL):
   series = (runtime.get("history") or [], runtime.get("five_minute_history") or [], runtime.get("daily_history") or [])
   replay_intervals = (15 * MINUTE_MS, 15 * MINUTE_MS, 24 * 60 * MINUTE_MS)
@@ -1795,12 +1956,36 @@ def schedule_historical_replay(symbol=SYMBOL):
       result["generatedAt"] = now_ms()
       result["sourceSignature"] = signature
       result["strategyVersion"] = STRATEGY_VERSION
+      experiments = []
+      for variant in shadow_engine.variants(settings, STRATEGY_VERSION):
+        variant_result = backtest_engine.run_replay(
+          one_minute=runtime["history"],
+          five_minute=runtime["five_minute_history"],
+          daily=runtime["daily_history"],
+          settings=variant["settings"],
+          symbol=symbol,
+        )
+        variant_result["generatedAt"] = result["generatedAt"]
+        variant_result["strategyVersion"] = variant["version"]
+        experiments.append({
+          "id": variant["id"],
+          "version": variant["version"],
+          "generatedAt": result["generatedAt"],
+          "settings": variant["settings"],
+          "result": variant_result,
+        })
       with db() as connection:
         save_backtest_result(connection, signature, result, symbol)
+        for experiment in experiments:
+          save_shadow_experiment_result(
+            connection, signature, experiment, experiment["result"], symbol
+          )
+      shadow_snapshot = build_shadow_experiment_snapshot(result, experiments, settings)
       with MARKET_RUNTIME_LOCK:
         MARKET_RUNTIMES[symbol]["backtest"] = result
         MARKET_RUNTIMES[symbol]["backtest_status"] = "ready"
         MARKET_RUNTIMES[symbol]["backtest_error"] = None
+        MARKET_RUNTIMES[symbol]["shadow_experiments"] = shadow_snapshot
     except Exception as error:
       with MARKET_RUNTIME_LOCK:
         MARKET_RUNTIMES[symbol]["backtest_status"] = "error"
@@ -2669,6 +2854,9 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
     replay = runtime.get("backtest") or {}
     replay_trades = replay.get("trades") or []
     for timeframe, signal in recommendations.items():
+      for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
+        if isinstance(candidate, dict):
+          candidate["strategyVersion"] = STRATEGY_VERSION
       if broad_context:
         for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
           if isinstance(candidate, dict):
@@ -2772,18 +2960,16 @@ def market_scanner_snapshot():
 
 def model_governance_snapshot(symbol):
   settings = load_strategy_settings()
-  learning = settings.get("learning") or {}
-  minimum = max(30, int(learning.get("minimumPromotionSamples") or 120))
   runtime = market_runtime_snapshot(symbol)
-  replay = runtime.get("backtest") or {}
-  validation = replay.get("validation") or {}
-  with db() as connection:
-    snapshot = load_learning_snapshot(connection, symbol)
-  samples = int(snapshot.get("resolvedSamples") or 0)
-  validation_ready = validation.get("status") == "validated"
-  sample_ready = samples >= minimum
-  # A challenger cannot be promoted from the same outcomes used to create it.
-  ready_for_comparison = bool(sample_ready and validation_ready)
+  snapshot = runtime.get("shadow_experiments")
+  if snapshot is None:
+    with db() as connection:
+      experiments = load_latest_shadow_results(connection, symbol)
+    snapshot = build_shadow_experiment_snapshot(runtime.get("backtest") or {}, experiments, settings)
+  variants = snapshot.get("variants") or []
+  best = variants[0] if variants else None
+  comparison = (best or {}).get("comparison") or {}
+  status = comparison.get("status") or "building"
   return {
     "symbol": symbol,
     "champion": {
@@ -2791,19 +2977,22 @@ def model_governance_snapshot(symbol):
       "status": "production",
       "type": "fixed rules",
     },
-    "challenger": {
-      "version": "adaptive-calibration-v1",
-      "status": "shadow",
-      "resolvedForwardSamples": samples,
-      "minimumPromotionSamples": minimum,
-      "validationStatus": validation.get("status") or "building",
-      "readyForIndependentComparison": ready_for_comparison,
-      "eligibleForPromotion": False,
-      "scoreChangesApplied": (learning.get("mode") == "approved_live"),
-      "detail": (
-        "Shadow suggestions are recorded but do not change production scores. Promotion requires a separate forward comparison against the champion."
-      ),
+    "challenger": None if best is None else {
+      "id": best.get("id"),
+      "version": best.get("version"),
+      "label": best.get("label"),
+      "status": status,
+      "resolvedForwardSamples": int((comparison.get("challenger") or {}).get("resolved") or 0),
+      "minimumPromotionSamples": snapshot.get("minimumPromotionSamples"),
+      "eligibleForPromotion": bool(comparison.get("eligibleForPromotionReview")),
+      "scoreChangesApplied": False,
+      "expectedR": (comparison.get("challenger") or {}).get("expectedR"),
+      "championExpectedR": (comparison.get("champion") or {}).get("expectedR"),
+      "criteria": comparison.get("criteria") or {},
+      "topSegments": comparison.get("topSegments") or [],
+      "detail": comparison.get("detail"),
     },
+    "variants": variants,
     "autoPromote": False,
   }
 
@@ -3974,6 +4163,7 @@ class Handler(SimpleHTTPRequestHandler):
       runtime = market_runtime_snapshot(symbol)
       self.send_json(200, {
         "generatedAt": runtime["recommendations_at"],
+        "strategyVersion": STRATEGY_VERSION,
         "recommendations": runtime["recommendations"],
         "optionsOpportunity": runtime["options_opportunity"],
         "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
@@ -4590,6 +4780,7 @@ class Handler(SimpleHTTPRequestHandler):
           last_recommendations_key = recommendations_key
           self.send_sse("recommendations", {
             "generatedAt": runtime["recommendations_at"],
+            "strategyVersion": STRATEGY_VERSION,
             "recommendations": runtime["recommendations"],
             "optionsOpportunity": runtime["options_opportunity"],
             "dataHealth": runtime.get("data_health") or evaluate_data_health(symbol, runtime),
@@ -4654,11 +4845,16 @@ def main():
   init_db()
   with db() as connection:
     cached_backtests = {symbol: load_latest_backtest(connection, symbol) for symbol in SUPPORTED_SYMBOLS}
+    cached_shadow_results = {symbol: load_latest_shadow_results(connection, symbol) for symbol in SUPPORTED_SYMBOLS}
+  settings = load_strategy_settings()
   with MARKET_RUNTIME_LOCK:
     for symbol, cached_backtest in cached_backtests.items():
       if cached_backtest:
         MARKET_RUNTIMES[symbol]["backtest"] = cached_backtest
         MARKET_RUNTIMES[symbol]["backtest_status"] = "ready"
+        MARKET_RUNTIMES[symbol]["shadow_experiments"] = build_shadow_experiment_snapshot(
+          cached_backtest, cached_shadow_results.get(symbol), settings
+        )
   server = AppHTTPServer((HOST, PORT), Handler)
   start_market_data_workers()
   start_monitoring_worker()

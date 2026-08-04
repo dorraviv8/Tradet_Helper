@@ -352,6 +352,7 @@ const els = {
   modelSamples: document.getElementById("modelSamples"),
   modelApplied: document.getElementById("modelApplied"),
   modelGovernanceDetail: document.getElementById("modelGovernanceDetail"),
+  shadowVariantRows: document.getElementById("shadowVariantRows"),
   patternValidationTile: document.getElementById("patternValidationTile"),
   validationEmptyState: document.getElementById("validationEmptyState"),
   patternValidationBadge: document.getElementById("patternValidationBadge"),
@@ -478,6 +479,7 @@ function activePlanForTimeframe(timeframe = state.selectedTimeframe) {
     target2,
     score: Number(plan.score || 0),
     riskReward: Number(plan.risk_reward ?? plan.riskReward) || null,
+    strategyVersion: plan.strategy_version || plan.strategyVersion || STRATEGY_VERSION,
     signalCandleTime: Number(plan.signal_candle_time ?? plan.created_at) || null,
     exitWarning: plan.exitWarning || "Exit at the invalidation level or the displayed profit targets.",
     persisted: true,
@@ -511,7 +513,8 @@ function renderTradeRecommendation(plan) {
   els.tradeRecommendationSetup.textContent = plan.setup || `${long ? "Long" : "Short"} momentum setup`;
   const score = Number(plan.score || 0);
   const rr = Number(plan.riskReward);
-  els.tradeRecommendationMeta.textContent = `${timeframeLabel(Number(plan.timeframe))} · Score ${score}/100${Number.isFinite(rr) && rr > 0 ? ` · Reward/risk 1:${fmt(rr, 1)}` : ""}`;
+  const version = plan.strategyVersion || plan.strategy_version || STRATEGY_VERSION;
+  els.tradeRecommendationMeta.textContent = `${timeframeLabel(Number(plan.timeframe))} · Strategy v${version} · Score ${score}/100${Number.isFinite(rr) && rr > 0 ? ` · Reward/risk 1:${fmt(rr, 1)}` : ""}`;
   els.tradeRecommendationEntryLabel.textContent = long ? "Buy entry" : "Short entry";
   els.tradeRecommendationStopLabel.textContent = long ? "Sell if invalid" : "Cover if invalid";
   els.tradeRecommendationTarget1Label.textContent = long ? "Sell target 1" : "Cover target 1";
@@ -4140,15 +4143,34 @@ function applyServerRecommendations(payload) {
 function renderModelGovernance() {
   const governance = state.modelGovernance;
   const challenger = governance?.challenger;
-  if (!governance || !challenger) return;
-  els.modelGovernanceBadge.textContent = challenger.status === "shadow" ? "Shadow" : challenger.status;
-  setTone(els.modelGovernanceBadge, challenger.scoreChangesApplied ? "positive" : "neutral");
+  if (!governance) return;
+  const statusLabels = {
+    eligible_for_review: "Review ready",
+    underperforming: "Behind champion",
+    observing: "Observing",
+    building: "Building",
+  };
+  const status = challenger?.status || "building";
+  els.modelGovernanceBadge.textContent = statusLabels[status] || status;
+  setTone(els.modelGovernanceBadge, status === "eligible_for_review" ? "positive" : status === "underperforming" ? "negative" : "neutral");
   els.modelChampion.textContent = governance.champion?.version || "--";
-  els.modelChallenger.textContent = challenger.version || "--";
-  els.modelSamples.textContent = `${challenger.resolvedForwardSamples || 0} / ${challenger.minimumPromotionSamples || "--"}`;
-  els.modelApplied.textContent = challenger.scoreChangesApplied ? "Approved" : "No";
-  setTone(els.modelApplied, challenger.scoreChangesApplied ? "positive" : "neutral");
-  els.modelGovernanceDetail.textContent = challenger.detail || "Adaptive changes remain in shadow mode.";
+  els.modelChallenger.textContent = challenger?.label || "Building experiments";
+  els.modelSamples.textContent = `${challenger?.resolvedForwardSamples || 0} / ${challenger?.minimumPromotionSamples || governance?.variants?.[0]?.comparison?.minimumPromotionSamples || "--"}`;
+  els.modelApplied.textContent = "No - manual review";
+  setTone(els.modelApplied, "neutral");
+  const challengerR = challenger?.expectedR == null ? NaN : Number(challenger.expectedR);
+  const championR = challenger?.championExpectedR == null ? NaN : Number(challenger.championExpectedR);
+  const comparison = Number.isFinite(challengerR) && Number.isFinite(championR)
+    ? ` Champion ${championR >= 0 ? "+" : ""}${fmt(championR, 2)}R; challenger ${challengerR >= 0 ? "+" : ""}${fmt(challengerR, 2)}R.`
+    : "";
+  els.modelGovernanceDetail.textContent = `${challenger?.detail || "Shadow replays are building. Production remains unchanged."}${comparison}`;
+  els.shadowVariantRows.innerHTML = (governance.variants || []).map((variant) => {
+    const row = variant.comparison || {};
+    const metrics = row.challenger || {};
+    const expectedR = metrics.expectedR == null ? NaN : Number(metrics.expectedR);
+    const label = statusLabels[row.status] || row.status || "Building";
+    return `<div><span>${escapeHtml(variant.label || variant.id)}</span><strong class="${expectedR > 0 ? "positive" : expectedR < 0 ? "negative" : ""}">${Number.isFinite(expectedR) ? `${expectedR >= 0 ? "+" : ""}${fmt(expectedR, 2)}R` : "--"}</strong><small>${escapeHtml(label)} · ${Number(metrics.resolved || 0)} holdout trades</small></div>`;
+  }).join("");
 }
 
 function selectTimeframe(timeframe) {
