@@ -433,6 +433,12 @@ class ServerTests(unittest.TestCase):
       with server.MARKET_RUNTIME_LOCK:
         server.MARKET_RUNTIMES["QQQ"] = original
 
+  def test_matching_champion_replay_is_refreshed_when_shadow_results_are_missing(self):
+    runtime = {"backtest": {"sourceSignature": "same"}, "shadow_experiments": None}
+    self.assertFalse(server.replay_snapshot_is_current(runtime, "same"))
+    runtime["shadow_experiments"] = {"variants": []}
+    self.assertTrue(server.replay_snapshot_is_current(runtime, "same"))
+
   def test_data_health_blocks_missing_intraday_bars_during_market_hours(self):
     now = int(datetime(2026, 7, 27, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
     runtime = server.new_market_runtime()

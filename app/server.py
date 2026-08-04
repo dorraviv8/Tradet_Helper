@@ -1754,6 +1754,11 @@ def backtest_source_signature(runtime, settings, symbol=SYMBOL):
   return json.dumps(source, sort_keys=True, separators=(",", ":"))
 
 
+def replay_snapshot_is_current(runtime, signature):
+  current = runtime.get("backtest") or {}
+  return current.get("sourceSignature") == signature and runtime.get("shadow_experiments") is not None
+
+
 def attach_signal_calibration(signal, trades):
   if not isinstance(signal, dict):
     return signal
@@ -1930,8 +1935,7 @@ def schedule_historical_replay(symbol=SYMBOL):
     return False
   settings = load_strategy_settings()
   signature = backtest_source_signature(runtime, settings, symbol)
-  current = runtime.get("backtest") or {}
-  if current.get("sourceSignature") == signature:
+  if replay_snapshot_is_current(runtime, signature):
     return False
   with BACKTEST_JOB_LOCK:
     if symbol in BACKTEST_JOBS_ACTIVE:
