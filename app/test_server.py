@@ -362,6 +362,7 @@ class ServerTests(unittest.TestCase):
       "groups": [],
       "validation": {"status": "building", "outOfSample": {"resolved": 0}},
       "method": {"lookAheadSafe": True},
+      "contextPolicy": {"version": "test-router", "blocked": [], "preferred": []},
       "trades": [{
         "timeframe": 5,
         "direction": "long",
@@ -394,9 +395,34 @@ class ServerTests(unittest.TestCase):
       run_count = connection.execute("SELECT COUNT(*) AS total FROM shadow_experiment_runs").fetchone()["total"]
     self.assertEqual(run_count, 1)
     self.assertEqual(len(experiments), 1)
+    self.assertEqual(experiments[0]["result"]["contextPolicy"]["version"], "test-router")
     self.assertEqual(trade["market_regime"], "trend_up")
     self.assertEqual(trade["realized_r"], 1.9)
     self.assertEqual(trade["mfe_r"], 2.2)
+
+  def test_shadow_experiments_can_be_scoped_to_champion_source_signature(self):
+    def save(signature, generated_at):
+      variant = {
+        "id": "quality-threshold-v1",
+        "version": f"{server.STRATEGY_VERSION}-shadow-quality-threshold-v1",
+        "settings": {"activeTradeThreshold": 66},
+      }
+      result = {
+        "generatedAt": generated_at,
+        "summary": {"resolved": generated_at},
+        "trades": [],
+      }
+      server.save_shadow_experiment_result(connection, signature, variant, result, "QQQ")
+
+    with server.db() as connection:
+      save("source-old", 100)
+      save("source-current", 200)
+      current = server.load_latest_shadow_results(connection, "QQQ", "source-current")
+      old = server.load_latest_shadow_results(connection, "QQQ", "source-old")
+    self.assertEqual(current[0]["sourceSignature"], "source-current")
+    self.assertEqual(current[0]["result"]["summary"]["resolved"], 200)
+    self.assertEqual(old[0]["sourceSignature"], "source-old")
+    self.assertEqual(old[0]["result"]["summary"]["resolved"], 100)
 
   def test_shadow_snapshot_ranks_review_eligible_variant_first(self):
     def replay(expected_r):
@@ -418,6 +444,26 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(snapshot["bestVariantId"], "quality-threshold-v1")
     self.assertEqual(snapshot["variants"][0]["comparison"]["status"], "eligible_for_review")
     self.assertFalse(snapshot["autoPromote"])
+
+  def test_context_routing_attaches_shadow_decision_without_blocking_production(self):
+    candidate = {
+      "direction": "long", "setupType": "breakout", "timeframe": 5,
+      "marketPhase": "midday", "watchOnly": False,
+    }
+    signal = {**candidate, "regime": {"type": "chop"}, "bestLong": candidate, "bestShort": None}
+    policy_row = {
+      "key": "breakout|5|long|chop|midday", "samples": 22,
+      "calibratedExpectedR": -0.4, "winRate": 0.3,
+    }
+    snapshot = {"variants": [{
+      "id": server.context_router.VERSION,
+      "contextPolicy": {"blocked": [policy_row], "preferred": []},
+    }]}
+    server.attach_context_routing(signal, snapshot)
+    self.assertEqual(signal["contextRouting"]["status"], "block")
+    self.assertEqual(candidate["contextRouting"]["status"], "block")
+    self.assertFalse(signal["contextRouting"]["appliedToProduction"])
+    self.assertFalse(signal["watchOnly"])
 
   def test_shadow_comparison_filters_champion_to_same_window_and_timeframes(self):
     def trade(timeframe, signal_time, realized_r):
@@ -454,6 +500,8 @@ class ServerTests(unittest.TestCase):
     runtime = {"backtest": {"sourceSignature": "same"}, "shadow_experiments": None}
     self.assertFalse(server.replay_snapshot_is_current(runtime, "same"))
     runtime["shadow_experiments"] = {"variants": []}
+    self.assertFalse(server.replay_snapshot_is_current(runtime, "same"))
+    runtime["shadow_experiments"] = {"variants": [{"id": server.context_router.VERSION}]}
     self.assertTrue(server.replay_snapshot_is_current(runtime, "same"))
 
   def test_data_health_blocks_missing_intraday_bars_during_market_hours(self):

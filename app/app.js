@@ -266,6 +266,7 @@ const els = {
   calibrationRange: document.getElementById("calibrationRange"),
   calibrationExcursion: document.getElementById("calibrationExcursion"),
   calibrationHoldingTime: document.getElementById("calibrationHoldingTime"),
+  contextRoutingState: document.getElementById("contextRoutingState"),
   calibrationScope: document.getElementById("calibrationScope"),
   activeAlert: document.getElementById("activeAlert"),
   scoreDrivers: document.getElementById("scoreDrivers"),
@@ -3485,6 +3486,10 @@ function renderCalibration(signal) {
   const modelMae = Number(model.avgMaeR);
   const modelHoldingMs = Number(model.avgHoldingMs);
   const qualityGate = subject?.qualityGate || {};
+  const contextRouting = subject?.contextRouting || {};
+  const contextLabels = { block: "Shadow block", prefer: "Shadow prefer", neutral: "No rule", building: "Building" };
+  els.contextRoutingState.textContent = contextLabels[contextRouting.status] || "Building";
+  setTone(els.contextRoutingState, contextRouting.status === "prefer" ? "positive" : contextRouting.status === "block" ? "negative" : "neutral");
   const samples = Number(calibration.sampleSize || 0);
   const probability = Number(calibration.probabilityT1);
   const expectedR = Number(calibration.expectedR);
@@ -3507,7 +3512,7 @@ function renderCalibration(signal) {
       ? `${fmt(modelMfe, 2)}R / ${fmt(modelMae, 2)}R`
       : "--";
     els.calibrationHoldingTime.textContent = fmtDuration(modelHoldingMs);
-    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. ${qualityGate.detail || `Live model uses ${model.scope || "comparable"} outcomes, with a neutral prior and conservative range until the sample grows.`}`;
+    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. ${contextRouting.detail || qualityGate.detail || `Live model uses ${model.scope || "comparable"} outcomes, with a neutral prior and conservative range until the sample grows.`}`;
     return;
   }
   if (!samples || !Number.isFinite(probability)) {
@@ -3519,7 +3524,7 @@ function renderCalibration(signal) {
     els.calibrationRange.textContent = "--";
     els.calibrationExcursion.textContent = "--";
     els.calibrationHoldingTime.textContent = "--";
-    els.calibrationScope.textContent = qualityGate.detail || "Waiting for automatically resolved comparable plans and historical replay data.";
+    els.calibrationScope.textContent = contextRouting.detail || qualityGate.detail || "Waiting for automatically resolved comparable plans and historical replay data.";
     return;
   }
   els.calibrationBadge.textContent = calibration.calibrated ? "Replay baseline" : "Replay only";
@@ -3533,7 +3538,7 @@ function renderCalibration(signal) {
     : "--";
   els.calibrationExcursion.textContent = "--";
   els.calibrationHoldingTime.textContent = "--";
-  els.calibrationScope.textContent = qualityGate.detail || `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.sampleType || "historical replay"} ${calibration.scope || "baseline"} with a neutral prior.`;
+  els.calibrationScope.textContent = contextRouting.detail || qualityGate.detail || `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.sampleType || "historical replay"} ${calibration.scope || "baseline"} with a neutral prior.`;
 }
 
 function render(signal, indicators) {

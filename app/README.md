@@ -72,7 +72,9 @@ Each actionable long or short plan includes entry, invalidation, Target 1, Targe
 
 The server runs a bounded background candle-by-candle replay over persistent 1m history, up to 50,000 native 5m bars, resampled 15m bars, and up to 3,000 daily bars. Replay calls the same Python setup and scoring functions used by live recommendations. It uses chronological holdouts and rolling forward folds, models opening fills, stop gaps and session-dependent slippage, excludes ambiguous OHLC paths, and keeps simulated trades separate from the live journal.
 
-Each replay also runs two versioned shadow challengers over a bounded recent 5m, 15m, and 1D evaluation window: a four-point higher quality threshold and the strict confirmation profile. Their trades are persisted separately with entry, stop, targets, setup, timeframe, direction, regime, MFE, MAE, and realized R. Model Governance filters the fixed production champion to the identical timeframes and date window, then compares holdout expectancy after execution costs, profit factor, drawdown, sample coverage, and fold stability.
+Each replay also runs three versioned shadow challengers. Two operate over a bounded recent 5m, 15m, and 1D evaluation window: a four-point higher quality threshold and the strict confirmation profile. The third is a context router that learns exact setup, timeframe, direction, market-regime, and session-phase combinations. It requires at least 15 outcomes plus negative expectancy, win rate, and profit-factor evidence before proposing a block, or at least 20 outcomes plus positive evidence before marking a context preferred. Its out-of-sample result is trained on the earlier 60% and evaluated only on the later 40%; current shadow decisions may use all completed history.
+
+Challenger trades and policies are persisted separately with entry, stop, targets, setup, timeframe, direction, regime, MFE, MAE, and realized R. Model Governance filters the fixed production champion to each challenger's identical timeframes and date window, then compares holdout expectancy after execution costs, profit factor, drawdown, sample coverage, and fold stability. The context router remains observational: its proposed block or preference appears under Model Confidence but does not suppress, promote, or rescore a production recommendation without manual review and a later explicit promotion.
 
 Default replay execution assumptions are 0.5 basis points of slippage per side and zero per-share commission. Configure `backtestSlippageBps` and `backtestCommissionPerShare` in `settings.json` if the expected execution environment differs.
 
@@ -155,7 +157,7 @@ node app/test_pattern_engine.js
 python3 -m unittest discover -s app -p 'test_*.py'
 node --check app/app.js
 node --check app/pattern-engine.js
-python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/shadow_engine.py app/ibkr_provider.py
+python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/shadow_engine.py app/context_router.py app/ibkr_provider.py
 ```
 
 This tool is educational decision support, not financial advice. It does not guarantee outcomes.

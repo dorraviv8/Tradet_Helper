@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 import strategy_engine
 import backtest_engine
+import context_router
 import ibkr_provider
 import options_engine
 import notification_engine
@@ -1620,7 +1621,7 @@ def save_shadow_experiment_result(connection, source_signature, variant, result,
   generated_at = int(result.get("generatedAt") or now_ms())
   stored_result = {
     key: result.get(key)
-    for key in ("symbol", "summary", "byTimeframe", "groups", "validation", "method", "generatedAt", "evaluationWindow")
+    for key in ("symbol", "summary", "byTimeframe", "groups", "validation", "method", "generatedAt", "evaluationWindow", "contextPolicy")
   }
   connection.execute("""
     INSERT INTO shadow_experiment_runs (
@@ -1672,13 +1673,16 @@ def save_shadow_experiment_result(connection, source_signature, variant, result,
     """, rows)
 
 
-def load_latest_shadow_results(connection, symbol=SYMBOL):
-  rows = connection.execute("""
-    SELECT variant_id, variant_version, generated_at, settings_json, result_json
+def load_latest_shadow_results(connection, symbol=SYMBOL, source_signature=None):
+  signature_filter = " AND source_signature = ?" if source_signature is not None else ""
+  parameters = (symbol, STRATEGY_VERSION, source_signature) if source_signature is not None else (symbol, STRATEGY_VERSION)
+  rows = connection.execute(f"""
+    SELECT variant_id, variant_version, source_signature, generated_at, settings_json, result_json
     FROM shadow_experiment_runs
     WHERE symbol = ? AND champion_version = ?
+      {signature_filter}
     ORDER BY generated_at DESC, id DESC
-  """, (symbol, STRATEGY_VERSION)).fetchall()
+  """, parameters).fetchall()
   latest = {}
   for row in rows:
     if row["variant_id"] in latest:
@@ -1691,6 +1695,7 @@ def load_latest_shadow_results(connection, symbol=SYMBOL):
     latest[row["variant_id"]] = {
       "id": row["variant_id"],
       "version": row["variant_version"],
+      "sourceSignature": row["source_signature"],
       "generatedAt": row["generated_at"],
       "settings": settings,
       "result": result,
@@ -1700,6 +1705,12 @@ def load_latest_shadow_results(connection, symbol=SYMBOL):
 
 def build_shadow_experiment_snapshot(champion, experiments, settings):
   definitions = {row["id"]: row for row in shadow_engine.variants(settings, STRATEGY_VERSION)}
+  definitions[context_router.VERSION] = {
+    "id": context_router.VERSION,
+    "version": f"{STRATEGY_VERSION}-shadow-{context_router.VERSION}",
+    "label": context_router.LABEL,
+    "description": context_router.DESCRIPTION,
+  }
   minimum = max(30, int((settings.get("learning") or {}).get("minimumPromotionSamples") or 120))
   variants = []
   for experiment in experiments or []:
@@ -1714,6 +1725,7 @@ def build_shadow_experiment_snapshot(champion, experiments, settings):
       "description": definition.get("description"),
       "generatedAt": experiment.get("generatedAt"),
       "summary": (experiment.get("result") or {}).get("summary") or {},
+      "contextPolicy": experiment_result.get("contextPolicy"),
       "comparison": comparison,
     })
   rank = {"eligible_for_review": 3, "observing": 2, "building": 1, "underperforming": 0}
@@ -1738,6 +1750,24 @@ def shadow_evaluation_window(trades):
     "end": max(signal_times) if signal_times else None,
     "timeframes": sorted({int(row["timeframe"]) for row in trades or [] if row.get("timeframe") is not None}),
   }
+
+
+def attach_context_routing(signal, shadow_snapshot):
+  if not isinstance(signal, dict):
+    return signal
+  router = next((
+    row for row in (shadow_snapshot or {}).get("variants") or []
+    if row.get("id") == context_router.VERSION
+  ), None)
+  policy = (router or {}).get("contextPolicy") or {}
+  signal_regime = (signal.get("regime") or {}).get("type") or signal.get("marketRegime") or "unknown"
+  for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
+    if not isinstance(candidate, dict):
+      continue
+    candidate.setdefault("timeframe", signal.get("timeframe"))
+    candidate.setdefault("marketRegime", signal_regime)
+    candidate["contextRouting"] = context_router.decision_for_candidate(policy, candidate)
+  return signal
 
 
 def champion_for_shadow_window(champion, challenger):
@@ -1787,7 +1817,9 @@ def backtest_source_signature(runtime, settings, symbol=SYMBOL):
 
 def replay_snapshot_is_current(runtime, signature):
   current = runtime.get("backtest") or {}
-  return current.get("sourceSignature") == signature and runtime.get("shadow_experiments") is not None
+  variants = ((runtime.get("shadow_experiments") or {}).get("variants") or [])
+  has_context_router = any(row.get("id") == context_router.VERSION for row in variants)
+  return current.get("sourceSignature") == signature and has_context_router
 
 
 def attach_signal_calibration(signal, trades):
@@ -1981,43 +2013,72 @@ def schedule_historical_replay(symbol=SYMBOL):
 
   def run():
     try:
-      result = backtest_engine.run_replay(
-        one_minute=runtime["history"],
-        five_minute=runtime["five_minute_history"],
-        daily=runtime["daily_history"],
-        settings=settings,
-        symbol=symbol,
+      reuse_champion = (
+        (runtime.get("backtest") or {}).get("sourceSignature") == signature
+        and bool((runtime.get("backtest") or {}).get("trades"))
       )
-      result["generatedAt"] = now_ms()
-      result["sourceSignature"] = signature
-      result["strategyVersion"] = STRATEGY_VERSION
-      experiments = []
-      for variant in shadow_engine.variants(settings, STRATEGY_VERSION):
-        variant_result = backtest_engine.run_replay(
+      if reuse_champion:
+        result = runtime["backtest"]
+      else:
+        result = backtest_engine.run_replay(
+          one_minute=runtime["history"],
           five_minute=runtime["five_minute_history"],
           daily=runtime["daily_history"],
-          settings=variant["settings"],
+          settings=settings,
           symbol=symbol,
-          five_minute_max_bars=shadow_engine.SHADOW_FIVE_MINUTE_MAX_BARS,
-          daily_max_bars=shadow_engine.SHADOW_DAILY_MAX_BARS,
         )
-        variant_result["generatedAt"] = result["generatedAt"]
-        variant_result["strategyVersion"] = variant["version"]
-        variant_result["evaluationWindow"] = shadow_evaluation_window(variant_result.get("trades") or [])
-        experiments.append({
-          "id": variant["id"],
-          "version": variant["version"],
-          "generatedAt": result["generatedAt"],
-          "settings": variant["settings"],
-          "result": variant_result,
-        })
+        result["generatedAt"] = now_ms()
+        result["sourceSignature"] = signature
+        result["strategyVersion"] = STRATEGY_VERSION
+      experiments = []
+      if not reuse_champion:
+        for variant in shadow_engine.variants(settings, STRATEGY_VERSION):
+          variant_result = backtest_engine.run_replay(
+            five_minute=runtime["five_minute_history"],
+            daily=runtime["daily_history"],
+            settings=variant["settings"],
+            symbol=symbol,
+            five_minute_max_bars=shadow_engine.SHADOW_FIVE_MINUTE_MAX_BARS,
+            daily_max_bars=shadow_engine.SHADOW_DAILY_MAX_BARS,
+          )
+          variant_result["generatedAt"] = result["generatedAt"]
+          variant_result["strategyVersion"] = variant["version"]
+          variant_result["evaluationWindow"] = shadow_evaluation_window(variant_result.get("trades") or [])
+          experiments.append({
+            "id": variant["id"],
+            "version": variant["version"],
+            "generatedAt": result["generatedAt"],
+            "settings": variant["settings"],
+            "result": variant_result,
+          })
+      context_variant = {
+        "id": context_router.VERSION,
+        "version": f"{STRATEGY_VERSION}-shadow-{context_router.VERSION}",
+        "settings": {
+          "mode": "shadow",
+          "dimensions": "setup|timeframe|direction|regime|phase",
+          "minimumBlockSamples": context_router.MIN_BLOCK_SAMPLES,
+          "minimumPreferSamples": context_router.MIN_PREFER_SAMPLES,
+        },
+      }
+      context_result = context_router.run(result.get("trades") or [])
+      context_result["symbol"] = symbol
+      context_result["generatedAt"] = result["generatedAt"]
+      context_result["strategyVersion"] = context_variant["version"]
+      experiments.append({
+        **context_variant,
+        "generatedAt": result["generatedAt"],
+        "result": context_result,
+      })
       with db() as connection:
-        save_backtest_result(connection, signature, result, symbol)
+        if not reuse_champion:
+          save_backtest_result(connection, signature, result, symbol)
         for experiment in experiments:
           save_shadow_experiment_result(
             connection, signature, experiment, experiment["result"], symbol
           )
-      shadow_snapshot = build_shadow_experiment_snapshot(result, experiments, settings)
+        persisted_experiments = load_latest_shadow_results(connection, symbol, signature)
+      shadow_snapshot = build_shadow_experiment_snapshot(result, persisted_experiments, settings)
       with MARKET_RUNTIME_LOCK:
         MARKET_RUNTIMES[symbol]["backtest"] = result
         MARKET_RUNTIMES[symbol]["backtest_status"] = "ready"
@@ -2119,6 +2180,7 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
       "trend5": signal.get("trend5"),
       "trend15": signal.get("trend15"),
       "marketConfirmation": signal.get("marketConfirmation"),
+      "contextRouting": signal.get("contextRouting"),
       "dataQuality": signal.get("dataQuality"),
       "riskPlan": signal.get("riskPlan"),
     }),
@@ -2901,6 +2963,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
       attach_signal_calibration(signal, replay_trades)
       attach_signal_learning_confidence(signal, learning_snapshot)
       apply_setup_quality_gate({timeframe: signal}, learning_snapshot)
+      attach_context_routing(signal, runtime.get("shadow_experiments"))
       risk_engine.attach_position_plan(signal, settings, symbol)
       plan_ids[int(timeframe)] = persist_generated_signal(
         connection, provider, int(timeframe), signal, settings, symbol
@@ -3001,7 +3064,8 @@ def model_governance_snapshot(symbol):
   snapshot = runtime.get("shadow_experiments")
   if snapshot is None:
     with db() as connection:
-      experiments = load_latest_shadow_results(connection, symbol)
+      signature = (runtime.get("backtest") or {}).get("sourceSignature")
+      experiments = load_latest_shadow_results(connection, symbol, signature)
     snapshot = build_shadow_experiment_snapshot(runtime.get("backtest") or {}, experiments, settings)
   variants = snapshot.get("variants") or []
   best = variants[0] if variants else None
@@ -4882,7 +4946,12 @@ def main():
   init_db()
   with db() as connection:
     cached_backtests = {symbol: load_latest_backtest(connection, symbol) for symbol in SUPPORTED_SYMBOLS}
-    cached_shadow_results = {symbol: load_latest_shadow_results(connection, symbol) for symbol in SUPPORTED_SYMBOLS}
+    cached_shadow_results = {
+      symbol: load_latest_shadow_results(
+        connection, symbol, (cached_backtests.get(symbol) or {}).get("sourceSignature")
+      )
+      for symbol in SUPPORTED_SYMBOLS
+    }
   settings = load_strategy_settings()
   with MARKET_RUNTIME_LOCK:
     for symbol, cached_backtest in cached_backtests.items():
