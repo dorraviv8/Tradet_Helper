@@ -2015,7 +2015,6 @@ def schedule_historical_replay(symbol=SYMBOL):
     try:
       reuse_champion = (
         (runtime.get("backtest") or {}).get("sourceSignature") == signature
-        and bool((runtime.get("backtest") or {}).get("trades"))
       )
       if reuse_champion:
         result = runtime["backtest"]
