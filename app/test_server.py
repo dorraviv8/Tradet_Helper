@@ -87,6 +87,8 @@ class ServerTests(unittest.TestCase):
       "lifecycle_status": "waiting",
       "realized_r": None,
       "closed_at": None,
+      "signal_candle_time": None,
+      "entry_confirmation": "touch",
     }
     row.update(overrides)
     with server.db() as connection:
@@ -94,11 +96,13 @@ class ServerTests(unittest.TestCase):
         INSERT INTO plans (
           id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type,
           market_phase, status, score, entry, stop, target1, target2, risk_reward, price_at_plan,
-          strategy_version, eligible_for_learning, outcome_status, lifecycle_status, realized_r, closed_at
+          strategy_version, eligible_for_learning, outcome_status, lifecycle_status, realized_r, closed_at,
+          signal_candle_time, entry_confirmation
         ) VALUES (
           :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type,
           :market_phase, :status, :score, :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan,
-          :strategy_version, :eligible_for_learning, :outcome_status, :lifecycle_status, :realized_r, :closed_at
+          :strategy_version, :eligible_for_learning, :outcome_status, :lifecycle_status, :realized_r, :closed_at,
+          :signal_candle_time, :entry_confirmation
         )
       """, row)
 
@@ -339,6 +343,56 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(loaded["summary"]["resolved"], 20)
     self.assertEqual(loaded["sourceSignature"], "signature")
     self.assertEqual(plan_count, 0)
+
+  def test_duplicate_trade_theses_are_quarantined_from_learning(self):
+    signal_time = 1_780_000_000_000
+    self.insert_plan(
+      "revision-a", signal_candle_time=signal_time, setup="Long 1D EMA 20 rejection",
+      timeframe=1440, realized_r=-1.0, outcome_status="stopped", lifecycle_status="closed", closed_at=signal_time + 1,
+    )
+    self.insert_plan(
+      "revision-b", signal_candle_time=signal_time, setup="Long 1D EMA 20 rejection",
+      timeframe=1440, entry=100.2, realized_r=-1.0, outcome_status="stopped", lifecycle_status="closed", closed_at=signal_time + 2,
+    )
+    with server.db() as connection:
+      self.assertEqual(server.repair_duplicate_plan_learning(connection), 1)
+      rows = connection.execute("SELECT id, eligible_for_learning, duplicate_of FROM plans ORDER BY id").fetchall()
+      snapshot = server.build_learning_snapshot(connection, "QQQ")
+      scoreboard = {row["symbol"]: row for row in server.recommendation_scoreboard(connection)}
+    self.assertEqual(sum(int(row["eligible_for_learning"]) for row in rows), 1)
+    self.assertEqual(sum(row["duplicate_of"] is not None for row in rows), 1)
+    self.assertEqual(snapshot["resolvedSamples"], 1)
+    self.assertEqual(scoreboard["QQQ"]["recommended"], 1)
+
+  def test_same_signal_candle_revises_one_waiting_plan(self):
+    base = {
+      "direction": "long", "watchOnly": False, "score": 82,
+      "setup": "Long 5m momentum continuation", "setupType": "momentum",
+      "entry": 100.0, "stop": 99.0, "target": 101.2, "target2": 102.0,
+      "riskReward": 1.2, "signalCandleTime": 1_780_000_000_000,
+      "actionableAt": 1_780_000_300_000, "marketPhase": "morning",
+      "regime": {"type": "trend_up"}, "reasons": [], "exitRules": [],
+      "latestIndicator": {"close": 99.8},
+      "executionQuality": {"status": "passed", "entryConfirmation": "close"},
+    }
+    with server.db() as connection:
+      with patch.object(server, "now_ms", return_value=base["actionableAt"] + 60_000):
+        first = server.persist_generated_signal(connection, "test", 5, base, {"activeTradeThreshold": 62}, "QQQ")
+        revised = {**base, "entry": 100.25, "target": 101.45, "target2": 102.25, "actionableAt": base["actionableAt"] + 60_000}
+        second = server.persist_generated_signal(connection, "test", 5, revised, {"activeTradeThreshold": 62}, "QQQ")
+      rows = connection.execute("SELECT * FROM plans").fetchall()
+      events = connection.execute("SELECT event_type FROM plan_events WHERE plan_id = ? ORDER BY id", (first,)).fetchall()
+    self.assertEqual(first, second)
+    self.assertEqual(len(rows), 1)
+    self.assertEqual(rows[0]["entry"], 100.25)
+    self.assertEqual(rows[0]["revision_count"], 1)
+    self.assertEqual([row["event_type"] for row in events], ["created", "revised"])
+
+  def test_close_confirmation_does_not_enter_on_intrabar_touch(self):
+    self.insert_plan("close-confirm", entry_confirmation="close", entry=101, stop=99, target1=102, target2=103)
+    with server.db() as connection:
+      server.evaluate_plans(connection, "QQQ", [candle(120_000, 100, 101.5, 99.5, 100.5)])
+    self.assertEqual(self.fetch_plan("close-confirm")["lifecycle_status"], "waiting")
 
   def test_backtest_results_are_scoped_by_symbol(self):
     with server.db() as connection:
@@ -626,8 +680,9 @@ class ServerTests(unittest.TestCase):
     })
     self.assertEqual(confidence["status"], "Preliminary")
     self.assertEqual(confidence["sampleSize"], 8)
-    self.assertEqual(confidence["scope"], "comparable setup, timeframe, phase, direction, and regime")
-    self.assertAlmostEqual(confidence["target1Rate"], 15 / 28)
+    self.assertEqual(confidence["scope"], "hierarchical through exact context")
+    self.assertGreater(confidence["target1Rate"], 0.5)
+    self.assertLess(confidence["target1Rate"], 5 / 8)
     self.assertLess(confidence["confidenceLow"], confidence["target1Rate"])
     self.assertGreater(confidence["confidenceHigh"], confidence["target1Rate"])
     self.assertAlmostEqual(confidence["avgMfeR"], 1.5)

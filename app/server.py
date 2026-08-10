@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import strategy_engine
 import backtest_engine
 import context_router
+import learning_engine
 import ibkr_provider
 import options_engine
 import notification_engine
@@ -88,7 +89,7 @@ OPTIONS_PROVIDER_REQUEST_CREDITS = 4
 BACKTEST_MIN_REPLAY_INTERVAL_MS = 60 * 60 * 1000
 BACKTEST_MAX_CONCURRENCY = max(1, int(os.environ.get("BACKTEST_MAX_CONCURRENCY", "1")))
 SECONDARY_VALIDATION_INTERVAL_SECONDS = max(30, int(os.environ.get("SECONDARY_VALIDATION_INTERVAL_SECONDS", "60")))
-LEARNING_SNAPSHOT_VERSION = 2
+LEARNING_SNAPSHOT_VERSION = 3
 ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
 MONITOR_INTERVAL_SECONDS = max(30, int(os.environ.get("MONITOR_INTERVAL_SECONDS", "60")))
 MONITOR_FAILURE_THRESHOLD = max(1, int(os.environ.get("MONITOR_FAILURE_THRESHOLD", "3")))
@@ -177,6 +178,67 @@ def add_column(connection, existing, name, definition):
   if name not in existing:
     connection.execute(f"ALTER TABLE plans ADD COLUMN {name} {definition}")
     existing.add(name)
+
+
+def trade_thesis_key(symbol, timeframe, direction, setup, signal_candle_time, strategy_version=STRATEGY_VERSION, fallback_id=None):
+  if signal_candle_time is None:
+    return f"legacy:{fallback_id}"
+  identity = json.dumps([
+    str(strategy_version), str(symbol), int(timeframe), str(direction),
+    " ".join(str(setup).lower().split()), int(signal_candle_time),
+  ], separators=(",", ":"))
+  return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def repair_duplicate_plan_learning(connection):
+  rows = connection.execute("""
+    SELECT id, symbol, timeframe, direction, setup, signal_candle_time,
+           strategy_version, created_at, entry_hit_at, lifecycle_status,
+           outcome_status, duplicate_of
+    FROM plans
+    ORDER BY created_at, id
+  """).fetchall()
+  grouped = {}
+  repaired = 0
+  for row in rows:
+    key = trade_thesis_key(
+      row["symbol"], row["timeframe"], row["direction"], row["setup"],
+      row["signal_candle_time"], row["strategy_version"] or "legacy", row["id"],
+    )
+    grouped.setdefault(key, []).append(row)
+  for key, candidates in grouped.items():
+    if len(candidates) < 2:
+      connection.execute("UPDATE plans SET thesis_key = ? WHERE id = ?", (key, candidates[0]["id"]))
+      continue
+    canonical = sorted(candidates, key=lambda row: (
+      0 if row["entry_hit_at"] is not None else 1,
+      int(row["created_at"] or 0),
+      str(row["id"]),
+    ))[0]
+    for duplicate in candidates:
+      if duplicate["id"] == canonical["id"]:
+        continue
+      if duplicate["duplicate_of"] == canonical["id"]:
+        continue
+      active = (
+        duplicate["outcome_status"] in {"open", "target1"}
+        and (duplicate["lifecycle_status"] or "waiting") in {"waiting", "entered"}
+      )
+      connection.execute("""
+        UPDATE plans
+        SET duplicate_of = ?, thesis_key = ?, eligible_for_learning = 0,
+            lifecycle_status = CASE WHEN ? THEN 'superseded' ELSE lifecycle_status END,
+            outcome_status = CASE WHEN ? THEN 'superseded' ELSE outcome_status END
+        WHERE id = ?
+      """, (
+        canonical["id"], f"{key}:duplicate:{duplicate['id']}",
+        1 if active else 0, 1 if active else 0, duplicate["id"],
+      ))
+      repaired += 1
+    connection.execute("UPDATE plans SET duplicate_of = NULL, thesis_key = ? WHERE id = ?", (key, canonical["id"]))
+  if repaired:
+    connection.execute("DELETE FROM learning_snapshots")
+  return repaired
 
 
 def init_db():
@@ -271,8 +333,16 @@ def init_db():
       "trader_notes": "TEXT",
       "review_updated_at": "INTEGER",
       "screenshot_path": "TEXT",
+      "thesis_key": "TEXT",
+      "duplicate_of": "TEXT",
+      "revision_count": "INTEGER NOT NULL DEFAULT 0",
+      "entry_confirmation": "TEXT NOT NULL DEFAULT 'touch'",
     }.items():
       add_column(connection, existing, column, definition)
+
+    repair_duplicate_plan_learning(connection)
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_unique_thesis ON plans(thesis_key) WHERE duplicate_of IS NULL")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_duplicate_of ON plans(duplicate_of)")
 
     connection.execute("""
       CREATE TABLE IF NOT EXISTS candles (
@@ -1530,10 +1600,22 @@ def build_learning_snapshot(connection, symbol=SYMBOL):
   )
   groups = {key: learning_group_rows(connection, symbol, label, column) for key, label, column in group_definitions}
   total = sum(int(item["sample_size"]) for item in groups["byTimeframe"].values())
+  outcomes = [dict(row) for row in connection.execute("""
+    SELECT id, score,
+           CASE WHEN outcome_status IN ('target1', 'target1_stop', 'target2') THEN 1 ELSE 0 END AS target1_hit,
+           realized_r, closed_at
+    FROM plans
+    WHERE symbol = ? AND eligible_for_learning = 1 AND strategy_version = ?
+      AND realized_r IS NOT NULL AND duplicate_of IS NULL
+    ORDER BY COALESCE(closed_at, updated_at), id
+  """, (symbol, STRATEGY_VERSION)).fetchall()]
+  score_calibration = learning_engine.build_score_calibration(outcomes)
   return {
     "symbol": symbol,
     "strategyVersion": STRATEGY_VERSION,
     "resolvedSamples": total,
+    "scoreCalibration": score_calibration,
+    "calibrationDrift": learning_engine.calibration_drift(outcomes, score_calibration),
     "performance": {
       key: {
         group_key: {
@@ -1865,36 +1947,17 @@ def learning_confidence_for_signal(snapshot, signal):
       "avgMaeR": None,
       "avgHoldingMs": None,
       "lastUpdated": None,
+      "scoreProbability": None,
+      "contextProbability": None,
+      "hierarchy": [],
     }
-  setup_type = signal.get("setupType") or strategy_engine.setup_type(signal.get("setup", ""))
-  timeframe = str(signal.get("timeframe") or "")
-  phase = signal.get("marketPhase") or "unknown"
-  direction = signal.get("direction") or "unknown"
-  regime = (signal.get("regime") or {}).get("type") or signal.get("marketRegime") or "unknown"
-  comparable_key = "|".join((setup_type, timeframe, phase, direction, regime))
-  setup_timeframe_direction_key = "|".join((setup_type, timeframe, direction))
-  setup_timeframe_key = "|".join((setup_type, timeframe))
-  candidates = (
-    ("comparable", comparable_key, "comparable setup, timeframe, phase, direction, and regime", 8),
-    ("setupTimeframeDirection", setup_timeframe_direction_key, "setup, timeframe, and direction", 12),
-    ("setupTimeframe", setup_timeframe_key, "setup and timeframe", 15),
-    ("setup", setup_type, "setup type", 20),
-    ("timeframe", timeframe, "timeframe", 30),
-  )
   groups = snapshot.get("groups") or {}
-  selected = None
-  scope = "no comparable resolved plans"
-  for group_name, key, label, minimum_samples in candidates:
-    item = (groups.get(f"by{group_name[0].upper()}{group_name[1:]}") or {}).get(str(key))
-    if item and int(item.get("sample_size") or 0) >= minimum_samples:
-      selected = item
-      scope = label
-      break
-  if selected is None:
+  estimate = learning_engine.hierarchical_estimate(groups, signal)
+  if estimate is None:
     return {
       "status": "Building",
       "sampleSize": 0,
-      "scope": scope,
+      "scope": "no comparable resolved plans",
       "expectedR": None,
       "target1Rate": None,
       "confidenceLow": None,
@@ -1903,20 +1966,31 @@ def learning_confidence_for_signal(snapshot, signal):
       "avgMaeR": None,
       "avgHoldingMs": None,
       "lastUpdated": None,
+      "scoreProbability": None,
+      "contextProbability": None,
+      "hierarchy": [],
     }
-  sample_size = int(selected["sample_size"])
+  sample_size = int(estimate["sampleSize"])
+  context_probability = finite_or_none(estimate.get("probabilityT1"))
+  score_probability = learning_engine.predict_probability(snapshot.get("scoreCalibration"), signal.get("score") or 0)
+  probability = score_probability if score_probability is not None else context_probability
+  confidence_low, confidence_high = wilson_interval((probability or 0.5) * sample_size, sample_size) if sample_size else (None, None)
   return {
     "status": "Established" if sample_size >= 60 else "Developing" if sample_size >= 20 else "Preliminary",
     "sampleSize": sample_size,
-    "scope": scope,
-    "expectedR": finite_or_none(selected.get("calibrated_expected_r")),
-    "target1Rate": finite_or_none(selected.get("target1_rate")),
-    "confidenceLow": finite_or_none(selected.get("confidence_low")),
-    "confidenceHigh": finite_or_none(selected.get("confidence_high")),
-    "avgMfeR": finite_or_none(selected.get("avg_mfe_r")),
-    "avgMaeR": finite_or_none(selected.get("avg_mae_r")),
-    "avgHoldingMs": selected.get("avg_holding_ms"),
-    "lastUpdated": selected.get("last_closed_at"),
+    "scope": f"hierarchical through {estimate['scope']}",
+    "expectedR": finite_or_none(estimate.get("expectedR")),
+    "target1Rate": probability,
+    "scoreProbability": score_probability,
+    "contextProbability": context_probability,
+    "confidenceLow": finite_or_none(confidence_low),
+    "confidenceHigh": finite_or_none(confidence_high),
+    "avgMfeR": finite_or_none(estimate.get("avgMfeR")),
+    "avgMaeR": finite_or_none(estimate.get("avgMaeR")),
+    "avgHoldingMs": estimate.get("avgHoldingMs"),
+    "lastUpdated": estimate.get("lastUpdated"),
+    "hierarchy": estimate.get("levels") or [],
+    "calibrationStatus": (snapshot.get("scoreCalibration") or {}).get("status"),
   }
 
 
@@ -1935,18 +2009,17 @@ def attach_signal_learning_confidence(signal, snapshot):
 def setup_quality_gate(snapshot, candidate):
   if not isinstance(candidate, dict) or candidate.get("direction") not in {"long", "short"}:
     return {"status": "Building", "sampleSize": 0, "detail": "No actionable setup to evaluate."}
-  setup_type = candidate.get("setupType") or strategy_engine.setup_type(candidate.get("setup", ""))
-  timeframe = str(candidate.get("timeframe") or "")
-  key = "|".join((setup_type, timeframe, candidate["direction"]))
-  row = ((snapshot.get("groups") or {}).get("bySetupTimeframeDirection") or {}).get(key)
-  if not row:
+  confidence = learning_confidence_for_signal(snapshot, candidate)
+  if not confidence.get("sampleSize"):
     return {
       "status": "Building", "sampleSize": 0,
-      "detail": "This setup/timeframe/side is collecting its first comparable outcomes.",
+      "detail": "This context is collecting its first independent outcomes.",
     }
-  samples = int(row.get("sample_size") or 0)
-  expected_r = float(row.get("calibrated_expected_r") or 0)
-  win_rate = float(row.get("win_rate") or 0.5)
+  setup_type = candidate.get("setupType") or strategy_engine.setup_type(candidate.get("setup", ""))
+  timeframe = str(candidate.get("timeframe") or "")
+  samples = int(confidence.get("sampleSize") or 0)
+  expected_r = float(confidence.get("expectedR") or 0)
+  win_rate = float(confidence.get("contextProbability") or 0.5)
   if samples >= 20 and expected_r < -0.10 and win_rate <= 0.45:
     return {
       "status": "Blocked", "sampleSize": samples, "expectedR": expected_r, "winRate": win_rate,
@@ -1962,6 +2035,24 @@ def setup_quality_gate(snapshot, candidate):
     "expectedR": expected_r, "winRate": win_rate,
     "detail": f"{samples} comparable outcomes recorded; quality gate remains observational until the sample is larger.",
   }
+
+
+def apply_calibration_drift_gate(recommendations, snapshot):
+  drift = snapshot.get("calibrationDrift") or {}
+  for signal in (recommendations or {}).values():
+    seen = set()
+    for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
+      if not isinstance(candidate, dict) or id(candidate) in seen or candidate.get("direction") not in {"long", "short"}:
+        continue
+      seen.add(id(candidate))
+      decision = learning_engine.drift_for_score(drift, candidate.get("score") or 0)
+      candidate["calibrationDrift"] = decision
+      if decision["status"] == "blocked":
+        candidate["watchOnly"] = True
+        candidate.setdefault("reasons", []).append(decision["detail"])
+      elif decision["status"] == "warning":
+        candidate.setdefault("reasons", []).append(decision["detail"])
+  return recommendations
 
 
 def apply_setup_quality_gate(recommendations, snapshot):
@@ -2109,28 +2200,39 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
     return None
   latest = signal.get("latestIndicator") or {}
   entry = float(signal["entry"])
-  plan_id = "|".join((
-    symbol,
-    str(timeframe),
-    signal["direction"],
-    signal["setup"],
-    str(signal["signalCandleTime"]),
-    str(round(entry * 20)),
-  ))
+  thesis_key = trade_thesis_key(
+    symbol, timeframe, signal["direction"], signal["setup"],
+    signal["signalCandleTime"], STRATEGY_VERSION,
+  )
+  plan_id = f"plan-{thesis_key[:24]}"
   duplicate = connection.execute("""
-    SELECT id, entry
+    SELECT id, entry, lifecycle_status, outcome_status, entry_hit_at
     FROM plans
-    WHERE symbol = ? AND timeframe = ? AND direction = ?
-      AND COALESCE(setup_type, 'unknown') = ? AND created_at >= ?
-      AND outcome_status IN ('open', 'target1')
-      AND COALESCE(lifecycle_status, 'waiting') IN ('waiting', 'entered')
-      AND strategy_version = ?
-    ORDER BY created_at DESC LIMIT 1
-  """, (
-    symbol, timeframe, signal["direction"], signal.get("setupType", "unknown"),
-    actionable_at - (7 * 24 * 60 * MINUTE_MS if timeframe == strategy_engine.DAILY_TIMEFRAME else 15 * MINUTE_MS), STRATEGY_VERSION,
-  )).fetchone()
-  if duplicate and abs(float(duplicate["entry"]) - entry) / max(1, entry) < 0.0015:
+    WHERE thesis_key = ? AND duplicate_of IS NULL
+    LIMIT 1
+  """, (thesis_key,)).fetchone()
+  if duplicate:
+    if duplicate["entry_hit_at"] is None and duplicate["lifecycle_status"] == "waiting" and duplicate["outcome_status"] == "open":
+      execution_quality = signal.get("executionQuality") or {}
+      connection.execute("""
+        UPDATE plans
+        SET updated_at = ?, score = ?, entry = ?, stop = ?, target1 = ?, target2 = ?,
+            risk_reward = ?, price_at_plan = ?, reasons_json = ?, exit_rules_json = ?,
+            calibration_json = ?, feature_snapshot_json = ?, revision_count = revision_count + 1,
+            entry_confirmation = ?
+        WHERE id = ?
+      """, (
+        actionable_at, int(signal["score"]), entry, float(signal["stop"]),
+        float(signal["target"]), float(signal["target2"]), finite_or_none(signal.get("riskReward")),
+        float(latest["close"]), json.dumps(signal.get("reasons") or []), json.dumps(signal.get("exitRules") or []),
+        json.dumps(signal.get("calibration") or {}), json.dumps({
+          "rawScore": signal.get("rawScore"), "regime": signal.get("regime"),
+          "contextRouting": signal.get("contextRouting"), "calibrationDrift": signal.get("calibrationDrift"),
+          "executionQuality": execution_quality, "dataQuality": signal.get("dataQuality"),
+          "riskPlan": signal.get("riskPlan"),
+        }), execution_quality.get("entryConfirmation", "touch"), duplicate["id"],
+      ))
+      insert_event(connection, duplicate["id"], "revised", actionable_at, latest["close"], {"entry": entry, "score": int(signal["score"])})
     return duplicate["id"]
   row = {
     "id": plan_id,
@@ -2171,6 +2273,8 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
     "settings_json": json.dumps(settings),
     "data_quality": signal.get("dataQuality", "unknown"),
     "eligible_for_learning": 1,
+    "thesis_key": thesis_key,
+    "entry_confirmation": (signal.get("executionQuality") or {}).get("entryConfirmation", "touch"),
     "calibration_json": json.dumps(signal.get("calibration") or {}),
     "feature_snapshot_json": json.dumps({
       "rawScore": signal.get("rawScore"),
@@ -2180,6 +2284,8 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
       "trend15": signal.get("trend15"),
       "marketConfirmation": signal.get("marketConfirmation"),
       "contextRouting": signal.get("contextRouting"),
+      "calibrationDrift": signal.get("calibrationDrift"),
+      "executionQuality": signal.get("executionQuality"),
       "dataQuality": signal.get("dataQuality"),
       "riskPlan": signal.get("riskPlan"),
     }),
@@ -2190,13 +2296,13 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
       entry, stop, target1, target2, risk_reward, price_at_plan, rsi, atr, vwap,
       ema20, ema50, ema150, sma20, sma50, sma150, selected_trend, trend_5, trend_15,
       reasons_json, exit_rules_json, last_price, strategy_version, signal_candle_time, settings_json, data_quality, eligible_for_learning,
-      calibration_json, feature_snapshot_json
+      calibration_json, feature_snapshot_json, thesis_key, entry_confirmation
     ) VALUES (
       :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type, :market_phase, :market_regime, :status, :score,
       :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan, :rsi, :atr, :vwap,
       :ema20, :ema50, :ema150, :sma20, :sma50, :sma150, :selected_trend, :trend_5, :trend_15,
       :reasons_json, :exit_rules_json, :price_at_plan, :strategy_version, :signal_candle_time, :settings_json, :data_quality, :eligible_for_learning,
-      :calibration_json, :feature_snapshot_json
+      :calibration_json, :feature_snapshot_json, :thesis_key, :entry_confirmation
     )
   """, row)
   if cursor.rowcount:
@@ -2962,6 +3068,7 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
       attach_signal_calibration(signal, replay_trades)
       attach_signal_learning_confidence(signal, learning_snapshot)
       apply_setup_quality_gate({timeframe: signal}, learning_snapshot)
+      apply_calibration_drift_gate({timeframe: signal}, learning_snapshot)
       attach_context_routing(signal, runtime.get("shadow_experiments"))
       risk_engine.attach_position_plan(signal, settings, symbol)
       plan_ids[int(timeframe)] = persist_generated_signal(
@@ -3119,6 +3226,13 @@ def monitoring_findings(timestamp=None):
       findings[f"{symbol}:price_mismatch"] = ("critical", f"{symbol}: {cross_validation.get('detail')}")
     elif cross_validation.get("status") in {"stale", "unavailable"}:
       findings[f"{symbol}:secondary_provider"] = ("warning", f"{symbol}: {cross_validation.get('detail')}")
+    drift_blocks = []
+    for signal in (runtime.get("recommendations") or {}).values():
+      for candidate in (signal, signal.get("bestLong"), signal.get("bestShort")):
+        if isinstance(candidate, dict) and (candidate.get("calibrationDrift") or {}).get("status") == "blocked":
+          drift_blocks.append((candidate.get("calibrationDrift") or {}).get("detail"))
+    if drift_blocks:
+      findings[f"{symbol}:calibration_drift"] = ("warning", f"{symbol}: live score calibration drift paused at least one score band")
   backup_age = timestamp - int(BACKUP_STATE.get("last_success_at") or 0) if BACKUP_STATE.get("last_success_at") else None
   if BACKUP_STATE.get("last_error"):
     findings["database:backup_failed"] = ("critical", f"Database backup failed: {BACKUP_STATE['last_error']}")
@@ -3215,6 +3329,20 @@ def prometheus_metrics():
   findings = monitoring_findings(timestamp)
   with db() as connection:
     open_incidents = int(connection.execute("SELECT COUNT(*) AS total FROM system_incidents WHERE status = 'open'").fetchone()["total"])
+    duplicate_plans = int(connection.execute("SELECT COUNT(*) AS total FROM plans WHERE duplicate_of IS NOT NULL").fetchone()["total"])
+    learning_rows = connection.execute("""
+      SELECT symbol, snapshot_json FROM learning_snapshots WHERE strategy_version = ?
+    """, (STRATEGY_VERSION,)).fetchall()
+  learning_metrics = {}
+  for row in learning_rows:
+    try:
+      snapshot = json.loads(row["snapshot_json"])
+    except (TypeError, ValueError):
+      continue
+    learning_metrics[row["symbol"]] = {
+      "samples": int(snapshot.get("resolvedSamples") or 0),
+      "drift": (snapshot.get("calibrationDrift") or {}).get("status") or "building",
+    }
   lines = [
     "# HELP trader_helper_up Whether the application process is responding.",
     "# TYPE trader_helper_up gauge",
@@ -3225,6 +3353,9 @@ def prometheus_metrics():
     "# HELP trader_helper_active_findings Number of current unconfirmed monitoring findings.",
     "# TYPE trader_helper_active_findings gauge",
     f"trader_helper_active_findings {len(findings)}",
+    "# HELP trader_helper_duplicate_plans_quarantined Number of correlated plan revisions excluded from learning.",
+    "# TYPE trader_helper_duplicate_plans_quarantined gauge",
+    f"trader_helper_duplicate_plans_quarantined {duplicate_plans}",
     "# HELP trader_helper_database_backup_age_seconds Age of the latest verified SQLite backup.",
     "# TYPE trader_helper_database_backup_age_seconds gauge",
     f"trader_helper_database_backup_age_seconds {((timestamp - BACKUP_STATE['last_success_at']) / 1000) if BACKUP_STATE.get('last_success_at') else -1}",
@@ -3241,6 +3372,10 @@ def prometheus_metrics():
     "# TYPE trader_helper_secondary_price_drift_pct gauge",
     "# HELP trader_helper_secondary_price_verified Whether the latest independent price check passed.",
     "# TYPE trader_helper_secondary_price_verified gauge",
+    "# HELP trader_helper_learning_samples Independent resolved learning outcomes by symbol.",
+    "# TYPE trader_helper_learning_samples gauge",
+    "# HELP trader_helper_calibration_drift_state Calibration drift state: -1 building, 0 stable, 1 warning, 2 blocked.",
+    "# TYPE trader_helper_calibration_drift_state gauge",
   ]
   delivery = notification_engine.delivery_status()
   lines.extend([
@@ -3263,6 +3398,10 @@ def prometheus_metrics():
     lines.append(f"trader_helper_trade_alerts_allowed{{{labels}}} {1 if health.get('tradeAllowed') else 0}")
     lines.append(f"trader_helper_secondary_price_drift_pct{{{labels}}} {float(drift) if drift is not None else -1}")
     lines.append(f"trader_helper_secondary_price_verified{{{labels}}} {1 if cross_validation.get('status') == 'verified' else 0}")
+    learning = learning_metrics.get(symbol, {})
+    drift_value = {"building": -1, "stable": 0, "warning": 1, "blocked": 2}.get(learning.get("drift"), -1)
+    lines.append(f"trader_helper_learning_samples{{{labels}}} {int(learning.get('samples') or 0)}")
+    lines.append(f"trader_helper_calibration_drift_state{{{labels}}} {drift_value}")
   return "\n".join(lines) + "\n"
 
 
@@ -3577,9 +3716,10 @@ def hit_map(row, candle):
   stop = float(row["stop"])
   target1 = float(row["target1"])
   target2 = float(row["target2"])
+  close_confirmation = row["entry_confirmation"] == "close" if "entry_confirmation" in row.keys() else False
   if direction == "long":
     return {
-      "entry": candle["high"] >= entry,
+      "entry": candle["close"] >= entry if close_confirmation else candle["high"] >= entry,
       "stop": candle["low"] <= stop,
       "target1": candle["high"] >= target1,
       "target2": candle["high"] >= target2,
@@ -3587,7 +3727,7 @@ def hit_map(row, candle):
       "adverse": max(0, entry - candle["low"]),
     }
   return {
-    "entry": candle["low"] <= entry,
+    "entry": candle["close"] <= entry if close_confirmation else candle["low"] <= entry,
     "stop": candle["high"] >= stop,
     "target1": candle["low"] <= target1,
     "target2": candle["low"] <= target2,
@@ -3898,6 +4038,7 @@ def recommendation_scoreboard(connection):
     FROM plans
     WHERE symbol IN ({placeholders})
       AND status = 'alert'
+      AND duplicate_of IS NULL
     GROUP BY symbol
   """, SUPPORTED_SYMBOLS).fetchall()
   by_symbol = {row["symbol"]: dict(row) for row in rows}
@@ -4359,8 +4500,13 @@ class Handler(SimpleHTTPRequestHandler):
       if any(abs(value - price_at_plan) / price_at_plan > 0.05 for value in prices.values()):
         raise ValueError("plan prices are too far from market price")
 
+      thesis_key = trade_thesis_key(
+        symbol, timeframe, plan["direction"], plan.get("setup") or "unknown",
+        signal_candle_time, str(payload.get("strategyVersion") or STRATEGY_VERSION),
+      )
+
       row = {
-        "id": str(plan["id"])[:240],
+        "id": f"plan-{thesis_key[:24]}",
         "created_at": timestamp,
         "updated_at": timestamp,
         "symbol": symbol,
@@ -4398,53 +4544,34 @@ class Handler(SimpleHTTPRequestHandler):
         "settings_json": json.dumps(payload.get("settings") or {}),
         "data_quality": str(payload.get("dataQuality") or "unknown")[:120],
         "eligible_for_learning": 1 if str(payload.get("strategyVersion") or STRATEGY_VERSION) == STRATEGY_VERSION else 0,
+        "thesis_key": thesis_key,
+        "entry_confirmation": ((plan.get("executionQuality") or {}).get("entryConfirmation") or "touch"),
       }
 
       with db() as connection:
         duplicate = connection.execute("""
-          SELECT id, entry
+          SELECT id
           FROM plans
-          WHERE symbol = ?
-            AND timeframe = ?
-            AND direction = ?
-            AND COALESCE(setup_type, 'unknown') = ?
-            AND created_at >= ?
-            AND outcome_status IN ('open', 'target1')
-            AND COALESCE(lifecycle_status, 'waiting') IN ('waiting', 'entered')
-            AND strategy_version = ?
-          ORDER BY created_at DESC
+          WHERE thesis_key = ? AND duplicate_of IS NULL
           LIMIT 1
-        """, (
-          row["symbol"],
-          row["timeframe"],
-          row["direction"],
-          row["setup_type"],
-          timestamp - 15 * 60 * 1000,
-          STRATEGY_VERSION,
-        )).fetchone()
+        """, (thesis_key,)).fetchone()
         if duplicate:
-          previous_entry = float(duplicate["entry"])
-          entry_changed = abs(previous_entry - row["entry"]) / max(1, row["entry"])
-          if entry_changed < 0.0015:
-            connection.execute("""
-              UPDATE plans
-              SET updated_at = ?, score = MAX(score, ?), last_price = ?
-              WHERE id = ?
-            """, (timestamp, row["score"], row["price_at_plan"], duplicate["id"]))
-            self.send_json(200, {"saved": False, "duplicateOf": duplicate["id"], "id": duplicate["id"]})
-            return
+          self.send_json(200, {"saved": False, "duplicateOf": duplicate["id"], "id": duplicate["id"]})
+          return
 
         connection.execute("""
           INSERT INTO plans (
             id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type, market_phase, market_regime, status, score,
             entry, stop, target1, target2, risk_reward, price_at_plan, rsi, atr, vwap,
             ema20, ema50, ema150, sma20, sma50, sma150, selected_trend, trend_5, trend_15,
-            reasons_json, exit_rules_json, last_price, strategy_version, signal_candle_time, settings_json, data_quality, eligible_for_learning
+            reasons_json, exit_rules_json, last_price, strategy_version, signal_candle_time, settings_json, data_quality, eligible_for_learning,
+            thesis_key, entry_confirmation
           ) VALUES (
             :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type, :market_phase, :market_regime, :status, :score,
             :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan, :rsi, :atr, :vwap,
             :ema20, :ema50, :ema150, :sma20, :sma50, :sma150, :selected_trend, :trend_5, :trend_15,
-            :reasons_json, :exit_rules_json, :price_at_plan, :strategy_version, :signal_candle_time, :settings_json, :data_quality, :eligible_for_learning
+            :reasons_json, :exit_rules_json, :price_at_plan, :strategy_version, :signal_candle_time, :settings_json, :data_quality, :eligible_for_learning,
+            :thesis_key, :entry_confirmation
           )
           ON CONFLICT(id) DO UPDATE SET
             updated_at = excluded.updated_at,

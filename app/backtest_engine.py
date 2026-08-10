@@ -16,9 +16,10 @@ def _hit_map(signal, candle):
   stop = float(signal["stop"])
   target1 = float(signal["target"])
   target2 = float(signal["target2"])
+  close_confirmation = (signal.get("executionQuality") or {}).get("entryConfirmation") == "close"
   if direction == "long":
     return {
-      "entry": candle["high"] >= entry,
+      "entry": candle["close"] >= entry if close_confirmation else candle["high"] >= entry,
       "stop": candle["low"] <= stop,
       "target1": candle["high"] >= target1,
       "target2": candle["high"] >= target2,
@@ -26,7 +27,7 @@ def _hit_map(signal, candle):
       "adverse": max(0, entry - candle["low"]),
     }
   return {
-    "entry": candle["low"] <= entry,
+    "entry": candle["close"] <= entry if close_confirmation else candle["low"] <= entry,
     "stop": candle["high"] >= stop,
     "target1": candle["low"] <= target1,
     "target2": candle["low"] <= target2,

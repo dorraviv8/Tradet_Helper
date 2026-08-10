@@ -68,6 +68,8 @@ The Patterns control ranks confirmed or geometrically valid structures and displ
 
 Each actionable long or short plan includes entry, invalidation, Target 1, Target 2, exit warnings, score drivers, and the next missing condition. Intraday targets use asset-specific volatility bounds. QQQ swing targets are bounded at roughly 1.2%-2.5% for Target 1 and up to 4% for Target 2; BTC-USD uses roughly 2%-5% and up to 8%. Scores are rule-based quality ranks, not probabilities. Position sizing is shown only after an account size and risk percentage are supplied; TA-125 requires selection of a tradable instrument first.
 
+Intraday candidates also pass an execution-quality gate. The stop must be at least 0.25 ATR from entry and wide enough that estimated round-trip slippage consumes no more than 0.25R. Intraday entries require a candle close through the trigger; an intrabar touch alone does not activate a plan. Candidates that fail either test remain watch-only.
+
 ## Historical Replay And Calibration
 
 The server runs a bounded background candle-by-candle replay over persistent 1m history, up to 50,000 native 5m bars, resampled 15m bars, and up to 3,000 daily bars. Replay calls the same Python setup and scoring functions used by live recommendations. It uses chronological holdouts and rolling forward folds, models opening fills, stop gaps and session-dependent slippage, excludes ambiguous OHLC paths, and keeps simulated trades separate from the live journal.
@@ -79,6 +81,12 @@ Challenger trades and policies are persisted separately with entry, stop, target
 Default replay execution assumptions are 0.5 basis points of slippage per side and zero per-share commission. Configure `backtestSlippageBps` and `backtestCommissionPerShare` in `settings.json` if the expected execution environment differs.
 
 Historical Edge reports a neutral-prior estimate of Target 1 occurring before the stop, expected net return in R, profit factor, maximum drawdown, comparable sample size, and a 95% Wilson interval. The most specific group with enough observations is selected in this order: setup/timeframe/direction, setup/timeframe, timeframe/direction, timeframe, then all replay trades. Replay statistics describe the retained sample and do not guarantee future results.
+
+Live learning uses one canonical trade thesis per strategy version, symbol, timeframe, direction, setup, and signal candle. Price-level revisions update that thesis instead of creating a second outcome. A startup migration preserves duplicate rows for audit history, marks them as correlated revisions, and excludes them from learning and success-rate calculations.
+
+The Model Confidence panel separates the rule-based setup score from a regularized sigmoid estimate of Target 1 probability. The calibrator uses a chronological 70/30 train/holdout split and remains in a building state until 20 independent outcomes exist. Context expectancy uses conservative hierarchical shrinkage from timeframe through setup, direction, regime, and session instead of treating a one-trade exact context as independent proof.
+
+Calibration drift is evaluated over the most recent eight independent outcomes in each ten-point score band. Five outcomes can produce a warning; a production pause requires at least eight outcomes, a probability shortfall of at least 20 percentage points, and expectancy of -0.25R or worse. The pause affects only that score band and is exposed in the UI and Prometheus metrics.
 
 On the selected chart, a confirmed long plan marks its exact entry trigger with a green upward arrow. A confirmed short plan uses a red downward arrow. Watch-only candidates and rejected setups do not draw entry arrows.
 
@@ -157,7 +165,7 @@ node app/test_pattern_engine.js
 python3 -m unittest discover -s app -p 'test_*.py'
 node --check app/app.js
 node --check app/pattern-engine.js
-python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/shadow_engine.py app/context_router.py app/ibkr_provider.py
+python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/shadow_engine.py app/context_router.py app/learning_engine.py app/ibkr_provider.py
 ```
 
 This tool is educational decision support, not financial advice. It does not guarantee outcomes.

@@ -426,6 +426,35 @@ def bounds(timeframe, mode, symbol=DEFAULT_SYMBOL):
   return values
 
 
+def execution_quality(entry, stop, atr, timeframe, settings=None, symbol=DEFAULT_SYMBOL):
+  settings = settings or {}
+  risk = abs(float(entry) - float(stop))
+  price = max(abs(float(entry)), 1e-9)
+  atr_value = max(float(atr or 0), 1e-9)
+  risk_bps = risk / price * 10_000
+  risk_atr = risk / atr_value
+  base_slippage = max(0, float(settings.get("backtestSlippageBps", 0.5)))
+  estimated_slippage = base_slippage + (1.0 if is_continuous_market(symbol) else 0.0)
+  round_trip_cost_bps = estimated_slippage * 2
+  minimum_risk_bps = max(3.0 if is_continuous_market(symbol) else 2.0, round_trip_cost_bps / 0.25)
+  blockers = []
+  if timeframe != DAILY_TIMEFRAME:
+    if risk_bps < minimum_risk_bps:
+      blockers.append(f"Stop distance {risk_bps:.1f} bps is too small for estimated execution cost")
+    if risk_atr < 0.25:
+      blockers.append(f"Stop distance {risk_atr:.2f} ATR is inside normal candle noise")
+  return {
+    "status": "blocked" if blockers else "passed",
+    "riskBps": round(risk_bps, 3),
+    "riskAtr": round(risk_atr, 3),
+    "estimatedRoundTripCostBps": round(round_trip_cost_bps, 3),
+    "minimumRiskBps": round(minimum_risk_bps, 3),
+    "minimumRiskAtr": 0.25,
+    "entryConfirmation": "close" if timeframe != DAILY_TIMEFRAME else "touch",
+    "blockers": blockers,
+  }
+
+
 def session_levels(candles, bar_minutes=1, symbol=DEFAULT_SYMBOL):
   current = today_candles(candles, symbol)
   regular = [candle for candle in current if market_session(candle["time"], symbol)["regular"]]
@@ -729,6 +758,11 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
   learning_mode = (settings.get("learning") or {}).get("mode", "shadow")
   if shadow_adjustment and learning_mode == "approved_live":
     adjust(shadow_adjustment, "Approved forward outcome calibration")
+  execution_quality_state = execution_quality(entry, stop, latest["atr"], timeframe, settings, symbol)
+  if execution_quality_state["blockers"]:
+    score -= 20
+    reasons.extend(execution_quality_state["blockers"])
+    contribution_rows.append({"label": "Execution quality block", "points": -20})
   normalized_score = int(clamp(round(50 + (score - 50) * 0.68), 0, 95))
   exit_rules = [
     "Take partial profit near Target 1",
@@ -748,9 +782,10 @@ def score_candidate(candidate, context, settings, performance, symbol=DEFAULT_SY
     "target": target,
     "target2": target2,
     "riskReward": risk_reward,
-    "watchOnly": structural_risk_too_wide or risk_reward < 0.85 or (continuation and extension > 1.8) or (timeframe == 5 and continuation and execution["available"] and not execution["aligned"]),
+    "watchOnly": structural_risk_too_wide or risk_reward < 0.85 or bool(execution_quality_state["blockers"]) or (continuation and extension > 1.8) or (timeframe == 5 and continuation and execution["available"] and not execution["aligned"]),
     "marketPhase": phase,
     "executionConfirmation": execution,
+    "executionQuality": execution_quality_state,
     "fiveMinuteModel": five_minute_model,
     "shadowModel": {
       "status": "shadow" if learning_mode != "approved_live" else "approved_live",
@@ -904,6 +939,7 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     score += shadow_adjustment
     contribution_rows.append({"label": "Approved forward outcome calibration", "points": int(shadow_adjustment)})
   normalized_score = int(clamp(round(50 + (score - 50) * 0.68), 0, 95))
+  execution_quality_state = execution_quality(entry, stop, latest["atr"], DAILY_TIMEFRAME, settings, symbol)
   return {
     "setup": candidate["setup"],
     "setupType": kind,
@@ -922,6 +958,7 @@ def score_daily_candidate(candidate, values, levels, trend, settings, performanc
     "target": target,
     "target2": target2,
     "riskReward": risk_reward,
+    "executionQuality": execution_quality_state,
     "watchOnly": structural_risk_too_wide or risk_reward < 1 or (kind in {"momentum", "breakout", "breakdown", "ema_pullback"} and extension > 5.5),
     "marketPhase": "swing",
     "holdingPeriod": "multi-day swing",

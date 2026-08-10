@@ -39,6 +39,14 @@ class StrategyEngineTests(unittest.TestCase):
     self.assertGreater(btc["target1MaxPct"], qqq["target1MaxPct"])
     self.assertFalse(strategy.asset_profile("TA125")["reliableVolume"])
 
+  def test_execution_quality_blocks_stop_inside_cost_and_candle_noise(self):
+    blocked = strategy.execution_quality(64_742.5, 64_746.1, 12.0, 1, {"backtestSlippageBps": 0.5}, "BTC-USD")
+    passed = strategy.execution_quality(64_742.5, 64_600.0, 120.0, 5, {"backtestSlippageBps": 0.5}, "BTC-USD")
+    self.assertEqual(blocked["status"], "blocked")
+    self.assertEqual(blocked["entryConfirmation"], "close")
+    self.assertTrue(blocked["blockers"])
+    self.assertEqual(passed["status"], "passed")
+
   def test_resample_preserves_ohlcv_order(self):
     start = timestamp(2026, 7, 17, 9, 30)
     sampled = strategy.resample([

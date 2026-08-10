@@ -261,12 +261,15 @@ const els = {
   activationGate: document.getElementById("activationGate"),
   calibrationBadge: document.getElementById("calibrationBadge"),
   calibrationProbability: document.getElementById("calibrationProbability"),
+  contextProbability: document.getElementById("contextProbability"),
   calibrationExpectedR: document.getElementById("calibrationExpectedR"),
   calibrationSamples: document.getElementById("calibrationSamples"),
   calibrationRange: document.getElementById("calibrationRange"),
   calibrationExcursion: document.getElementById("calibrationExcursion"),
   calibrationHoldingTime: document.getElementById("calibrationHoldingTime"),
   contextRoutingState: document.getElementById("contextRoutingState"),
+  calibrationDriftState: document.getElementById("calibrationDriftState"),
+  executionQualityState: document.getElementById("executionQualityState"),
   calibrationScope: document.getElementById("calibrationScope"),
   activeAlert: document.getElementById("activeAlert"),
   scoreDrivers: document.getElementById("scoreDrivers"),
@@ -3176,6 +3179,8 @@ function setTone(element, tone) {
 
 function candidateBlocker(candidate) {
   if (!candidate) return "No setup candidate";
+  if (candidate.calibrationDrift?.status === "blocked") return candidate.calibrationDrift.detail;
+  if (candidate.executionQuality?.status === "blocked") return candidate.executionQuality.blockers?.[0] || "Execution quality is insufficient";
   if (candidate.qualityGate?.status === "Blocked") return candidate.qualityGate.detail;
   if (candidate.score < activeTradeThreshold()) return `Score below ${activeTradeThreshold()} threshold`;
   if (candidate.watchOnly) return "Risk/reward or target distance is not clean";
@@ -3479,6 +3484,8 @@ function renderCalibration(signal) {
   const model = subject?.modelConfidence || {};
   const modelSamples = Number(model.sampleSize || 0);
   const modelTargetRate = Number(model.target1Rate);
+  const modelScoreProbability = model.scoreProbability == null ? Number.NaN : Number(model.scoreProbability);
+  const modelContextProbability = model.contextProbability == null ? Number.NaN : Number(model.contextProbability);
   const modelExpectedR = Number(model.expectedR);
   const modelLow = Number(model.confidenceLow);
   const modelHigh = Number(model.confidenceHigh);
@@ -3487,9 +3494,21 @@ function renderCalibration(signal) {
   const modelHoldingMs = Number(model.avgHoldingMs);
   const qualityGate = subject?.qualityGate || {};
   const contextRouting = subject?.contextRouting || {};
+  const calibrationDrift = subject?.calibrationDrift || {};
+  const executionQuality = subject?.executionQuality || {};
+  const confidenceDetail = calibrationDrift.status === "blocked" || calibrationDrift.status === "warning"
+    ? calibrationDrift.detail
+    : executionQuality.status === "blocked"
+      ? executionQuality.blockers?.join("; ")
+      : qualityGate.detail;
   const contextLabels = { block: "Shadow block", prefer: "Shadow prefer", neutral: "No rule", building: "Building" };
   els.contextRoutingState.textContent = contextLabels[contextRouting.status] || "Building";
   setTone(els.contextRoutingState, contextRouting.status === "prefer" ? "positive" : contextRouting.status === "block" ? "negative" : "neutral");
+  const driftLabels = { blocked: "Paused", warning: "Warning", stable: "Stable", building: "Building" };
+  els.calibrationDriftState.textContent = driftLabels[calibrationDrift.status] || "Building";
+  setTone(els.calibrationDriftState, calibrationDrift.status === "blocked" || calibrationDrift.status === "warning" ? "negative" : calibrationDrift.status === "stable" ? "positive" : "neutral");
+  els.executionQualityState.textContent = executionQuality.status === "passed" ? "Passed" : executionQuality.status === "blocked" ? "Watch only" : "Building";
+  setTone(els.executionQualityState, executionQuality.status === "passed" ? "positive" : executionQuality.status === "blocked" ? "negative" : "neutral");
   const samples = Number(calibration.sampleSize || 0);
   const probability = Number(calibration.probabilityT1);
   const expectedR = Number(calibration.expectedR);
@@ -3499,7 +3518,8 @@ function renderCalibration(signal) {
     const established = model.status === "Established";
     els.calibrationBadge.textContent = model.status || "Developing";
     setTone(els.calibrationBadge, established ? "positive" : "neutral");
-    els.calibrationProbability.textContent = `${fmt(modelTargetRate * 100, 0)}%`;
+    els.calibrationProbability.textContent = Number.isFinite(modelScoreProbability) ? `${fmt(modelScoreProbability * 100, 0)}%` : "--";
+    els.contextProbability.textContent = Number.isFinite(modelContextProbability) ? `${fmt(modelContextProbability * 100, 0)}%` : "--";
     els.calibrationExpectedR.textContent = Number.isFinite(modelExpectedR)
       ? `${modelExpectedR >= 0 ? "+" : ""}${fmt(modelExpectedR, 2)}R`
       : "--";
@@ -3512,24 +3532,26 @@ function renderCalibration(signal) {
       ? `${fmt(modelMfe, 2)}R / ${fmt(modelMae, 2)}R`
       : "--";
     els.calibrationHoldingTime.textContent = fmtDuration(modelHoldingMs);
-    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. ${contextRouting.detail || qualityGate.detail || `Live model uses ${model.scope || "comparable"} outcomes, with a neutral prior and conservative range until the sample grows.`}`;
+    els.calibrationScope.textContent = `${subject?.setup || "Candidate"}. ${confidenceDetail || `Live model uses ${model.scope || "hierarchical"} evidence; score calibration is ${model.calibrationStatus || "building"}.`}`;
     return;
   }
   if (!samples || !Number.isFinite(probability)) {
     els.calibrationBadge.textContent = "Building";
     setTone(els.calibrationBadge, "neutral");
     els.calibrationProbability.textContent = "--";
+    els.contextProbability.textContent = "--";
     els.calibrationExpectedR.textContent = "--";
     els.calibrationSamples.textContent = samples || "--";
     els.calibrationRange.textContent = "--";
     els.calibrationExcursion.textContent = "--";
     els.calibrationHoldingTime.textContent = "--";
-    els.calibrationScope.textContent = contextRouting.detail || qualityGate.detail || "Waiting for automatically resolved comparable plans and historical replay data.";
+    els.calibrationScope.textContent = confidenceDetail || "Waiting for independent resolved plans and historical replay data.";
     return;
   }
   els.calibrationBadge.textContent = calibration.calibrated ? "Replay baseline" : "Replay only";
   setTone(els.calibrationBadge, calibration.calibrated ? "positive" : "neutral");
   els.calibrationProbability.textContent = `${fmt(probability * 100, 0)}%`;
+  els.contextProbability.textContent = "--";
   els.calibrationExpectedR.textContent = Number.isFinite(expectedR) ? `${expectedR >= 0 ? "+" : ""}${fmt(expectedR, 2)}R` : "--";
   setTone(els.calibrationExpectedR, expectedR > 0 ? "positive" : expectedR < 0 ? "negative" : "neutral");
   els.calibrationSamples.textContent = samples;
@@ -3538,7 +3560,7 @@ function renderCalibration(signal) {
     : "--";
   els.calibrationExcursion.textContent = "--";
   els.calibrationHoldingTime.textContent = "--";
-  els.calibrationScope.textContent = contextRouting.detail || qualityGate.detail || `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.sampleType || "historical replay"} ${calibration.scope || "baseline"} with a neutral prior.`;
+  els.calibrationScope.textContent = confidenceDetail || `${subject?.setup || "Candidate"}. Live model is still building; this is a ${calibration.sampleType || "historical replay"} ${calibration.scope || "baseline"} with a neutral prior.`;
 }
 
 function render(signal, indicators) {

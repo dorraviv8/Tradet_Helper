@@ -38,6 +38,14 @@ def signal(**overrides):
 
 
 class BacktestEngineTests(unittest.TestCase):
+  def test_intraday_entry_requires_candle_close_confirmation(self):
+    candidate = signal(executionQuality={"entryConfirmation": "close"})
+    intrabar_touch = candle(120_000, 99.8, 100.4, 99.7, 99.9)
+    confirmed_close = candle(180_000, 99.9, 100.4, 99.8, 100.1)
+
+    self.assertFalse(backtest._hit_map(candidate, intrabar_touch)["entry"])
+    self.assertTrue(backtest._hit_map(candidate, confirmed_close)["entry"])
+
   def test_entry_bar_cannot_receive_same_bar_target_credit(self):
     result = backtest.simulate_trade(signal(), [
       candle(120_000, 99.8, 101.2, 99.7, 100.8),
