@@ -1051,6 +1051,7 @@ def build_daily_signal(values, settings=None, performance=None, intraday_context
     signal = {**best, "timeframe": DAILY_TIMEFRAME, **context}
   signal["bestLong"] = best_long
   signal["bestShort"] = best_short
+  signal["_shadowCandidates"] = candidates
   signal["biasScore"] = (best_long["score"] - best_short["score"]) if best_long and best_short else round(best_long["score"] * 0.5) if best_long else -round(best_short["score"] * 0.5) if best_short else 0
   signal["signalCandleTime"] = latest["time"]
   signal["actionableAt"] = latest["time"] + DAILY_TIMEFRAME * MINUTE_MS
@@ -1204,6 +1205,7 @@ def build_intraday_signal(selected, timeframe, trends, regime, session, settings
     signal = {**best, "timeframe": timeframe, **trend_context}
   signal["bestLong"] = best_long
   signal["bestShort"] = best_short
+  signal["_shadowCandidates"] = candidates
   signal["biasScore"] = (best_long["score"] - best_short["score"]) if best_long and best_short else round(best_long["score"] * 0.5) if best_long else -round(best_short["score"] * 0.5) if best_short else 0
   signal["signalCandleTime"] = latest["time"]
   signal["actionableAt"] = latest["time"] + timeframe * MINUTE_MS

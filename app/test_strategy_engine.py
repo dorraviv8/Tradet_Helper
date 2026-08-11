@@ -28,6 +28,17 @@ def candle(time, open_price, high, low, close, volume=1000):
   }
 
 
+def make_intraday_candles(count):
+  start = timestamp(2026, 7, 17, 9, 30)
+  values = []
+  price = 100.0
+  for index in range(count):
+    close = price + 0.03
+    values.append(candle(start + index * strategy.MINUTE_MS, price, close + 0.04, price - 0.03, close, 1_000 + index))
+    price = close
+  return values
+
+
 class StrategyEngineTests(unittest.TestCase):
   def test_asset_profiles_use_distinct_market_targets(self):
     qqq = strategy.bounds(5, "normal", "QQQ")
@@ -46,6 +57,12 @@ class StrategyEngineTests(unittest.TestCase):
     self.assertEqual(blocked["entryConfirmation"], "close")
     self.assertTrue(blocked["blockers"])
     self.assertEqual(passed["status"], "passed")
+
+  def test_analysis_retains_private_candidate_pool_for_shadow_evaluation(self):
+    values = make_intraday_candles(220)
+    result = strategy.analyze_all(values, now=values[-1]["time"] + strategy.MINUTE_MS)
+    pools = [signal.get("_shadowCandidates") for signal in result.values()]
+    self.assertTrue(any(isinstance(pool, list) for pool in pools))
 
   def test_resample_preserves_ohlcv_order(self):
     start = timestamp(2026, 7, 17, 9, 30)

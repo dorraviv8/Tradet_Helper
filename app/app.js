@@ -87,6 +87,7 @@ const state = {
   journalRecent: [],
   journalStats: null,
   replayStats: null,
+  shadowLearning: null,
   fearGreed: null,
   sentimentTimer: null,
   stream: null,
@@ -341,6 +342,19 @@ const els = {
   modelValidationReplay: document.getElementById("modelValidationReplay"),
   modelValidationRequirements: document.getElementById("modelValidationRequirements"),
   modelValidationBreakdown: document.getElementById("modelValidationBreakdown"),
+  shadowLearningTile: document.getElementById("shadowLearningTile"),
+  shadowLearningVersion: document.getElementById("shadowLearningVersion"),
+  shadowLearningBadge: document.getElementById("shadowLearningBadge"),
+  shadowTracked: document.getElementById("shadowTracked"),
+  shadowResolved: document.getElementById("shadowResolved"),
+  shadowTargetRate: document.getElementById("shadowTargetRate"),
+  shadowExpectedR: document.getElementById("shadowExpectedR"),
+  shadowMissed: document.getElementById("shadowMissed"),
+  shadowProposals: document.getElementById("shadowProposals"),
+  shadowBestFilter: document.getElementById("shadowBestFilter"),
+  shadowWorstFilter: document.getElementById("shadowWorstFilter"),
+  shadowFilterRows: document.getElementById("shadowFilterRows"),
+  shadowLearningDetail: document.getElementById("shadowLearningDetail"),
   replayTile: document.getElementById("replayTile"),
   replayBest: document.getElementById("replayBest"),
   replayAvgTarget: document.getElementById("replayAvgTarget"),
@@ -3868,6 +3882,7 @@ async function refreshJournalStats(force = false) {
     });
     renderJournalRows();
     refreshModelValidation();
+    refreshShadowLearning();
     refreshReplayStats();
     refreshRecommendationScoreboard();
   } catch (error) {
@@ -3928,6 +3943,64 @@ async function refreshModelValidation() {
     renderModelValidation(data);
   } catch (error) {
     if (error.name !== "AbortError") console.info("Model validation unavailable.", error);
+  }
+}
+
+function shadowFilterLabel(row) {
+  if (!row) return "Building";
+  const expectedR = row.expectedR == null ? NaN : Number(row.expectedR);
+  return `${row.label || row.code} · ${Number.isFinite(expectedR) ? `${expectedR >= 0 ? "+" : ""}${fmt(expectedR, 2)}R` : "--"}`;
+}
+
+function renderShadowLearning(data) {
+  const resolved = Number(data.independentResolved || 0);
+  const minimum = Number(data.minimumFilterSamples || 20);
+  const proposals = data.proposals || [];
+  const filters = data.filters || [];
+  const largestCohort = filters.reduce((largest, row) => Math.max(largest, Number(row.resolved || 0)), 0);
+  const measuredFilter = filters.some((row) => !["recommended", "not_selected"].includes(row.code) && Number(row.resolved || 0) >= minimum);
+  const expectedR = data.expectedR == null ? NaN : Number(data.expectedR);
+  const targetRate = data.target1Rate == null ? NaN : Number(data.target1Rate);
+  const status = proposals.length ? "Review ready" : measuredFilter ? "Measured" : "Building";
+  els.shadowLearningBadge.textContent = status;
+  setTone(els.shadowLearningBadge, proposals.length ? "positive" : "neutral");
+  els.shadowLearningVersion.textContent = `${data.symbol || API_SYMBOL} · ${data.version || "live candidate ledger"}`;
+  els.shadowTracked.textContent = Number(data.tracked || 0);
+  els.shadowResolved.textContent = resolved;
+  els.shadowTargetRate.textContent = Number.isFinite(targetRate) ? `${fmt(targetRate * 100, 0)}%` : "--";
+  els.shadowExpectedR.textContent = Number.isFinite(expectedR) ? `${expectedR >= 0 ? "+" : ""}${fmt(expectedR, 2)}R` : "--";
+  setTone(els.shadowExpectedR, expectedR > 0 ? "positive" : expectedR < 0 ? "negative" : "neutral");
+  els.shadowMissed.textContent = Number(data.potentiallyMissed || 0);
+  els.shadowProposals.textContent = proposals.length;
+  els.shadowBestFilter.textContent = shadowFilterLabel(data.bestFilter);
+  els.shadowWorstFilter.textContent = data.worstFilter?.code && data.worstFilter.code !== data.bestFilter?.code
+    ? shadowFilterLabel(data.worstFilter)
+    : "Building";
+  const ranked = [...filters]
+    .filter((row) => Number(row.resolved || 0) > 0)
+    .sort((a, b) => Number(b.resolved || 0) - Number(a.resolved || 0))
+    .slice(0, 4);
+  els.shadowFilterRows.innerHTML = ranked.length ? ranked.map((row) => {
+    const value = row.expectedR == null ? NaN : Number(row.expectedR);
+    const validation = row.validation?.status || "building";
+    const labels = { review_easing: "Review ready", retain: "Retain filter", inconclusive: "Inconclusive", building: "Building" };
+    return `<div><span>${escapeHtml(row.label || row.code)}</span><strong class="${value > 0 ? "positive" : value < 0 ? "negative" : ""}">${Number.isFinite(value) ? `${value >= 0 ? "+" : ""}${fmt(value, 2)}R` : "--"}</strong><small>${Number(row.resolved || 0)} independent · ${escapeHtml(labels[validation] || validation)}</small></div>`;
+  }).join("") : `<div><span>Filter evidence</span><strong>Building sample</strong></div>`;
+  els.shadowLearningDetail.textContent = proposals[0]?.detail || `${Number(data.open || 0)} active · largest filter cohort ${largestCohort} / ${minimum}. Production rules remain unchanged.`;
+  updateValidationEmptyState();
+}
+
+async function refreshShadowLearning() {
+  try {
+    const symbol = API_SYMBOL;
+    const response = await marketFetch(`/api/shadow-learning?symbol=${encodeURIComponent(symbol)}`);
+    if (!response.ok) throw new Error(`shadow learning failed: ${response.status}`);
+    const data = await response.json();
+    if (!isCurrentAsset(symbol)) return;
+    state.shadowLearning = data;
+    renderShadowLearning(data);
+  } catch (error) {
+    if (error.name !== "AbortError") console.info("Shadow learning unavailable.", error);
   }
 }
 
@@ -4475,6 +4548,7 @@ function resetMarketState() {
   state.journalRecent = [];
   state.journalStats = null;
   state.replayStats = null;
+  state.shadowLearning = null;
   state.currentPattern = null;
   state.currentPatternKey = "";
   state.lastPatternObservationKey = "";
@@ -4532,6 +4606,19 @@ function resetMarketState() {
   els.modelValidationReplay.textContent = "Building";
   els.modelValidationRequirements.textContent = "0 / 4 passed";
   els.modelValidationBreakdown.innerHTML = "";
+  els.shadowLearningVersion.textContent = "Live candidate ledger";
+  els.shadowLearningBadge.textContent = "Building";
+  setTone(els.shadowLearningBadge, "neutral");
+  els.shadowTracked.textContent = "0";
+  els.shadowResolved.textContent = "0";
+  els.shadowTargetRate.textContent = "--";
+  els.shadowExpectedR.textContent = "--";
+  els.shadowMissed.textContent = "0";
+  els.shadowProposals.textContent = "0";
+  els.shadowBestFilter.textContent = "Building";
+  els.shadowWorstFilter.textContent = "Building";
+  els.shadowFilterRows.innerHTML = "";
+  els.shadowLearningDetail.textContent = "No production rule changes.";
   els.replayTile.hidden = true;
   els.modelValidationTile.hidden = false;
   els.patternValidationTile.hidden = true;

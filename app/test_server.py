@@ -394,6 +394,58 @@ class ServerTests(unittest.TestCase):
       server.evaluate_plans(connection, "QQQ", [candle(120_000, 100, 101.5, 99.5, 100.5)])
     self.assertEqual(self.fetch_plan("close-confirm")["lifecycle_status"], "waiting")
 
+  def test_shadow_candidates_are_deduplicated_and_isolated_from_live_learning(self):
+    signal_time = int(datetime(2026, 7, 31, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    candidate = {
+      "direction": "long", "watchOnly": True, "score": 58,
+      "setup": "Long 5m momentum continuation", "setupType": "momentum",
+      "entry": 101.0, "stop": 100.0, "target": 102.0, "target2": 103.0,
+      "riskReward": 1.0, "marketPhase": "morning", "reasons": [], "exitRules": [],
+      "executionQuality": {"status": "passed", "entryConfirmation": "close", "riskBps": 99, "estimatedRoundTripCostBps": 1},
+    }
+    signal = {
+      "direction": "neutral", "signalCandleTime": signal_time, "actionableAt": signal_time + 5 * server.MINUTE_MS,
+      "latestIndicator": {"close": 100.8, "atr": 0.5}, "regime": {"type": "range"},
+      "_shadowCandidates": [candidate],
+    }
+    with server.db() as connection:
+      with patch.object(server, "now_ms", return_value=signal["actionableAt"] + 1):
+        first = server.persist_shadow_candidate_pool(connection, "test", 5, signal, {"activeTradeThreshold": 62, "mode": "normal"}, None, "QQQ", {"tradeAllowed": True})
+        second = server.persist_shadow_candidate_pool(connection, "test", 5, signal, {"activeTradeThreshold": 62, "mode": "normal"}, None, "QQQ", {"tradeAllowed": True})
+      rows = connection.execute("SELECT * FROM plans WHERE status = 'shadow'").fetchall()
+      snapshot = server.shadow_learning_snapshot(connection, "QQQ")
+      cached_snapshot = server.shadow_learning_snapshot(connection, "QQQ")
+      cache_rows = connection.execute("SELECT COUNT(*) FROM shadow_candidate_snapshots").fetchone()[0]
+      scoreboard = {row["symbol"]: row for row in server.recommendation_scoreboard(connection)}
+    self.assertEqual((first, second), (1, 0))
+    self.assertEqual(len(rows), 1)
+    self.assertEqual(rows[0]["eligible_for_learning"], 0)
+    self.assertEqual(rows[0]["strategy_version"], server.SHADOW_CANDIDATE_VERSION)
+    self.assertEqual(snapshot["tracked"], 1)
+    self.assertEqual(cached_snapshot["generatedAt"], snapshot["generatedAt"])
+    self.assertEqual(cache_rows, 1)
+    self.assertEqual(scoreboard["QQQ"]["recommended"], 0)
+
+  def test_shadow_entry_uses_close_confirmation_and_time_exit(self):
+    self.insert_plan(
+      "shadow-close", status="shadow", strategy_version=server.SHADOW_CANDIDATE_VERSION,
+      eligible_for_learning=0, entry_confirmation="close", entry=101, stop=99,
+      target1=102, target2=103, lifecycle_status="waiting",
+    )
+    with patch.object(server.notification_engine, "send_async") as notify:
+      with server.db() as connection:
+        server.evaluate_plans(connection, "QQQ", [candle(120_000, 100, 101.5, 99.5, 100.5)])
+        waiting = dict(connection.execute("SELECT * FROM plans WHERE id = 'shadow-close'").fetchone())
+        server.evaluate_plans(connection, "QQQ", [candle(180_000, 100.5, 101.3, 100.4, 101.1)])
+        entered = dict(connection.execute("SELECT * FROM plans WHERE id = 'shadow-close'").fetchone())
+        server.evaluate_plans(connection, "QQQ", [candle(60_000 + 4 * 60 * server.MINUTE_MS + server.MINUTE_MS, 101.2, 101.4, 101.0, 101.2)])
+        closed = dict(connection.execute("SELECT * FROM plans WHERE id = 'shadow-close'").fetchone())
+    self.assertEqual(waiting["lifecycle_status"], "waiting")
+    self.assertEqual(entered["lifecycle_status"], "entered")
+    self.assertEqual(closed["outcome_status"], "time_exit")
+    self.assertAlmostEqual(closed["realized_r"], 0.1)
+    notify.assert_not_called()
+
   def test_backtest_results_are_scoped_by_symbol(self):
     with server.db() as connection:
       server.save_backtest_result(connection, "qqq-signature", {"generatedAt": 1, "summary": {"resolved": 10}}, "QQQ")

@@ -88,6 +88,14 @@ The Model Confidence panel separates the rule-based setup score from a regulariz
 
 Calibration drift is evaluated over the most recent eight independent outcomes in each ten-point score band. Five outcomes can produce a warning; a production pause requires at least eight outcomes, a probability shortfall of at least 20 percentage points, and expectancy of -0.25R or worse. The pause affects only that score band and is exposed in the UI and Prometheus metrics.
 
+## Live Shadow Candidate Learning
+
+Every technically triggered candidate from a fresh regular-session candle is recorded in a persistent shadow ledger, including the production recommendation, near-threshold alternatives, and candidates rejected by execution quality, risk/reward, structural, 5m, quality, calibration-drift, or context filters. Shadow candidates never create trader alerts, never appear as active trade plans, and never enter production calibration. Their deterministic thesis keys prevent browser or server refreshes from duplicating evidence.
+
+Shadow outcomes use the same candle-close entry confirmation and OHLC ambiguity rules as live plans. Intraday candidates receive a four-hour time exit and daily candidates a fourteen-day time exit. Analytics subtract the candidate's estimated round-trip execution cost, cluster correlated setups from the same symbol/timeframe/direction/candle into one independent observation, and cache the resulting snapshot persistently.
+
+The Shadow Learning panel compares each rejected filter cohort with the recommended baseline. A rule can become eligible for manual review only after at least 20 independent filter outcomes, at least six chronological holdout outcomes, positive train and holdout expectancy, a holdout T1 rate of at least 50%, holdout profit factor of at least 1.10, and holdout expectancy at least 0.05R above the recommended baseline. Production rules are never changed automatically.
+
 On the selected chart, a confirmed long plan marks its exact entry trigger with a green upward arrow. A confirmed short plan uses a red downward arrow. Watch-only candidates and rejected setups do not draw entry arrows.
 
 ## Chart Navigation
@@ -165,7 +173,7 @@ node app/test_pattern_engine.js
 python3 -m unittest discover -s app -p 'test_*.py'
 node --check app/app.js
 node --check app/pattern-engine.js
-python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/shadow_engine.py app/context_router.py app/learning_engine.py app/ibkr_provider.py
+python3 -m py_compile app/server.py app/strategy_engine.py app/backtest_engine.py app/shadow_engine.py app/shadow_candidate_engine.py app/context_router.py app/learning_engine.py app/ibkr_provider.py
 ```
 
 This tool is educational decision support, not financial advice. It does not guarantee outcomes.

@@ -30,6 +30,7 @@ import options_engine
 import notification_engine
 import risk_engine
 import shadow_engine
+import shadow_candidate_engine
 
 
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -62,6 +63,7 @@ SYMBOL = "QQQ"
 SUPPORTED_SYMBOLS = ("QQQ", "SPY", "BTC-USD", "TA125")
 YAHOO_SYMBOLS = {"TA125": "^TA125.TA"}
 STRATEGY_VERSION = "6.0.0"
+SHADOW_CANDIDATE_VERSION = f"{STRATEGY_VERSION}-{shadow_candidate_engine.VERSION}"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 LEGACY_DB_PATH = os.path.join(APP_DIR, "trader_journal.sqlite3")
@@ -196,6 +198,7 @@ def repair_duplicate_plan_learning(connection):
            strategy_version, created_at, entry_hit_at, lifecycle_status,
            outcome_status, duplicate_of
     FROM plans
+    WHERE status <> 'shadow'
     ORDER BY created_at, id
   """).fetchall()
   grouped = {}
@@ -343,6 +346,7 @@ def init_db():
     repair_duplicate_plan_learning(connection)
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_unique_thesis ON plans(thesis_key) WHERE duplicate_of IS NULL")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_duplicate_of ON plans(duplicate_of)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_plans_active_lifecycle ON plans(symbol, lifecycle_status, outcome_status, status, created_at)")
 
     connection.execute("""
       CREATE TABLE IF NOT EXISTS candles (
@@ -497,6 +501,16 @@ def init_db():
         updated_at INTEGER NOT NULL,
         snapshot_json TEXT NOT NULL,
         PRIMARY KEY (symbol, strategy_version)
+      )
+    """)
+    connection.execute("""
+      CREATE TABLE IF NOT EXISTS shadow_candidate_snapshots (
+        symbol TEXT NOT NULL,
+        version TEXT NOT NULL,
+        source_signature TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        PRIMARY KEY (symbol, version)
       )
     """)
     connection.execute("""
@@ -2311,6 +2325,184 @@ def persist_generated_signal(connection, provider, timeframe, signal, settings, 
   return plan_id
 
 
+def shadow_rejection_codes(candidate, selected, threshold, timeframe):
+  if selected:
+    return ["recommended"]
+  score = int(candidate.get("score") or 0)
+  codes = []
+  if score < threshold:
+    codes.append("below_threshold")
+    if score >= threshold - 10:
+      codes.append("near_threshold")
+  execution = candidate.get("executionQuality") or {}
+  if execution.get("status") == "blocked":
+    codes.append("execution_quality")
+  minimum_rr = 1.0 if timeframe == strategy_engine.DAILY_TIMEFRAME else 0.85
+  if finite_number(candidate.get("riskReward")) is not None and float(candidate["riskReward"]) < minimum_rr:
+    codes.append("risk_reward")
+  if candidate.get("watchOnly") and not any(code in codes for code in ("execution_quality", "risk_reward")):
+    codes.append("structure")
+  if (candidate.get("qualityGate") or {}).get("status") == "Blocked":
+    codes.append("quality_gate")
+  if (candidate.get("calibrationDrift") or {}).get("status") == "blocked":
+    codes.append("calibration_drift")
+  if (candidate.get("contextRouting") or {}).get("status") == "block":
+    codes.append("context_router")
+  if timeframe == 5 and any("no-trade" in str(reason).lower() or "volume" in str(reason).lower() for reason in candidate.get("reasons") or []):
+    codes.append("five_minute_filter")
+  codes.append("not_selected")
+  return list(dict.fromkeys(codes))
+
+
+def persist_shadow_candidate_pool(connection, provider, timeframe, signal, settings, live_plan_id=None, symbol=SYMBOL, data_health=None):
+  candidates = signal.get("_shadowCandidates") or []
+  if not candidates or (data_health and not data_health.get("tradeAllowed", True)):
+    return 0
+  signal_time = int(signal.get("signalCandleTime") or 0)
+  actionable_at = int(signal.get("actionableAt") or 0)
+  if not signal_time or not actionable_at:
+    return 0
+  timestamp = now_ms()
+  freshness = 5 * 24 * 60 * MINUTE_MS if timeframe == strategy_engine.DAILY_TIMEFRAME else 3 * MINUTE_MS
+  if timestamp - actionable_at > freshness or actionable_at > timestamp + (5 * 24 * 60 * MINUTE_MS if timeframe == strategy_engine.DAILY_TIMEFRAME else MINUTE_MS):
+    return 0
+  if timeframe != strategy_engine.DAILY_TIMEFRAME and not strategy_engine.market_session(signal_time, symbol)["regular"]:
+    return 0
+  latest = signal.get("latestIndicator") or {}
+  market_price = finite_number(latest.get("close"))
+  if market_price is None:
+    return 0
+  threshold = int(settings.get("activeTradeThreshold", 62)) + {"scalp": -6, "normal": 0, "strict": 8}.get(settings.get("mode", "normal"), 0)
+  selected_setup = signal.get("setup") if live_plan_id else None
+  selected_direction = signal.get("direction") if live_plan_id else None
+  inserted = 0
+  for candidate in candidates:
+    if not isinstance(candidate, dict) or candidate.get("direction") not in {"long", "short"}:
+      continue
+    levels = {key: finite_number(candidate.get(key)) for key in ("entry", "stop", "target", "target2")}
+    if any(value is None for value in levels.values()):
+      continue
+    direction = candidate["direction"]
+    if direction == "long" and not (levels["stop"] < levels["entry"] < levels["target"] <= levels["target2"]):
+      continue
+    if direction == "short" and not (levels["stop"] > levels["entry"] > levels["target"] >= levels["target2"]):
+      continue
+    selected = candidate.get("setup") == selected_setup and direction == selected_direction
+    rejection_codes = shadow_rejection_codes(candidate, selected, threshold, timeframe)
+    execution = candidate.get("executionQuality") or {}
+    risk_bps = finite_number(execution.get("riskBps"))
+    cost_bps = finite_number(execution.get("estimatedRoundTripCostBps"))
+    execution_cost_r = cost_bps / risk_bps if risk_bps and cost_bps is not None else 0.0
+    thesis_key = trade_thesis_key(
+      symbol, timeframe, direction, candidate.get("setup") or "unknown",
+      signal_time, SHADOW_CANDIDATE_VERSION,
+    )
+    row = {
+      "id": f"shadow-{thesis_key[:24]}", "created_at": actionable_at, "updated_at": actionable_at,
+      "symbol": symbol, "provider": provider, "timeframe": timeframe, "direction": direction,
+      "setup": candidate.get("setup") or "unknown", "setup_type": candidate.get("setupType") or strategy_engine.setup_type(candidate.get("setup") or ""),
+      "market_phase": candidate.get("marketPhase") or strategy_engine.market_phase(signal_time, symbol),
+      "market_regime": (candidate.get("regime") or signal.get("regime") or {}).get("type", "unknown"),
+      "status": "shadow", "score": int(candidate.get("score") or 0),
+      "entry": levels["entry"], "stop": levels["stop"], "target1": levels["target"], "target2": levels["target2"],
+      "risk_reward": finite_or_none(candidate.get("riskReward")), "price_at_plan": market_price,
+      "rsi": finite_or_none(latest.get("rsi")), "atr": finite_or_none(latest.get("atr")), "vwap": finite_or_none(latest.get("vwap")),
+      "ema20": finite_or_none(latest.get("ema20")), "ema50": finite_or_none(latest.get("ema50")), "ema150": finite_or_none(latest.get("ema150")),
+      "sma20": finite_or_none(latest.get("sma20")), "sma50": finite_or_none(latest.get("sma50")), "sma150": finite_or_none(latest.get("sma150")),
+      "selected_trend": (candidate.get("selectedTrend") or signal.get("selectedTrend") or {}).get("label"),
+      "trend_5": (candidate.get("trend5") or signal.get("trend5") or {}).get("label"),
+      "trend_15": (candidate.get("trend15") or signal.get("trend15") or {}).get("label"),
+      "reasons_json": json.dumps(candidate.get("reasons") or []), "exit_rules_json": json.dumps(candidate.get("exitRules") or []),
+      "last_price": market_price, "strategy_version": SHADOW_CANDIDATE_VERSION, "signal_candle_time": signal_time,
+      "settings_json": json.dumps(settings), "data_quality": "clean", "eligible_for_learning": 0,
+      "thesis_key": thesis_key, "entry_confirmation": execution.get("entryConfirmation", "close" if timeframe != strategy_engine.DAILY_TIMEFRAME else "touch"),
+      "feature_snapshot_json": json.dumps({
+        "shadowCandidate": True, "selection": "recommended" if selected else "rejected",
+        "rejectionCodes": rejection_codes, "threshold": threshold, "thresholdGap": int(candidate.get("score") or 0) - threshold,
+        "scoreContributions": candidate.get("scoreContributions") or [], "executionQuality": execution,
+        "executionCostR": execution_cost_r, "qualityGate": candidate.get("qualityGate"),
+        "calibrationDrift": candidate.get("calibrationDrift"), "contextRouting": candidate.get("contextRouting"),
+      }),
+    }
+    cursor = connection.execute("""
+      INSERT OR IGNORE INTO plans (
+        id, created_at, updated_at, symbol, provider, timeframe, direction, setup, setup_type, market_phase, market_regime, status, score,
+        entry, stop, target1, target2, risk_reward, price_at_plan, rsi, atr, vwap, ema20, ema50, ema150, sma20, sma50, sma150,
+        selected_trend, trend_5, trend_15, reasons_json, exit_rules_json, last_price, strategy_version, signal_candle_time,
+        settings_json, data_quality, eligible_for_learning, thesis_key, entry_confirmation, feature_snapshot_json
+      ) VALUES (
+        :id, :created_at, :updated_at, :symbol, :provider, :timeframe, :direction, :setup, :setup_type, :market_phase, :market_regime, :status, :score,
+        :entry, :stop, :target1, :target2, :risk_reward, :price_at_plan, :rsi, :atr, :vwap, :ema20, :ema50, :ema150, :sma20, :sma50, :sma150,
+        :selected_trend, :trend_5, :trend_15, :reasons_json, :exit_rules_json, :last_price, :strategy_version, :signal_candle_time,
+        :settings_json, :data_quality, :eligible_for_learning, :thesis_key, :entry_confirmation, :feature_snapshot_json
+      )
+    """, row)
+    if cursor.rowcount:
+      insert_event(connection, row["id"], "shadow_created", actionable_at, market_price, {"rejectionCodes": rejection_codes})
+      inserted += 1
+  return inserted
+
+
+def shadow_candidate_rows(connection, symbol=SYMBOL):
+  rows = connection.execute("""
+    SELECT id, symbol, timeframe, direction, setup, setup_type, market_phase, market_regime,
+           score, signal_candle_time, lifecycle_status, outcome_status, entry_hit_at,
+           hit_target1_at, realized_r, closed_at, updated_at, feature_snapshot_json
+    FROM plans
+    WHERE symbol = ? AND status = 'shadow' AND strategy_version = ?
+    ORDER BY COALESCE(closed_at, updated_at), id
+  """, (symbol, SHADOW_CANDIDATE_VERSION)).fetchall()
+  output = []
+  for row in rows:
+    item = dict(row)
+    try:
+      features = json.loads(item.pop("feature_snapshot_json") or "{}")
+    except (TypeError, ValueError):
+      features = {}
+    cost_r = finite_number(features.get("executionCostR")) or 0.0
+    item["rejection_codes"] = features.get("rejectionCodes") or []
+    item["target1_hit"] = item["hit_target1_at"] is not None or item["outcome_status"] in {"target1", "target1_stop", "target2"}
+    item["net_realized_r"] = float(item["realized_r"]) - cost_r if item["realized_r"] is not None else None
+    output.append(item)
+  return output
+
+
+def shadow_learning_snapshot(connection, symbol=SYMBOL):
+  signature_row = connection.execute("""
+    SELECT COUNT(*) AS total, COALESCE(MAX(updated_at), 0) AS updated_at,
+           COALESCE(MAX(closed_at), 0) AS closed_at,
+           SUM(CASE WHEN realized_r IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+           COALESCE(SUM(ROUND(COALESCE(realized_r, 0) * 10000)), 0) AS realized_checksum
+    FROM plans
+    WHERE symbol = ? AND status = 'shadow' AND strategy_version = ?
+  """, (symbol, SHADOW_CANDIDATE_VERSION)).fetchone()
+  signature = (
+    f"{int(signature_row['total'])}:{int(signature_row['updated_at'])}:"
+    f"{int(signature_row['closed_at'])}:{int(signature_row['resolved'] or 0)}:"
+    f"{int(signature_row['realized_checksum'] or 0)}"
+  )
+  cached = connection.execute("""
+    SELECT source_signature, snapshot_json
+    FROM shadow_candidate_snapshots
+    WHERE symbol = ? AND version = ?
+  """, (symbol, shadow_candidate_engine.VERSION)).fetchone()
+  if cached and cached["source_signature"] == signature:
+    try:
+      return json.loads(cached["snapshot_json"])
+    except (TypeError, ValueError):
+      pass
+  snapshot = shadow_candidate_engine.build_snapshot(shadow_candidate_rows(connection, symbol), symbol, now_ms())
+  connection.execute("""
+    INSERT INTO shadow_candidate_snapshots (symbol, version, source_signature, updated_at, snapshot_json)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(symbol, version) DO UPDATE SET
+      source_signature = excluded.source_signature,
+      updated_at = excluded.updated_at,
+      snapshot_json = excluded.snapshot_json
+  """, (symbol, shadow_candidate_engine.VERSION, signature, snapshot["generatedAt"], json.dumps(snapshot)))
+  return snapshot
+
+
 def realized_volatility(candles, periods=20):
   closes = [
     finite_number(candle.get("close"))
@@ -3074,6 +3266,11 @@ def refresh_server_recommendations(provider, symbol=SYMBOL):
       plan_ids[int(timeframe)] = persist_generated_signal(
         connection, provider, int(timeframe), signal, settings, symbol
       )
+      persist_shadow_candidate_pool(
+        connection, provider, int(timeframe), signal, settings,
+        plan_ids[int(timeframe)], symbol, data_health,
+      )
+      signal.pop("_shadowCandidates", None)
   options_opportunity = build_options_opportunity(
     recommendations, plan_ids, runtime, generated_at, symbol
   )
@@ -3333,6 +3530,15 @@ def prometheus_metrics():
     learning_rows = connection.execute("""
       SELECT symbol, snapshot_json FROM learning_snapshots WHERE strategy_version = ?
     """, (STRATEGY_VERSION,)).fetchall()
+    shadow_rows = connection.execute("""
+      SELECT symbol, COUNT(*) AS tracked,
+             SUM(CASE WHEN realized_r IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+             SUM(CASE WHEN lifecycle_status IN ('waiting', 'entered') THEN 1 ELSE 0 END) AS active
+      FROM plans
+      WHERE status = 'shadow' AND strategy_version = ?
+      GROUP BY symbol
+    """, (SHADOW_CANDIDATE_VERSION,)).fetchall()
+  shadow_metrics = {row["symbol"]: dict(row) for row in shadow_rows}
   learning_metrics = {}
   for row in learning_rows:
     try:
@@ -3376,6 +3582,12 @@ def prometheus_metrics():
     "# TYPE trader_helper_learning_samples gauge",
     "# HELP trader_helper_calibration_drift_state Calibration drift state: -1 building, 0 stable, 1 warning, 2 blocked.",
     "# TYPE trader_helper_calibration_drift_state gauge",
+    "# HELP trader_helper_shadow_candidates_tracked Persistent live shadow candidates by symbol.",
+    "# TYPE trader_helper_shadow_candidates_tracked gauge",
+    "# HELP trader_helper_shadow_candidates_resolved Resolved live shadow candidates by symbol.",
+    "# TYPE trader_helper_shadow_candidates_resolved gauge",
+    "# HELP trader_helper_shadow_candidates_active Active live shadow candidates by symbol.",
+    "# TYPE trader_helper_shadow_candidates_active gauge",
   ]
   delivery = notification_engine.delivery_status()
   lines.extend([
@@ -3402,6 +3614,10 @@ def prometheus_metrics():
     drift_value = {"building": -1, "stable": 0, "warning": 1, "blocked": 2}.get(learning.get("drift"), -1)
     lines.append(f"trader_helper_learning_samples{{{labels}}} {int(learning.get('samples') or 0)}")
     lines.append(f"trader_helper_calibration_drift_state{{{labels}}} {drift_value}")
+    shadow = shadow_metrics.get(symbol, {})
+    lines.append(f"trader_helper_shadow_candidates_tracked{{{labels}}} {int(shadow.get('tracked') or 0)}")
+    lines.append(f"trader_helper_shadow_candidates_resolved{{{labels}}} {int(shadow.get('resolved') or 0)}")
+    lines.append(f"trader_helper_shadow_candidates_active{{{labels}}} {int(shadow.get('active') or 0)}")
   return "\n".join(lines) + "\n"
 
 
@@ -3693,7 +3909,7 @@ def pattern_validation_stats(connection, symbol):
   return output
 
 
-def realized_r_for(status, row):
+def realized_r_for(status, row, exit_price=None):
   entry = float(row["entry"])
   stop = float(row["stop"])
   target1 = float(row["target1"])
@@ -3707,6 +3923,11 @@ def realized_r_for(status, row):
     return (abs(target1 - entry) / risk * 0.5) - 0.5
   if status == "target2":
     return abs(target2 - entry) / risk
+  if status == "time_exit" and exit_price is not None:
+    move = float(exit_price) - entry if row["direction"] == "long" else entry - float(exit_price)
+    if row["outcome_status"] == "target1":
+      return abs(target1 - entry) / risk * 0.5 + move / risk * 0.5
+    return move / risk
   return None
 
 
@@ -3737,7 +3958,7 @@ def hit_map(row, candle):
 
 
 def close_lifecycle(status):
-  if status in {"target2", "stopped", "target1_stop", "ambiguous"}:
+  if status in {"target2", "stopped", "target1_stop", "ambiguous", "time_exit"}:
     return "closed"
   if status == "expired":
     return "expired"
@@ -3747,7 +3968,7 @@ def close_lifecycle(status):
 def update_plan_row(connection, row, candle, updates):
   status = updates.get("outcome_status", row["outcome_status"])
   lifecycle = updates.get("lifecycle_status", row["lifecycle_status"] or "waiting")
-  realized_r = realized_r_for(status, row)
+  realized_r = realized_r_for(status, row, candle.get("close"))
   closed_at = candle["time"] if lifecycle in {"closed", "expired"} else row["closed_at"]
   params = {
     "updated_at": candle["time"],
@@ -3802,7 +4023,7 @@ def trader_lifecycle_state(row):
     return "triggered"
   if outcome in {"expired"}:
     return "invalidated"
-  if outcome in {"target2", "target1_stop", "stopped", "ambiguous"} or lifecycle == "closed":
+  if outcome in {"target2", "target1_stop", "stopped", "ambiguous", "time_exit"} or lifecycle == "closed":
     return "closed"
   return lifecycle
 
@@ -3896,7 +4117,14 @@ def evaluate_plans(connection, symbol, candles):
         entry_at = int(row["entry_hit_at"] or row["created_at"])
         favorable = max(float(row["max_favorable"] or 0), hits["favorable"])
         adverse = max(float(row["max_adverse"] or 0), hits["adverse"])
-        if status == "target1":
+        shadow_time_exit = row["status"] == "shadow" and candle["time"] - int(row["created_at"]) > max_age
+        if shadow_time_exit:
+          changed = {
+            "outcome_status": "time_exit", "lifecycle_status": "closed",
+            "max_favorable": favorable, "max_adverse": adverse,
+          }
+          event_type = "time_exit"
+        elif status == "target1":
           if hits["target2"] and hits["stop"]:
             changed = {
               "outcome_status": "ambiguous",
@@ -3981,7 +4209,7 @@ def evaluate_plans(connection, symbol, candles):
         if event_type:
           insert_event(connection, row["id"], event_type, candle["time"], candle["close"], changed)
         row = connection.execute("SELECT * FROM plans WHERE id = ?", (row["id"],)).fetchone()
-        if event_type:
+        if event_type and row["status"] != "shadow":
           notification_engine.send_async(event_type, dict(row))
         updates += 1
         if row["lifecycle_status"] in {"closed", "expired"}:
@@ -4347,6 +4575,12 @@ class Handler(SimpleHTTPRequestHandler):
       symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
       with db() as connection:
         self.send_json(200, model_validation_snapshot(connection, symbol))
+      return
+    if parsed.path == "/api/shadow-learning":
+      params = parse_qs(parsed.query)
+      symbol = validate_symbol((params.get("symbol") or [SYMBOL])[0])
+      with db() as connection:
+        self.send_json(200, shadow_learning_snapshot(connection, symbol))
       return
     if parsed.path == "/api/config":
       params = parse_qs(parsed.query)
@@ -4753,7 +4987,8 @@ class Handler(SimpleHTTPRequestHandler):
         quarantined = connection.execute("""
           SELECT COUNT(*) AS total
           FROM plans
-          WHERE symbol = ? AND (eligible_for_learning = 0 OR strategy_version IS NULL OR strategy_version <> ?)
+          WHERE symbol = ? AND status <> 'shadow'
+            AND (eligible_for_learning = 0 OR strategy_version IS NULL OR strategy_version <> ?)
         """, (symbol, STRATEGY_VERSION)).fetchone()
         by_direction = connection.execute(f"""
           SELECT direction, COUNT(*) AS total,
