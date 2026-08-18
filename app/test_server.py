@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -184,6 +185,23 @@ class ServerTests(unittest.TestCase):
       server.BACKUP_DIR = old_backup_dir
       server.PERSISTENT_DATA_DIR = old_persistent_dir
 
+  def test_concurrent_writes_are_serialized_without_database_lock_errors(self):
+    def write(index):
+      with server.db() as connection:
+        connection.execute("""
+          INSERT INTO system_incidents (
+            incident_key, severity, message, status, first_seen_at, last_seen_at, occurrences
+          ) VALUES (?, 'warning', 'test', 'resolved', ?, ?, 1)
+        """, (f"concurrent:{index}", index, index))
+      return index
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+      completed = list(executor.map(write, range(40)))
+    self.assertEqual(completed, list(range(40)))
+    with server.db() as connection:
+      total = connection.execute("SELECT COUNT(*) total FROM system_incidents WHERE incident_key LIKE 'concurrent:%'").fetchone()["total"]
+    self.assertEqual(total, 40)
+
   def test_ta125_uses_yahoo_tel_aviv_index_symbol(self):
     payload = {
       "chart": {
@@ -310,6 +328,22 @@ class ServerTests(unittest.TestCase):
     self.assertIn('trader_helper_trade_alerts_allowed{symbol="BTC-USD"}', metrics)
     self.assertIn('trader_helper_secondary_price_drift_pct{symbol="BTC-USD"}', metrics)
     self.assertIn('trader_helper_secondary_price_verified{symbol="QQQ"}', metrics)
+    self.assertIn("trader_helper_demo_worker_healthy", metrics)
+    self.assertIn("trader_helper_demo_invariant_findings", metrics)
+
+  def test_demo_execution_bundle_excludes_forming_candles(self):
+    closed_time = 1_780_000_800_000
+    closed_time -= closed_time % (5 * server.MINUTE_MS)
+    forming_time = closed_time + 5 * server.MINUTE_MS
+    timestamp = forming_time + 30_000
+    runtime = server.new_market_runtime()
+    runtime["history"] = [
+      candle(closed_time, 100, 101, 99, 100.5),
+      candle(forming_time, 100.5, 102, 100, 101.5),
+    ]
+    bundle = server.demo_execution_bundle("QQQ", runtime, timestamp)
+    self.assertEqual(bundle["intraday"][5][-1]["time"], closed_time)
+    self.assertNotIn(forming_time, [bar["time"] for bar in bundle["intraday"][1]])
 
   def test_supported_symbols_include_bitcoin_and_spy(self):
     self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")

@@ -83,6 +83,7 @@ const state = {
   scoreboardTimer: null,
   demoTrading: null,
   demoTradingTimer: null,
+  demoHistoryLimit: 200,
   selectedJournalPlanId: "",
   optionsOpportunity: null,
   lastOptionsAlertKey: "",
@@ -398,6 +399,7 @@ const els = {
   demoUnrealized: document.getElementById("demoUnrealized"),
   demoRealizedGross: document.getElementById("demoRealizedGross"),
   demoCommissions: document.getElementById("demoCommissions"),
+  demoBorrowFees: document.getElementById("demoBorrowFees"),
   demoTaxes: document.getElementById("demoTaxes"),
   demoDrawdown: document.getElementById("demoDrawdown"),
   demoWinRecord: document.getElementById("demoWinRecord"),
@@ -416,6 +418,7 @@ const els = {
   demoPendingEmpty: document.getElementById("demoPendingEmpty"),
   demoHistoryRows: document.getElementById("demoHistoryRows"),
   demoHistoryEmpty: document.getElementById("demoHistoryEmpty"),
+  demoHistoryMore: document.getElementById("demoHistoryMore"),
   tradeReviewForm: document.getElementById("tradeReviewForm"),
   reviewPlanLabel: document.getElementById("reviewPlanLabel"),
   reviewStatus: document.getElementById("reviewStatus"),
@@ -5008,6 +5011,7 @@ function renderDemoTrading(data) {
   setTone(els.demoUnrealized, Number(account.unrealizedPnl) > 0 ? "positive" : Number(account.unrealizedPnl) < 0 ? "negative" : "neutral");
   els.demoRealizedGross.textContent = demoUsd(account.realizedGrossPnl, true);
   els.demoCommissions.textContent = demoUsd(account.commissions);
+  els.demoBorrowFees.textContent = demoUsd(account.borrowFees);
   els.demoTaxes.textContent = demoUsd(account.taxes);
   els.demoDrawdown.textContent = `${Number(account.maxDrawdownPct || 0).toFixed(2)}%`;
   els.demoWinRecord.textContent = `${Number(account.wins || 0)}W · ${Number(account.losses || 0)}L`;
@@ -5024,14 +5028,15 @@ function renderDemoTrading(data) {
       <p>${escapeHtml(position.setup)} · score ${Number(position.score || 0)}/100</p>
       <div class="demo-position-levels">
         <div><span>Entry</span><strong>${demoPrice(position, position.entryPrice)}</strong></div>
-        <div><span>Investment</span><strong>${demoUsd(position.entryValue)}</strong></div>
+        <div><span>Investment</span><strong>${demoUsd(position.remainingValue)}</strong></div>
         <div><span>Current</span><strong>${demoPrice(position, position.lastPrice)}</strong></div>
-        <div><span>Stop</span><strong>${demoPrice(position, position.stop)}</strong></div>
+        <div><span>${position.trailingStop ? "Trailing stop" : "Stop"}</span><strong>${demoPrice(position, position.stop)}</strong></div>
         <div><span>Target 1</span><strong>${demoPrice(position, position.target1)}</strong></div>
         <div><span>Target 2</span><strong>${demoPrice(position, position.target2)}</strong></div>
+        <div><span>Initial risk</span><strong>${demoUsd(position.initialRisk)}</strong></div>
         <div><span>Unrealized</span><strong class="${pnl > 0 ? "positive" : pnl < 0 ? "negative" : ""}">${demoUsd(pnl, true)}</strong></div>
       </div>
-      <footer><span>${Number(position.remainingQuantity).toLocaleString()} units</span><span>Opened ${demoDate(position.openedAt)}</span></footer>
+      <footer><span>${Number(position.remainingQuantity).toLocaleString()} units · ${escapeHtml(position.stopConfirmation || "close")} stop${position.stopAdjusted ? " · cost adjusted" : ""}</span><span>Opened ${demoDate(position.openedAt)} · valued ${demoDate(position.lastValuedAt)}</span></footer>
     </article>`;
   }).join("");
 
@@ -5043,25 +5048,30 @@ function renderDemoTrading(data) {
     <td data-label="Horizon">${escapeHtml(order.horizon)} · ${order.timeframe === 1440 ? "1D" : `${order.timeframe}m`}</td>
     <td data-label="Side" class="${order.direction === "long" ? "positive" : "negative"}">${escapeHtml(order.direction.toUpperCase())}</td>
     <td data-label="Setup">${escapeHtml(order.setup || "Momentum setup")}</td>
-    <td data-label="Eligible">${demoDate(order.eligibleAt)}</td>
+    <td data-label="Eligible">${escapeHtml(order.status || "pending")} · ${demoDate(order.fillEligibleAt || order.eligibleAt)}</td>
     <td data-label="Risk">${demoUsd(order.plannedRisk)}</td>
     <td data-label="Max value">${demoUsd(order.maxNotional)}</td>
   </tr>`).join("");
 
   const history = data?.tradeHistory || [];
   els.demoHistoryEmpty.hidden = history.length > 0;
-  els.demoHistoryRows.innerHTML = history.map((trade) => `<tr>
+  els.demoHistoryMore.hidden = history.length >= Number(data?.historyTotal || 0);
+  els.demoHistoryRows.innerHTML = history.map((trade) => {
+    const exits = (trade.fills || []).filter((fill) => fill.action === "exit");
+    const finalExit = exits.at(-1);
+    return `<tr>
     <td data-label="Closed">${demoDate(trade.closedAt)}</td>
     <td data-label="Market">${escapeHtml(trade.symbol)}</td>
     <td data-label="Horizon">${escapeHtml(trade.horizon)}</td>
     <td data-label="Side" class="${trade.direction === "long" ? "positive" : "negative"}">${escapeHtml(trade.direction.toUpperCase())}</td>
     <td data-label="Entry">${demoPrice(trade, trade.entryPrice)}</td>
-    <td data-label="Exit state">${escapeHtml(String(trade.closeReason || "closed").replaceAll("_", " "))}</td>
+    <td data-label="Exit">${finalExit ? demoPrice(trade, finalExit.price) : "--"}<br><small>${escapeHtml(String(trade.closeReason || "closed").replaceAll("_", " "))}</small></td>
     <td data-label="Gross">${demoUsd(trade.realizedGrossPnl, true)}</td>
     <td data-label="Fees">${demoUsd(trade.commissions)}</td>
     <td data-label="Tax">${demoUsd(trade.taxes)}</td>
     <td data-label="Net" class="${Number(trade.netPnl) > 0 ? "positive" : "negative"}">${demoUsd(trade.netPnl, true)}</td>
-  </tr>`).join("");
+  </tr>`;
+  }).join("");
 
   const breakdown = data?.breakdown || [];
   els.demoBreakdownEmpty.hidden = breakdown.length > 0;
@@ -5082,7 +5092,7 @@ function renderDemoTrading(data) {
 
 async function refreshDemoTrading() {
   try {
-    const response = await fetch(`/api/demo-trading?t=${Date.now()}`);
+    const response = await fetch(`/api/demo-trading?limit=${state.demoHistoryLimit}&t=${Date.now()}`);
     if (!response.ok) throw new Error(`demo trading failed: ${response.status}`);
     renderDemoTrading(await response.json());
   } catch (error) {
@@ -5156,6 +5166,10 @@ els.swingTradeView.addEventListener("click", () => activateHorizon("swing"));
 els.contextView.addEventListener("click", () => activateHorizon("context"));
 els.journalView.addEventListener("click", () => activateHorizon("journal"));
 els.demoTradingView.addEventListener("click", () => activateHorizon("demo"));
+els.demoHistoryMore.addEventListener("click", () => {
+  state.demoHistoryLimit = Math.min(500, state.demoHistoryLimit + 200);
+  refreshDemoTrading();
+});
 
 els.insightTabs.forEach((button) => {
   button.addEventListener("click", () => activateInsightGroup(button.dataset.insightGroup));

@@ -2894,6 +2894,25 @@ body[data-horizon="demo"] .mobile-plan-button {
   line-height: 1.4;
 }
 
+.demo-history-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.demo-history-actions .secondary-button,
+.demo-history-more {
+  min-height: 32px;
+  padding: 7px 10px;
+  text-decoration: none;
+}
+
+.demo-history-more {
+  margin: 14px auto 0;
+}
+
 .journal-band {
   min-height: calc(100svh - 120px);
   padding: 20px 24px;

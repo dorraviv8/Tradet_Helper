@@ -149,6 +149,7 @@ BACKTEST_JOB_LOCK = threading.Lock()
 BACKTEST_JOBS_ACTIVE = set()
 BACKTEST_JOB_SLOTS = threading.BoundedSemaphore(BACKTEST_MAX_CONCURRENCY)
 BACKUP_LOCK = threading.Lock()
+DATABASE_LOCK = threading.RLock()
 BACKUP_STATE = {"last_success_at": None, "last_path": None, "last_error": None, "integrity": "not_checked"}
 DEMO_TRADING_LOCK = threading.Lock()
 DEMO_TRADING_STATE = {
@@ -158,6 +159,7 @@ DEMO_TRADING_STATE = {
   "ta_intraday": [],
   "ta_daily": [],
   "ta_fx_rate": None,
+  "ta_fx_history": [],
   "ta_intraday_at": None,
   "ta_daily_at": None,
   "ta_fx_at": None,
@@ -174,13 +176,45 @@ def ensure_data_dir():
     shutil.copy2(LEGACY_DB_PATH, DB_PATH)
 
 
+class SerializedConnection(sqlite3.Connection):
+  WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP", "VACUUM", "BEGIN")
+
+  def _serialize_if_write(self, sql):
+    if getattr(self, "_write_lock_acquired", False):
+      return
+    statement = str(sql or "").lstrip().upper()
+    if statement.startswith(self.WRITE_PREFIXES):
+      DATABASE_LOCK.acquire()
+      self._write_lock_acquired = True
+
+  def execute(self, sql, parameters=()):
+    self._serialize_if_write(sql)
+    return super().execute(sql, parameters)
+
+  def executemany(self, sql, seq_of_parameters):
+    self._serialize_if_write(sql)
+    return super().executemany(sql, seq_of_parameters)
+
+  def executescript(self, sql_script):
+    if not getattr(self, "_write_lock_acquired", False):
+      DATABASE_LOCK.acquire()
+      self._write_lock_acquired = True
+    return super().executescript(sql_script)
+
+  def release_write_lock(self):
+    if getattr(self, "_write_lock_acquired", False):
+      self._write_lock_acquired = False
+      DATABASE_LOCK.release()
+
+
 @contextmanager
 def db():
   ensure_data_dir()
-  connection = sqlite3.connect(DB_PATH, timeout=10)
+  connection = sqlite3.connect(DB_PATH, timeout=30, factory=SerializedConnection)
   connection.row_factory = sqlite3.Row
-  connection.execute("PRAGMA busy_timeout=10000")
+  connection.execute("PRAGMA busy_timeout=30000")
   connection.execute("PRAGMA foreign_keys=ON")
+  connection.execute("PRAGMA synchronous=NORMAL")
   try:
     yield connection
     connection.commit()
@@ -188,7 +222,10 @@ def db():
     connection.rollback()
     raise
   finally:
-    connection.close()
+    try:
+      connection.close()
+    finally:
+      connection.release_write_lock()
 
 
 def add_column(connection, existing, name, definition):
@@ -625,16 +662,17 @@ def backup_database(timestamp=None):
     final_path = os.path.join(BACKUP_DIR, f"trader-journal-{stamp}.sqlite3")
     temporary_path = final_path + ".tmp"
     try:
-      source = sqlite3.connect(DB_PATH, timeout=10)
-      destination = sqlite3.connect(temporary_path)
-      try:
-        source.backup(destination)
-        integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-          raise RuntimeError(f"backup integrity check failed: {integrity}")
-      finally:
-        destination.close()
-        source.close()
+      with DATABASE_LOCK:
+        source = sqlite3.connect(DB_PATH, timeout=30)
+        destination = sqlite3.connect(temporary_path)
+        try:
+          source.backup(destination)
+          integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
+          if integrity != "ok":
+            raise RuntimeError(f"backup integrity check failed: {integrity}")
+        finally:
+          destination.close()
+          source.close()
       os.replace(temporary_path, final_path)
       backups = sorted(
         [os.path.join(BACKUP_DIR, name) for name in os.listdir(BACKUP_DIR) if name.endswith(".sqlite3")],
@@ -3566,6 +3604,8 @@ def prometheus_metrics():
       GROUP BY symbol
     """, (SHADOW_CANDIDATE_VERSION,)).fetchall()
     demo_snapshot = demo_trading_engine.account_snapshot(connection, 1)
+    demo_invariants = demo_trading_engine.invariant_findings(connection, timestamp)
+    demo_rejected = int(connection.execute("SELECT COUNT(*) total FROM demo_orders WHERE status = 'rejected'").fetchone()["total"])
   shadow_metrics = {row["symbol"]: dict(row) for row in shadow_rows}
   learning_metrics = {}
   for row in learning_rows:
@@ -3637,7 +3677,22 @@ def prometheus_metrics():
     "# HELP trader_helper_demo_day_trades_24h Demo day-trade entries opened in the trailing 24 hours.",
     "# TYPE trader_helper_demo_day_trades_24h gauge",
     f"trader_helper_demo_day_trades_24h {demo_snapshot['account']['dayTradesLast24h']}",
+    "# HELP trader_helper_demo_worker_healthy Whether the demo trading worker completed without an error.",
+    "# TYPE trader_helper_demo_worker_healthy gauge",
+    f"trader_helper_demo_worker_healthy {0 if DEMO_TRADING_STATE.get('last_error') else 1}",
+    "# HELP trader_helper_demo_invariant_findings Current accounting or execution invariant violations.",
+    "# TYPE trader_helper_demo_invariant_findings gauge",
+    f"trader_helper_demo_invariant_findings {len(demo_invariants)}",
+    "# HELP trader_helper_demo_rejected_orders Total rejected demo entry orders.",
+    "# TYPE trader_helper_demo_rejected_orders counter",
+    f"trader_helper_demo_rejected_orders {demo_rejected}",
+    "# HELP trader_helper_demo_position_valuation_age_seconds Age of each open demo position valuation.",
+    "# TYPE trader_helper_demo_position_valuation_age_seconds gauge",
   ]
+  for position in demo_snapshot["openPositions"]:
+    labels = f'symbol="{position["symbol"]}",horizon="{position["horizon"]}",position_id="{position["id"]}"'
+    age = max(0, timestamp - int(position["lastValuedAt"])) / 1000
+    lines.append(f"trader_helper_demo_position_valuation_age_seconds{{{labels}}} {age}")
   delivery = notification_engine.delivery_status()
   lines.extend([
     "# HELP trader_helper_trade_notification_attempts Total server trade-notification attempts.",
@@ -3812,7 +3867,7 @@ def refresh_demo_ta125_execution_data(timestamp=None):
     fx_due = not DEMO_TRADING_STATE["ta_fx_at"] or timestamp - DEMO_TRADING_STATE["ta_fx_at"] >= 5 * MINUTE_MS
   intraday = demo_yahoo_series(DEMO_TA125_ETF_SYMBOL, "60d", "5m", 100) if intraday_due else None
   daily = demo_yahoo_series(DEMO_TA125_ETF_SYMBOL, "10y", "1d", 100) if daily_due else None
-  fx_candles = demo_yahoo_series(DEMO_FX_SYMBOL, "5d", "5m") if fx_due else None
+  fx_candles = demo_yahoo_series(DEMO_FX_SYMBOL, "60d", "5m") if fx_due else None
   with DEMO_TRADING_LOCK:
     if intraday is not None:
       if len(intraday) < 20:
@@ -3829,25 +3884,63 @@ def refresh_demo_ta125_execution_data(timestamp=None):
       if ils_per_usd <= 0:
         raise ValueError("USD/ILS conversion quote is unavailable")
       DEMO_TRADING_STATE["ta_fx_rate"] = 1 / ils_per_usd
+      DEMO_TRADING_STATE["ta_fx_history"] = [
+        {"time": int(candle["time"]), "rate": 1 / float(candle["close"])}
+        for candle in fx_candles if float(candle.get("close") or 0) > 0
+      ]
       DEMO_TRADING_STATE["ta_fx_at"] = timestamp
     return {
       "intraday": list(DEMO_TRADING_STATE["ta_intraday"]),
       "daily": list(DEMO_TRADING_STATE["ta_daily"]),
       "fxRate": DEMO_TRADING_STATE["ta_fx_rate"],
+      "fxHistory": list(DEMO_TRADING_STATE["ta_fx_history"]),
     }
 
 
 def demo_execution_bundle(symbol, runtime, timestamp=None):
   timestamp = int(timestamp or now_ms())
   if symbol == "TA125":
-    return refresh_demo_ta125_execution_data(timestamp)
+    bundle = refresh_demo_ta125_execution_data(timestamp)
+    five = [bar for bar in bundle["intraday"] if int(bar["time"]) + 5 * MINUTE_MS + 2_000 <= timestamp]
+    daily = [bar for bar in bundle["daily"] if strategy_engine.daily_candle_is_closed(bar, timestamp, symbol)]
+    return {
+      "intraday": {5: five, 15: strategy_engine.closed_for_timeframe(five, 15, timestamp)},
+      "daily": daily,
+      "fxRate": bundle.get("fxHistory") or bundle["fxRate"],
+      "latestQuote": {"price": bundle["intraday"][-1]["close"], "time": bundle["intraday"][-1]["time"]} if bundle["intraday"] else None,
+    }
   minute = merge_candle_series([*runtime.get("history", []), *([runtime["candle"]] if runtime.get("candle") else [])])
-  intraday = merge_candle_series([*runtime.get("five_minute_history", []), *strategy_engine.resample(minute, 5)])
+  five = merge_candle_series([*runtime.get("five_minute_history", []), *strategy_engine.resample(minute, 5)])
+  intraday = {
+    1: strategy_engine.closed_for_timeframe(minute, 1, timestamp),
+    5: [bar for bar in five if int(bar["time"]) + 5 * MINUTE_MS + 2_000 <= timestamp],
+    15: strategy_engine.closed_for_timeframe(minute, 15, timestamp),
+  }
+  latest = minute[-1] if minute else None
   return {
     "intraday": intraday,
-    "daily": list(runtime.get("daily_history") or []),
+    "daily": [
+      bar for bar in (runtime.get("daily_history") or [])
+      if strategy_engine.daily_candle_is_closed(bar, timestamp, symbol)
+    ],
     "fxRate": 1.0,
+    "latestQuote": {"price": latest["close"], "time": latest["time"]} if latest else None,
   }
+
+
+def demo_indicator_context(recommendations):
+  context = {}
+  for timeframe, signal in (recommendations or {}).items():
+    if not isinstance(signal, dict):
+      continue
+    try:
+      key = int(timeframe)
+    except (TypeError, ValueError):
+      continue
+    latest = signal.get("latestIndicator")
+    if isinstance(latest, dict):
+      context[key] = latest
+  return context
 
 
 def demo_session_regular(timestamp, symbol):
@@ -3865,12 +3958,13 @@ def demo_trading_loop():
         if not runtime.get("recommendations"):
           continue
         bundle = demo_execution_bundle(symbol, runtime, timestamp)
-        if not bundle["intraday"] or not bundle["daily"] or not bundle["fxRate"]:
+        if not any(bundle["intraday"].values()) or not bundle["fxRate"]:
           continue
         with db() as connection:
           result = demo_trading_engine.process_market(
             connection, symbol, runtime["recommendations"], bundle["intraday"],
             bundle["daily"], bundle["fxRate"], timestamp, demo_session_regular,
+            bundle.get("latestQuote"), demo_indicator_context(runtime["recommendations"]),
           )
         for key in activity:
           activity[key] += int(result.get(key) or 0)
@@ -4717,8 +4811,9 @@ class Handler(SimpleHTTPRequestHandler):
       try:
         query = parse_qs(parsed.query)
         limit = min(500, max(1, int(query.get("limit", ["200"])[0])))
+        offset = max(0, int(query.get("offset", ["0"])[0]))
         with db() as connection:
-          snapshot = demo_trading_engine.account_snapshot(connection, limit)
+          snapshot = demo_trading_engine.account_snapshot(connection, limit, offset)
         with DEMO_TRADING_LOCK:
           snapshot["engine"] = {
             "status": "degraded" if DEMO_TRADING_STATE.get("last_error") else "running",
@@ -4728,6 +4823,21 @@ class Handler(SimpleHTTPRequestHandler):
             "lastActivity": DEMO_TRADING_STATE.get("last_activity") or {},
           }
         self.send_json(200, snapshot)
+      except Exception as error:
+        status, payload = self.api_error(error)
+        self.send_json(status, payload)
+      return
+    if parsed.path == "/api/demo-trading/export.csv":
+      try:
+        with db() as connection:
+          body = demo_trading_engine.trade_export_csv(connection).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", "attachment; filename=demo-trades.csv")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
       except Exception as error:
         status, payload = self.api_error(error)
         self.send_json(status, payload)

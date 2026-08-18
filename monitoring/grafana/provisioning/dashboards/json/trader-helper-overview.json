@@ -143,8 +143,58 @@
       "type": "timeseries"
     },
     {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 6, "x": 0, "y": 37},
+      "id": 16,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_demo_equity_usd", "refId": "A"}],
+      "title": "Demo Account Equity",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 6, "x": 6, "y": 37},
+      "id": 17,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_demo_net_pnl_usd", "refId": "A"}],
+      "title": "Demo Net P&L",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 7, "w": 6, "x": 12, "y": 37},
+      "id": 18,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_demo_worker_healthy", "refId": "A"}],
+      "title": "Demo Worker Healthy",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 7, "w": 6, "x": 18, "y": 37},
+      "id": 19,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "auto"},
+      "targets": [{"expr": "trader_helper_demo_invariant_findings", "refId": "A"}],
+      "title": "Demo Invariant Findings",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 44},
+      "id": 20,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [{"expr": "trader_helper_demo_position_valuation_age_seconds", "legendFormat": "{{symbol}} {{horizon}}", "refId": "A"}],
+      "title": "Open Demo Position Valuation Age",
+      "type": "timeseries"
+    },
+    {
       "datasource": {"type": "loki", "uid": "loki"},
-      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 37},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 52},
       "id": 13,
       "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
       "targets": [{"datasource": {"type": "loki", "uid": "loki"}, "expr": "{job=\"docker\"}", "refId": "A"}],
@@ -159,5 +209,5 @@
   "time": {"from": "now-6h", "to": "now"},
   "title": "Trader Helper Operations",
   "uid": "trader-helper-operations",
-  "version": 3
+  "version": 4
 }

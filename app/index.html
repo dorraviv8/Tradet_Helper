@@ -713,6 +713,7 @@
         <div><span>Unrealized P&amp;L</span><strong id="demoUnrealized">$0.00</strong></div>
         <div><span>Realized before costs</span><strong id="demoRealizedGross">$0.00</strong></div>
         <div><span>Commissions</span><strong id="demoCommissions">$0.00</strong></div>
+        <div><span>Short borrow costs</span><strong id="demoBorrowFees">$0.00</strong></div>
         <div><span>Taxes</span><strong id="demoTaxes">$0.00</strong></div>
         <div><span>Maximum drawdown</span><strong id="demoDrawdown">0.00%</strong></div>
         <div><span>Win record</span><strong id="demoWinRecord">0W · 0L</strong><small id="demoWinRate">Building</small></div>
@@ -763,7 +764,10 @@
       <section class="demo-table-section">
         <div class="section-heading">
           <div><p class="eyebrow">Permanent ledger</p><h2>Completed Trades</h2></div>
-          <span class="demo-rule-note">$5 each fill · 25% tax on profitable trades</span>
+          <div class="demo-history-actions">
+            <span class="demo-rule-note">$5 each fill · 25% tax on profitable trades</span>
+            <a class="secondary-button" href="/api/demo-trading/export.csv">Export CSV</a>
+          </div>
         </div>
         <div class="demo-table-wrap">
           <table class="demo-table">
@@ -772,6 +776,7 @@
           </table>
         </div>
         <p id="demoHistoryEmpty" class="demo-empty">The account starts now; no historical trades are imported.</p>
+        <button id="demoHistoryMore" class="secondary-button demo-history-more" type="button" hidden>Load more trades</button>
       </section>
     </section>
 

@@ -55,3 +55,27 @@ groups:
           severity: warning
         annotations:
           summary: A server-side trade notification failed
+
+      - alert: TraderHelperDemoWorkerFailed
+        expr: trader_helper_demo_worker_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Demo auto trading worker is failing
+
+      - alert: TraderHelperDemoInvariantViolation
+        expr: trader_helper_demo_invariant_findings > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Demo account failed an accounting or execution invariant
+
+      - alert: TraderHelperDemoValuationStale
+        expr: trader_helper_demo_position_valuation_age_seconds{symbol="BTC-USD"} > 600
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: An open BTC demo position has not been valued for ten minutes
