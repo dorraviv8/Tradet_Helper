@@ -3634,6 +3634,9 @@ def prometheus_metrics():
     "# HELP trader_helper_demo_max_drawdown_pct Maximum demo account drawdown percentage.",
     "# TYPE trader_helper_demo_max_drawdown_pct gauge",
     f"trader_helper_demo_max_drawdown_pct {demo_snapshot['account']['maxDrawdownPct']}",
+    "# HELP trader_helper_demo_day_trades_24h Demo day-trade entries opened in the trailing 24 hours.",
+    "# TYPE trader_helper_demo_day_trades_24h gauge",
+    f"trader_helper_demo_day_trades_24h {demo_snapshot['account']['dayTradesLast24h']}",
   ]
   delivery = notification_engine.delivery_status()
   lines.extend([

@@ -19,7 +19,9 @@ Synthetic demo prices are not used. Provider failure is shown as unavailable.
 
 ## Demo Auto Trading
 
-The forward-only demo account starts once with $20,000 and has no reset or manual-order endpoint. A dedicated background worker can hold day, swing, and long-horizon positions simultaneously. Day setups favor the 5m analysis; swing and long setups use closed daily momentum. Only qualified system signals can create orders.
+The forward-only demo account starts once with $20,000 and has no reset or manual-order endpoint. A dedicated background worker can hold day, swing, and long-horizon positions simultaneously. Day setups favor the 5m analysis; swing and long setups use closed daily momentum.
+
+The portfolio targets at least two new day-trade entries per trailing 24 hours. Until that target is reached, activity-target mode can accept the strongest score-50+ day candidate with at least 0.8 reward/risk even when it is below the normal alert threshold or remains watch-only for setup quality. It still rejects stale or blocked data, malformed levels, non-clean data quality, stop distances outside 0.05%-6%, insufficient cash, and risk-limit violations. The ordinary stricter selection resumes after two day entries.
 
 Entries fill at the next eligible candle open with adverse asset-specific slippage. QQQ and SPY use whole ETF shares, BTC-USD supports fractional units, and TA-125 signals execute through the `IBI-F42.TA` tracking ETF. Yahoo quotes that ETF in agorot, so prices are divided by 100 and converted into account USD using `ILS=X`. A missing ETF or FX quote blocks TA-125 execution.
 

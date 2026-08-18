@@ -5,18 +5,20 @@ import sqlite3
 import time
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ACCOUNT_ID = "primary"
 STARTING_CASH_CENTS = 2_000_000
 COMMISSION_CENTS = 500
 TAX_RATE = 0.25
 DAY_MS = 86_400_000
+MINIMUM_DAY_TRADES_24H = 2
+ACTIVE_DAY_MINIMUM_SCORE = 50
 
 HORIZON_POLICY = {
   "day": {
     "minimum_score": 58,
-    "risk_pct": 0.50,
-    "max_position_pct": 20.0,
+    "risk_pct": 0.75,
+    "max_position_pct": 25.0,
     "entry_expiry_ms": 35 * 60_000,
     "max_holding_ms": 4 * 60 * 60_000,
   },
@@ -201,6 +203,11 @@ def init_schema(connection, timestamp=None):
       ACCOUNT_ID, f"account:{ACCOUNT_ID}:opening", timestamp, STARTING_CASH_CENTS,
       STARTING_CASH_CENTS, json.dumps({"policyVersion": VERSION}),
     ))
+  else:
+    connection.execute(
+      "UPDATE demo_accounts SET policy_version = ?, updated_at = ? WHERE id = ?",
+      (VERSION, timestamp, ACCOUNT_ID),
+    )
 
 
 def _hash_id(prefix, *parts):
@@ -215,26 +222,73 @@ def _json(value):
     return {}
 
 
-def _candidate_subject(signal):
+def _candidate_levels_are_valid(candidate):
+  try:
+    entry = float(candidate.get("entry") or 0)
+    stop = float(candidate.get("stop") or 0)
+    target1 = float(candidate.get("target") or candidate.get("target1") or 0)
+    target2 = float(candidate.get("target2") or 0)
+  except (TypeError, ValueError):
+    return False
+  if min(entry, stop, target1, target2) <= 0:
+    return False
+  if candidate.get("direction") == "long":
+    return stop < entry < target1 <= target2
+  if candidate.get("direction") == "short":
+    return stop > entry > target1 >= target2
+  return False
+
+
+def _aggressive_day_candidate_is_safe(candidate):
+  if not _candidate_levels_are_valid(candidate):
+    return False
+  if int(candidate.get("score") or 0) < ACTIVE_DAY_MINIMUM_SCORE:
+    return False
+  if float(candidate.get("riskReward") or 0) < 0.8:
+    return False
+  data_health = candidate.get("dataHealth") or {}
+  if data_health.get("tradeAllowed") is False:
+    return False
+  data_quality = str(candidate.get("dataQuality") or "clean").lower()
+  if data_quality != "clean":
+    return False
+  entry = float(candidate["entry"])
+  stop_pct = abs(entry - float(candidate["stop"])) / entry
+  return 0.0005 <= stop_pct <= 0.06
+
+
+def _candidate_subject(signal, aggressive_day=False):
   if not isinstance(signal, dict):
     return None
   direct = signal if signal.get("direction") in {"long", "short"} else None
   candidates = [item for item in (direct, signal.get("bestLong"), signal.get("bestShort")) if isinstance(item, dict)]
-  eligible = [item for item in candidates if item.get("direction") in {"long", "short"} and not item.get("watchOnly")]
+  eligible = [
+    item for item in candidates
+    if item.get("direction") in {"long", "short"}
+    and (
+      (not item.get("watchOnly") and _candidate_levels_are_valid(item))
+      or (aggressive_day and _aggressive_day_candidate_is_safe(item))
+    )
+  ]
   return max(eligible, key=lambda item: (int(item.get("score") or 0), float(item.get("riskReward") or 0)), default=None)
 
 
-def candidates_from_recommendations(symbol, recommendations, timestamp):
+def candidates_from_recommendations(symbol, recommendations, timestamp, aggressive_day=False):
   rows = []
   for timeframe in (1, 5, 15):
     signal = recommendations.get(timeframe) or recommendations.get(str(timeframe)) or {}
-    candidate = _candidate_subject(signal)
+    candidate = _candidate_subject(signal, aggressive_day)
     if not candidate:
       continue
     score = int(candidate.get("score") or 0)
-    if score < HORIZON_POLICY["day"]["minimum_score"]:
+    threshold = ACTIVE_DAY_MINIMUM_SCORE if aggressive_day else HORIZON_POLICY["day"]["minimum_score"]
+    if score < threshold:
       continue
-    rows.append(_candidate_row(symbol, "day", timeframe, signal, candidate, timestamp))
+    row = _candidate_row(symbol, "day", timeframe, signal, candidate, timestamp)
+    row["selection_mode"] = "activity_target" if aggressive_day and (
+      candidate.get("watchOnly") or score < HORIZON_POLICY["day"]["minimum_score"]
+    ) else "qualified"
+    rows.append(row)
   if rows:
     rows = [max(rows, key=lambda row: (row["score"] + (4 if row["timeframe"] == 5 else 1 if row["timeframe"] == 15 else 0), row["risk_reward"]))]
 
@@ -323,13 +377,23 @@ def _open_risk_cents(connection):
   return risk
 
 
+def day_trade_entries_last_24h(connection, timestamp=None):
+  timestamp = int(timestamp or now_ms())
+  row = connection.execute("""
+    SELECT COUNT(*) total FROM demo_positions
+    WHERE horizon = 'day' AND opened_at >= ? AND opened_at <= ?
+  """, (timestamp - DAY_MS, timestamp)).fetchone()
+  return int(row["total"] or 0)
+
+
 def create_entry_orders(connection, symbol, recommendations, timestamp=None):
   timestamp = int(timestamp or now_ms())
   account = _account(connection)
   if not account or timestamp < int(account["started_at"]):
     return 0
   created = 0
-  for candidate in candidates_from_recommendations(symbol, recommendations, timestamp):
+  aggressive_day = day_trade_entries_last_24h(connection, timestamp) < MINIMUM_DAY_TRADES_24H
+  for candidate in candidates_from_recommendations(symbol, recommendations, timestamp, aggressive_day):
     policy = HORIZON_POLICY[candidate["horizon"]]
     if min(candidate["reference_price"], candidate["stop_reference"], candidate["target1_reference"], candidate["target2_reference"]) <= 0:
       continue
@@ -365,6 +429,7 @@ def create_entry_orders(connection, symbol, recommendations, timestamp=None):
       "referenceTarget2": candidate["target2_reference"],
       "strategyVersion": candidate["strategy_version"],
       "reasons": candidate["reasons"],
+      "selectionMode": candidate.get("selection_mode") or "qualified",
     }
     instrument = SYMBOL_POLICY[symbol]
     cursor = connection.execute("""
@@ -378,7 +443,9 @@ def create_entry_orders(connection, symbol, recommendations, timestamp=None):
       order_id, idempotency_key, ACCOUNT_ID, symbol, instrument["execution_symbol"], instrument["currency"],
       candidate["horizon"], candidate["timeframe"], candidate["direction"], candidate["signal_at"],
       candidate["actionable_at"], candidate["actionable_at"] + policy["entry_expiry_ms"], candidate["reference_price"],
-      risk_cents, max_notional, "qualified_system_signal", json.dumps(details), timestamp, timestamp,
+      risk_cents, max_notional,
+      "daily_activity_target" if candidate.get("selection_mode") == "activity_target" else "qualified_system_signal",
+      json.dumps(details), timestamp, timestamp,
     ))
     created += int(cursor.rowcount > 0)
   return created
@@ -793,6 +860,7 @@ def account_snapshot(connection, limit=200):
   closed = int(totals["closed"] or 0)
   net_total = int(totals["net"] or 0)
   net_pnl = values["equity_cents"] - int(account["starting_cash_cents"])
+  day_entries = day_trade_entries_last_24h(connection)
   return {
     "account": {
       "id": account["id"], "mode": "demo", "startedAt": int(account["started_at"]),
@@ -805,6 +873,7 @@ def account_snapshot(connection, limit=200):
       "maxDrawdownPct": round(int(account["max_drawdown_bps"]) / 100, 2),
       "closedTrades": closed, "wins": int(totals["wins"] or 0), "losses": int(totals["losses"] or 0),
       "winRate": round(int(totals["wins"] or 0) / closed * 100, 1) if closed else None,
+      "dayTradesLast24h": day_entries, "minimumDayTradesTarget": MINIMUM_DAY_TRADES_24H,
       "policyVersion": account["policy_version"], "updatedAt": int(account["updated_at"]),
     },
     "openPositions": [_position_json(row) for row in open_rows],
@@ -817,7 +886,11 @@ def account_snapshot(connection, limit=200):
     } for row in pending_rows],
     "tradeHistory": [_position_json(row) for row in history_rows],
     "breakdown": breakdown, "equityCurve": curve, "learning": learning_snapshot(connection),
-    "rules": {"commissionPerOrder": 5, "profitableTradeTaxPct": 25, "leverage": False, "reset": False, "focus": "day"},
+    "rules": {
+      "commissionPerOrder": 5, "profitableTradeTaxPct": 25, "leverage": False,
+      "reset": False, "focus": "day", "minimumDayTrades24h": MINIMUM_DAY_TRADES_24H,
+      "activityTargetMinimumScore": ACTIVE_DAY_MINIMUM_SCORE,
+    },
   }
 
 

@@ -4996,7 +4996,7 @@ function renderDemoTrading(data) {
   const net = Number(account.netPnl || 0);
   els.demoEngineBadge.textContent = engine.status === "running" ? "Running 24/7" : "Data degraded";
   setTone(els.demoEngineBadge, engine.status === "running" ? "positive" : "negative");
-  els.demoAccountStarted.textContent = `Started ${demoDate(account.startedAt)} · forward-only · policy v${account.policyVersion || "--"}`;
+  els.demoAccountStarted.textContent = `Started ${demoDate(account.startedAt)} · policy v${account.policyVersion || "--"} · day activity ${Number(account.dayTradesLast24h || 0)}/${Number(account.minimumDayTradesTarget || 2)} in 24h`;
   els.demoAccountEquity.textContent = demoUsd(account.equity);
   els.demoNetPnl.textContent = demoUsd(net, true);
   setTone(els.demoNetPnl, net > 0 ? "positive" : net < 0 ? "negative" : "neutral");

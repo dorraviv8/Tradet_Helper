@@ -41,6 +41,17 @@ def recommendations(direction="long", signal_at=100_000, score=80):
   }
 
 
+def activity_target_recommendations(signal_at=100_000, blocked=False):
+  signal = recommendations(signal_at=signal_at, score=52)[5]
+  signal.update({
+    "watchOnly": True,
+    "riskReward": 1.0,
+    "dataQuality": "provider blocked" if blocked else "clean",
+    "dataHealth": {"tradeAllowed": not blocked},
+  })
+  return {5: signal}
+
+
 class DemoTradingEngineTests(unittest.TestCase):
   def setUp(self):
     self.connection = sqlite3.connect(":memory:")
@@ -57,6 +68,7 @@ class DemoTradingEngineTests(unittest.TestCase):
     ledger = self.connection.execute("SELECT COUNT(*) total FROM demo_ledger").fetchone()
     self.assertEqual(account["started_at"], 1_000)
     self.assertEqual(account["cash_cents"], 2_000_000)
+    self.assertEqual(account["policy_version"], engine.VERSION)
     self.assertEqual(ledger["total"], 1)
 
   def test_forward_only_signal_and_idempotent_entry_order(self):
@@ -157,6 +169,25 @@ class DemoTradingEngineTests(unittest.TestCase):
     stop_risk = engine._open_risk_cents(self.connection)
     self.assertLessEqual(exposure, 800_000)
     self.assertLessEqual(stop_risk, 80_000)
+
+  def test_activity_target_accepts_safe_watch_candidate_below_normal_threshold(self):
+    created = engine.create_entry_orders(self.connection, "QQQ", activity_target_recommendations(), 500_000)
+    order = self.connection.execute("SELECT reason, details_json FROM demo_orders").fetchone()
+    self.assertEqual(created, 1)
+    self.assertEqual(order["reason"], "daily_activity_target")
+    self.assertIn('"selectionMode": "activity_target"', order["details_json"])
+
+  def test_activity_target_never_bypasses_blocked_data(self):
+    created = engine.create_entry_orders(self.connection, "QQQ", activity_target_recommendations(blocked=True), 500_000)
+    self.assertEqual(created, 0)
+
+  def test_activity_target_stops_after_two_recent_day_entries(self):
+    for symbol in ("QQQ", "SPY"):
+      engine.create_entry_orders(self.connection, symbol, {5: recommendations()[5]}, 500_000)
+      engine.fill_pending_entries(self.connection, symbol, [candle(400_000, 100)], 1, 500_000, {"day"})
+    self.assertEqual(engine.day_trade_entries_last_24h(self.connection, 500_000), 2)
+    created = engine.create_entry_orders(self.connection, "BTC-USD", activity_target_recommendations(), 500_000)
+    self.assertEqual(created, 0)
 
 
 if __name__ == "__main__":
