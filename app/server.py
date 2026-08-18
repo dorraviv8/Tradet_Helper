@@ -3875,9 +3875,8 @@ def refresh_demo_ta125_execution_data(timestamp=None):
       DEMO_TRADING_STATE["ta_intraday"] = intraday
       DEMO_TRADING_STATE["ta_intraday_at"] = timestamp
     if daily is not None:
-      if len(daily) < 160:
-        raise ValueError("TA-125 ETF daily execution history is incomplete")
-      DEMO_TRADING_STATE["ta_daily"] = daily
+      if daily:
+        DEMO_TRADING_STATE["ta_daily"] = daily
       DEMO_TRADING_STATE["ta_daily_at"] = timestamp
     if fx_candles is not None:
       ils_per_usd = float(fx_candles[-1]["close"]) if fx_candles else 0

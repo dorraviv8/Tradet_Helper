@@ -345,6 +345,32 @@ class ServerTests(unittest.TestCase):
     self.assertEqual(bundle["intraday"][5][-1]["time"], closed_time)
     self.assertNotIn(forming_time, [bar["time"] for bar in bundle["intraday"][1]])
 
+  def test_ta125_day_execution_does_not_require_160_daily_etf_bars(self):
+    timestamp = 1_780_000_000_000
+    intraday = [candle(timestamp - (20 - index) * 300_000, 40, 41, 39, 40) for index in range(20)]
+    daily = [candle(timestamp - (5 - index) * 86_400_000, 40, 41, 39, 40) for index in range(5)]
+    fx = [candle(timestamp - 300_000, 3.3, 3.4, 3.2, 3.3)]
+    prior = dict(server.DEMO_TRADING_STATE)
+
+    def series(symbol, _range, interval, _divisor=1):
+      if symbol == server.DEMO_FX_SYMBOL:
+        return fx
+      return daily if interval == "1d" else intraday
+
+    try:
+      with server.DEMO_TRADING_LOCK:
+        server.DEMO_TRADING_STATE.update({
+          "ta_intraday": [], "ta_daily": [], "ta_fx_history": [], "ta_fx_rate": None,
+          "ta_intraday_at": None, "ta_daily_at": None, "ta_fx_at": None,
+        })
+      with patch.object(server, "demo_yahoo_series", side_effect=series):
+        bundle = server.refresh_demo_ta125_execution_data(timestamp)
+      self.assertEqual(len(bundle["daily"]), 5)
+    finally:
+      with server.DEMO_TRADING_LOCK:
+        server.DEMO_TRADING_STATE.clear()
+        server.DEMO_TRADING_STATE.update(prior)
+
   def test_supported_symbols_include_bitcoin_and_spy(self):
     self.assertEqual(server.validate_symbol("btc-usd"), "BTC-USD")
     self.assertEqual(server.validate_symbol("spy"), "SPY")
