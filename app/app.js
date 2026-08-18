@@ -5024,6 +5024,7 @@ function renderDemoTrading(data) {
       <p>${escapeHtml(position.setup)} · score ${Number(position.score || 0)}/100</p>
       <div class="demo-position-levels">
         <div><span>Entry</span><strong>${demoPrice(position, position.entryPrice)}</strong></div>
+        <div><span>Investment</span><strong>${demoUsd(position.entryValue)}</strong></div>
         <div><span>Current</span><strong>${demoPrice(position, position.lastPrice)}</strong></div>
         <div><span>Stop</span><strong>${demoPrice(position, position.stop)}</strong></div>
         <div><span>Target 1</span><strong>${demoPrice(position, position.target1)}</strong></div>
