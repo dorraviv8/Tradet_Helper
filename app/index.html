@@ -56,6 +56,7 @@
         <button id="swingTradeView" class="horizon-button" type="button" role="tab" aria-controls="marketWorkspace" aria-selected="false">Swing</button>
         <button id="contextView" class="horizon-button" type="button" role="tab" aria-controls="marketWorkspace" aria-selected="false">Context</button>
         <button id="journalView" class="horizon-button" type="button" role="tab" aria-controls="journalViewPanel" aria-selected="false">Journal</button>
+        <button id="demoTradingView" class="horizon-button" type="button" role="tab" aria-controls="demoTradingPanel" aria-selected="false">Demo Trading</button>
       </div>
     </section>
 
@@ -686,6 +687,94 @@
       </div>
     </section>
 
+    <section id="demoTradingPanel" class="demo-trading-band" aria-labelledby="demoTradingTitle" hidden>
+      <header class="demo-account-header">
+        <div>
+          <p class="eyebrow">System controlled simulation</p>
+          <h2 id="demoTradingTitle">Demo Auto Trading</h2>
+          <p id="demoAccountStarted" class="demo-account-note">Forward-only account · no manual orders or resets</p>
+        </div>
+        <div class="demo-engine-state">
+          <span id="demoEngineBadge" class="badge neutral">Starting</span>
+          <strong id="demoAccountEquity">$20,000.00</strong>
+          <small>Account equity</small>
+        </div>
+      </header>
+
+      <div class="demo-account-grid" aria-live="polite">
+        <div class="demo-primary-metric">
+          <span>Net P&amp;L</span>
+          <strong id="demoNetPnl">$0.00</strong>
+          <small id="demoReturnPct">0.00% return</small>
+        </div>
+        <div><span>Available cash</span><strong id="demoCash">$20,000.00</strong></div>
+        <div><span>Invested value</span><strong id="demoInvested">$0.00</strong></div>
+        <div><span>Short collateral</span><strong id="demoCollateral">$0.00</strong></div>
+        <div><span>Unrealized P&amp;L</span><strong id="demoUnrealized">$0.00</strong></div>
+        <div><span>Realized before costs</span><strong id="demoRealizedGross">$0.00</strong></div>
+        <div><span>Commissions</span><strong id="demoCommissions">$0.00</strong></div>
+        <div><span>Taxes</span><strong id="demoTaxes">$0.00</strong></div>
+        <div><span>Maximum drawdown</span><strong id="demoDrawdown">0.00%</strong></div>
+        <div><span>Win record</span><strong id="demoWinRecord">0W · 0L</strong><small id="demoWinRate">Building</small></div>
+      </div>
+
+      <div class="demo-section-grid">
+        <section class="demo-panel demo-equity-panel">
+          <div class="section-heading">
+            <div><p class="eyebrow">Account history</p><h2>Equity Curve</h2></div>
+            <span id="demoTradeCount" class="badge neutral">0 closed</span>
+          </div>
+          <canvas id="demoEquityChart" class="demo-equity-chart" aria-label="Demo account equity curve"></canvas>
+          <p id="demoEquityEmpty" class="demo-empty">The curve begins with the first five-minute account snapshot.</p>
+        </section>
+        <section class="demo-panel">
+          <div class="section-heading">
+            <div><p class="eyebrow">Measured results</p><h2>Performance Breakdown</h2></div>
+          </div>
+          <div id="demoBreakdown" class="demo-breakdown"></div>
+          <p id="demoBreakdownEmpty" class="demo-empty">Results appear after positions close.</p>
+          <p id="demoLearningState" class="demo-learning-state">Learning starts with the first completed forward trade.</p>
+        </section>
+      </div>
+
+      <section class="demo-table-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">Live exposure</p><h2>Open Positions</h2></div>
+          <span id="demoOpenCount" class="badge neutral">0 open</span>
+        </div>
+        <div id="demoOpenPositions" class="demo-position-grid"></div>
+        <p id="demoOpenEmpty" class="demo-empty">No demo positions are open.</p>
+      </section>
+
+      <section class="demo-table-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">Next-bar execution</p><h2>Pending Orders</h2></div>
+          <span id="demoPendingCount" class="badge neutral">0 pending</span>
+        </div>
+        <div class="demo-table-wrap">
+          <table class="demo-table">
+            <thead><tr><th>Market</th><th>Horizon</th><th>Side</th><th>Setup</th><th>Eligible</th><th>Risk</th><th>Max value</th></tr></thead>
+            <tbody id="demoPendingRows"></tbody>
+          </table>
+        </div>
+        <p id="demoPendingEmpty" class="demo-empty">No system orders are waiting for a fill.</p>
+      </section>
+
+      <section class="demo-table-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">Permanent ledger</p><h2>Completed Trades</h2></div>
+          <span class="demo-rule-note">$5 each fill · 25% tax on profitable trades</span>
+        </div>
+        <div class="demo-table-wrap">
+          <table class="demo-table">
+            <thead><tr><th>Closed</th><th>Market</th><th>Horizon</th><th>Side</th><th>Entry</th><th>Exit state</th><th>Gross</th><th>Fees</th><th>Tax</th><th>Net</th></tr></thead>
+            <tbody id="demoHistoryRows"></tbody>
+          </table>
+        </div>
+        <p id="demoHistoryEmpty" class="demo-empty">The account starts now; no historical trades are imported.</p>
+      </section>
+    </section>
+
     <section class="lower-band">
       <div class="metrics">
         <div>
@@ -716,7 +805,7 @@
     </section>
 
     <footer class="disclaimer">
-      Alerts are educational decision support only. They do not place trades and do not guarantee outcomes.
+      Alerts are educational decision support only. Demo Auto Trading is a simulation and does not place real trades or guarantee outcomes.
     </footer>
 
     <button id="mobilePlanButton" class="mobile-plan-button" type="button" aria-controls="tradeDecisionPanel" aria-expanded="false">

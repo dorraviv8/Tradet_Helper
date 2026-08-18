@@ -31,6 +31,7 @@ import notification_engine
 import risk_engine
 import shadow_engine
 import shadow_candidate_engine
+import demo_trading_engine
 
 
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -64,6 +65,8 @@ SUPPORTED_SYMBOLS = ("QQQ", "SPY", "BTC-USD", "TA125")
 YAHOO_SYMBOLS = {"TA125": "^TA125.TA"}
 STRATEGY_VERSION = "6.0.0"
 SHADOW_CANDIDATE_VERSION = f"{STRATEGY_VERSION}-{shadow_candidate_engine.VERSION}"
+DEMO_TA125_ETF_SYMBOL = "IBI-F42.TA"
+DEMO_FX_SYMBOL = "ILS=X"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 LEGACY_DB_PATH = os.path.join(APP_DIR, "trader_journal.sqlite3")
@@ -147,6 +150,18 @@ BACKTEST_JOBS_ACTIVE = set()
 BACKTEST_JOB_SLOTS = threading.BoundedSemaphore(BACKTEST_MAX_CONCURRENCY)
 BACKUP_LOCK = threading.Lock()
 BACKUP_STATE = {"last_success_at": None, "last_path": None, "last_error": None, "integrity": "not_checked"}
+DEMO_TRADING_LOCK = threading.Lock()
+DEMO_TRADING_STATE = {
+  "last_success_at": None,
+  "last_error": None,
+  "error_count": 0,
+  "ta_intraday": [],
+  "ta_daily": [],
+  "ta_fx_rate": None,
+  "ta_intraday_at": None,
+  "ta_daily_at": None,
+  "ta_fx_at": None,
+}
 IBKR_CLIENT = None
 IBKR_CLIENT_LOCK = threading.Lock()
 
@@ -249,6 +264,7 @@ def init_db():
     # WAL mode is a database-wide setting. Applying it per request can block
     # read handlers while another connection is writing.
     connection.execute("PRAGMA journal_mode=WAL")
+    demo_trading_engine.init_schema(connection)
     connection.execute("""
       CREATE TABLE IF NOT EXISTS plans (
         id TEXT PRIMARY KEY,
@@ -3437,6 +3453,17 @@ def monitoring_findings(timestamp=None):
     findings["database:backup_stale"] = ("warning", f"Last verified database backup is {round(backup_age / 3_600_000, 1)} hours old")
   elif backup_age is None and timestamp - PROCESS_STARTED_AT_MS > 10 * MINUTE_MS:
     findings["database:no_backup"] = ("warning", "No verified database backup has completed")
+  with DEMO_TRADING_LOCK:
+    demo_error_count = int(DEMO_TRADING_STATE.get("error_count") or 0)
+    demo_last_error = DEMO_TRADING_STATE.get("last_error")
+    demo_last_success = DEMO_TRADING_STATE.get("last_success_at")
+  if demo_error_count >= 3:
+    findings["demo_trading:worker_error"] = ("critical", f"Demo trading worker is failing: {demo_last_error}")
+  elif demo_last_success and timestamp - int(demo_last_success) > 10 * MINUTE_MS:
+    findings["demo_trading:worker_stale"] = ("warning", "Demo trading worker has not completed a clean cycle for 10 minutes")
+  with db() as connection:
+    for index, (severity, message) in enumerate(demo_trading_engine.invariant_findings(connection, timestamp)):
+      findings[f"demo_trading:invariant:{index}"] = (severity, message)
   return findings
 
 
@@ -3538,6 +3565,7 @@ def prometheus_metrics():
       WHERE status = 'shadow' AND strategy_version = ?
       GROUP BY symbol
     """, (SHADOW_CANDIDATE_VERSION,)).fetchall()
+    demo_snapshot = demo_trading_engine.account_snapshot(connection, 1)
   shadow_metrics = {row["symbol"]: dict(row) for row in shadow_rows}
   learning_metrics = {}
   for row in learning_rows:
@@ -3588,6 +3616,24 @@ def prometheus_metrics():
     "# TYPE trader_helper_shadow_candidates_resolved gauge",
     "# HELP trader_helper_shadow_candidates_active Active live shadow candidates by symbol.",
     "# TYPE trader_helper_shadow_candidates_active gauge",
+    "# HELP trader_helper_demo_equity_usd Current demo account equity in USD.",
+    "# TYPE trader_helper_demo_equity_usd gauge",
+    f"trader_helper_demo_equity_usd {demo_snapshot['account']['equity']}",
+    "# HELP trader_helper_demo_net_pnl_usd Current demo account net profit and loss in USD.",
+    "# TYPE trader_helper_demo_net_pnl_usd gauge",
+    f"trader_helper_demo_net_pnl_usd {demo_snapshot['account']['netPnl']}",
+    "# HELP trader_helper_demo_open_positions Current number of open demo positions.",
+    "# TYPE trader_helper_demo_open_positions gauge",
+    f"trader_helper_demo_open_positions {len(demo_snapshot['openPositions'])}",
+    "# HELP trader_helper_demo_pending_orders Current number of pending demo orders.",
+    "# TYPE trader_helper_demo_pending_orders gauge",
+    f"trader_helper_demo_pending_orders {len(demo_snapshot['pendingOrders'])}",
+    "# HELP trader_helper_demo_closed_trades Total number of completed demo trades.",
+    "# TYPE trader_helper_demo_closed_trades counter",
+    f"trader_helper_demo_closed_trades {demo_snapshot['account']['closedTrades']}",
+    "# HELP trader_helper_demo_max_drawdown_pct Maximum demo account drawdown percentage.",
+    "# TYPE trader_helper_demo_max_drawdown_pct gauge",
+    f"trader_helper_demo_max_drawdown_pct {demo_snapshot['account']['maxDrawdownPct']}",
   ]
   delivery = notification_engine.delivery_status()
   lines.extend([
@@ -3735,6 +3781,114 @@ def market_data_loop(symbol):
         error_count = MARKET_RUNTIMES[symbol]["error_count"]
       delay = min(120, base_interval * (2 ** min(error_count, 4)))
     MARKET_STOP_EVENT.wait(delay)
+
+
+def demo_yahoo_series(symbol, range_value, interval, price_divisor=1):
+  payload = yahoo_get(f"/v8/finance/chart/{symbol}", {
+    "range": range_value,
+    "interval": interval,
+    "includePrePost": "true" if interval != "1d" else "false",
+  })
+  candles = normalize_yahoo_chart(payload)
+  if price_divisor == 1:
+    return candles
+  return [{
+    **candle,
+    "open": candle["open"] / price_divisor,
+    "high": candle["high"] / price_divisor,
+    "low": candle["low"] / price_divisor,
+    "close": candle["close"] / price_divisor,
+  } for candle in candles]
+
+
+def refresh_demo_ta125_execution_data(timestamp=None):
+  timestamp = int(timestamp or now_ms())
+  with DEMO_TRADING_LOCK:
+    intraday_due = not DEMO_TRADING_STATE["ta_intraday_at"] or timestamp - DEMO_TRADING_STATE["ta_intraday_at"] >= 5 * MINUTE_MS
+    daily_due = not DEMO_TRADING_STATE["ta_daily_at"] or timestamp - DEMO_TRADING_STATE["ta_daily_at"] >= DAILY_CACHE_TTL_MS
+    fx_due = not DEMO_TRADING_STATE["ta_fx_at"] or timestamp - DEMO_TRADING_STATE["ta_fx_at"] >= 5 * MINUTE_MS
+  intraday = demo_yahoo_series(DEMO_TA125_ETF_SYMBOL, "60d", "5m", 100) if intraday_due else None
+  daily = demo_yahoo_series(DEMO_TA125_ETF_SYMBOL, "10y", "1d", 100) if daily_due else None
+  fx_candles = demo_yahoo_series(DEMO_FX_SYMBOL, "5d", "5m") if fx_due else None
+  with DEMO_TRADING_LOCK:
+    if intraday is not None:
+      if len(intraday) < 20:
+        raise ValueError("TA-125 ETF intraday execution history is incomplete")
+      DEMO_TRADING_STATE["ta_intraday"] = intraday
+      DEMO_TRADING_STATE["ta_intraday_at"] = timestamp
+    if daily is not None:
+      if len(daily) < 160:
+        raise ValueError("TA-125 ETF daily execution history is incomplete")
+      DEMO_TRADING_STATE["ta_daily"] = daily
+      DEMO_TRADING_STATE["ta_daily_at"] = timestamp
+    if fx_candles is not None:
+      ils_per_usd = float(fx_candles[-1]["close"]) if fx_candles else 0
+      if ils_per_usd <= 0:
+        raise ValueError("USD/ILS conversion quote is unavailable")
+      DEMO_TRADING_STATE["ta_fx_rate"] = 1 / ils_per_usd
+      DEMO_TRADING_STATE["ta_fx_at"] = timestamp
+    return {
+      "intraday": list(DEMO_TRADING_STATE["ta_intraday"]),
+      "daily": list(DEMO_TRADING_STATE["ta_daily"]),
+      "fxRate": DEMO_TRADING_STATE["ta_fx_rate"],
+    }
+
+
+def demo_execution_bundle(symbol, runtime, timestamp=None):
+  timestamp = int(timestamp or now_ms())
+  if symbol == "TA125":
+    return refresh_demo_ta125_execution_data(timestamp)
+  minute = merge_candle_series([*runtime.get("history", []), *([runtime["candle"]] if runtime.get("candle") else [])])
+  intraday = merge_candle_series([*runtime.get("five_minute_history", []), *strategy_engine.resample(minute, 5)])
+  return {
+    "intraday": intraday,
+    "daily": list(runtime.get("daily_history") or []),
+    "fxRate": 1.0,
+  }
+
+
+def demo_session_regular(timestamp, symbol):
+  return bool(strategy_engine.market_session(timestamp, symbol).get("regular"))
+
+
+def demo_trading_loop():
+  while not MARKET_STOP_EVENT.is_set():
+    errors = []
+    activity = {"created": 0, "filled": 0, "exits": 0}
+    timestamp = now_ms()
+    for symbol in SUPPORTED_SYMBOLS:
+      try:
+        runtime = market_runtime_snapshot(symbol)
+        if not runtime.get("recommendations"):
+          continue
+        bundle = demo_execution_bundle(symbol, runtime, timestamp)
+        if not bundle["intraday"] or not bundle["daily"] or not bundle["fxRate"]:
+          continue
+        with db() as connection:
+          result = demo_trading_engine.process_market(
+            connection, symbol, runtime["recommendations"], bundle["intraday"],
+            bundle["daily"], bundle["fxRate"], timestamp, demo_session_regular,
+          )
+        for key in activity:
+          activity[key] += int(result.get(key) or 0)
+      except Exception as error:
+        errors.append(f"{symbol}: {str(error)[:180]}")
+    with DEMO_TRADING_LOCK:
+      if errors:
+        DEMO_TRADING_STATE["error_count"] += 1
+        DEMO_TRADING_STATE["last_error"] = "; ".join(errors)[:500]
+      else:
+        DEMO_TRADING_STATE["error_count"] = 0
+        DEMO_TRADING_STATE["last_error"] = None
+        DEMO_TRADING_STATE["last_success_at"] = timestamp
+      DEMO_TRADING_STATE["last_activity"] = activity
+    MARKET_STOP_EVENT.wait(15)
+
+
+def start_demo_trading_worker():
+  worker = threading.Thread(target=demo_trading_loop, name="demo-auto-trading", daemon=True)
+  worker.start()
+  return worker
 
 
 def start_market_data_workers():
@@ -4499,6 +4653,7 @@ class Handler(SimpleHTTPRequestHandler):
       content_type = "text/javascript"
     self.send_response(200)
     self.send_header("Content-Type", content_type)
+    self.send_header("Cache-Control", "no-cache")
     self.send_header("Content-Length", str(len(body)))
     self.end_headers()
     self.wfile.write(body)
@@ -4554,6 +4709,25 @@ class Handler(SimpleHTTPRequestHandler):
       return
     if parsed.path == "/api/system-health":
       self.send_json(200, system_health_snapshot())
+      return
+    if parsed.path == "/api/demo-trading":
+      try:
+        query = parse_qs(parsed.query)
+        limit = min(500, max(1, int(query.get("limit", ["200"])[0])))
+        with db() as connection:
+          snapshot = demo_trading_engine.account_snapshot(connection, limit)
+        with DEMO_TRADING_LOCK:
+          snapshot["engine"] = {
+            "status": "degraded" if DEMO_TRADING_STATE.get("last_error") else "running",
+            "lastSuccessAt": DEMO_TRADING_STATE.get("last_success_at"),
+            "lastError": DEMO_TRADING_STATE.get("last_error"),
+            "errorCount": DEMO_TRADING_STATE.get("error_count", 0),
+            "lastActivity": DEMO_TRADING_STATE.get("last_activity") or {},
+          }
+        self.send_json(200, snapshot)
+      except Exception as error:
+        status, payload = self.api_error(error)
+        self.send_json(status, payload)
       return
     if parsed.path == "/api/scanner":
       self.send_json(200, market_scanner_snapshot())
@@ -5324,6 +5498,7 @@ def main():
         )
   server = AppHTTPServer((HOST, PORT), Handler)
   start_market_data_workers()
+  start_demo_trading_worker()
   start_monitoring_worker()
   start_backup_worker()
   provider = active_provider(SYMBOL)

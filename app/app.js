@@ -81,6 +81,8 @@ const state = {
   systemFindingCount: 0,
   scannerTimer: null,
   scoreboardTimer: null,
+  demoTrading: null,
+  demoTradingTimer: null,
   selectedJournalPlanId: "",
   optionsOpportunity: null,
   lastOptionsAlertKey: "",
@@ -141,6 +143,8 @@ const els = {
   contextView: document.getElementById("contextView"),
   journalView: document.getElementById("journalView"),
   journalViewPanel: document.getElementById("journalViewPanel"),
+  demoTradingView: document.getElementById("demoTradingView"),
+  demoTradingPanel: document.getElementById("demoTradingPanel"),
   marketWorkspace: document.getElementById("marketWorkspace"),
   alertCenterButton: document.getElementById("alertCenterButton"),
   alertCenterCount: document.getElementById("alertCenterCount"),
@@ -383,6 +387,35 @@ const els = {
   feedbackBad: document.getElementById("feedbackBad"),
   journalFilter: document.getElementById("journalFilter"),
   journalRows: document.getElementById("journalRows"),
+  demoEngineBadge: document.getElementById("demoEngineBadge"),
+  demoAccountStarted: document.getElementById("demoAccountStarted"),
+  demoAccountEquity: document.getElementById("demoAccountEquity"),
+  demoNetPnl: document.getElementById("demoNetPnl"),
+  demoReturnPct: document.getElementById("demoReturnPct"),
+  demoCash: document.getElementById("demoCash"),
+  demoInvested: document.getElementById("demoInvested"),
+  demoCollateral: document.getElementById("demoCollateral"),
+  demoUnrealized: document.getElementById("demoUnrealized"),
+  demoRealizedGross: document.getElementById("demoRealizedGross"),
+  demoCommissions: document.getElementById("demoCommissions"),
+  demoTaxes: document.getElementById("demoTaxes"),
+  demoDrawdown: document.getElementById("demoDrawdown"),
+  demoWinRecord: document.getElementById("demoWinRecord"),
+  demoWinRate: document.getElementById("demoWinRate"),
+  demoTradeCount: document.getElementById("demoTradeCount"),
+  demoEquityChart: document.getElementById("demoEquityChart"),
+  demoEquityEmpty: document.getElementById("demoEquityEmpty"),
+  demoBreakdown: document.getElementById("demoBreakdown"),
+  demoBreakdownEmpty: document.getElementById("demoBreakdownEmpty"),
+  demoLearningState: document.getElementById("demoLearningState"),
+  demoOpenCount: document.getElementById("demoOpenCount"),
+  demoOpenPositions: document.getElementById("demoOpenPositions"),
+  demoOpenEmpty: document.getElementById("demoOpenEmpty"),
+  demoPendingCount: document.getElementById("demoPendingCount"),
+  demoPendingRows: document.getElementById("demoPendingRows"),
+  demoPendingEmpty: document.getElementById("demoPendingEmpty"),
+  demoHistoryRows: document.getElementById("demoHistoryRows"),
+  demoHistoryEmpty: document.getElementById("demoHistoryEmpty"),
   tradeReviewForm: document.getElementById("tradeReviewForm"),
   reviewPlanLabel: document.getElementById("reviewPlanLabel"),
   reviewStatus: document.getElementById("reviewStatus"),
@@ -4888,13 +4921,184 @@ function syncMobilePlanAccessibility() {
   els.sidePanel.inert = mobile && !open;
 }
 
+function demoUsd(value, signed = false) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const prefix = signed && number > 0 ? "+" : "";
+  return `${prefix}${number < 0 ? "-" : ""}$${Math.abs(number).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function demoPrice(position, value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const prefix = position.currency === "ILS" ? "₪" : "$";
+  const digits = position.symbol === "BTC-USD" ? 2 : 2;
+  return `${prefix}${number.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+}
+
+function demoDate(timestamp) {
+  if (!Number.isFinite(Number(timestamp))) return "--";
+  return new Date(Number(timestamp)).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function drawDemoEquityCurve(points = []) {
+  const canvas = els.demoEquityChart;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(rect.width * dpr));
+  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  if (!points.length) return;
+  const values = points.map((point) => Number(point.equity)).filter(Number.isFinite);
+  if (!values.length) return;
+  const padding = { top: 18, right: 14, bottom: 22, left: 58 };
+  const width = rect.width - padding.left - padding.right;
+  const height = rect.height - padding.top - padding.bottom;
+  let minimum = Math.min(...values);
+  let maximum = Math.max(...values);
+  const spread = Math.max(50, maximum - minimum);
+  minimum -= spread * 0.12;
+  maximum += spread * 0.12;
+  ctx.strokeStyle = "#303740";
+  ctx.fillStyle = "#9ba7b1";
+  ctx.font = "10px Inter, sans-serif";
+  ctx.textAlign = "right";
+  for (let index = 0; index < 3; index += 1) {
+    const y = padding.top + height * index / 2;
+    const value = maximum - (maximum - minimum) * index / 2;
+    ctx.beginPath();
+    ctx.moveTo(padding.left, y);
+    ctx.lineTo(padding.left + width, y);
+    ctx.stroke();
+    ctx.fillText(`$${Math.round(value).toLocaleString()}`, padding.left - 7, y + 3);
+  }
+  const x = (index) => padding.left + (points.length === 1 ? width : width * index / (points.length - 1));
+  const y = (value) => padding.top + (maximum - value) / (maximum - minimum) * height;
+  const positive = values.at(-1) >= values[0];
+  ctx.strokeStyle = positive ? "#2fd17c" : "#ff5c66";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  values.forEach((value, index) => index ? ctx.lineTo(x(index), y(value)) : ctx.moveTo(x(index), y(value)));
+  ctx.stroke();
+  ctx.fillStyle = ctx.strokeStyle;
+  ctx.beginPath();
+  ctx.arc(x(values.length - 1), y(values.at(-1)), 3, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function renderDemoTrading(data) {
+  state.demoTrading = data;
+  const account = data?.account || {};
+  const engine = data?.engine || {};
+  const net = Number(account.netPnl || 0);
+  els.demoEngineBadge.textContent = engine.status === "running" ? "Running 24/7" : "Data degraded";
+  setTone(els.demoEngineBadge, engine.status === "running" ? "positive" : "negative");
+  els.demoAccountStarted.textContent = `Started ${demoDate(account.startedAt)} · forward-only · policy v${account.policyVersion || "--"}`;
+  els.demoAccountEquity.textContent = demoUsd(account.equity);
+  els.demoNetPnl.textContent = demoUsd(net, true);
+  setTone(els.demoNetPnl, net > 0 ? "positive" : net < 0 ? "negative" : "neutral");
+  els.demoReturnPct.textContent = `${Number(account.returnPct || 0) >= 0 ? "+" : ""}${Number(account.returnPct || 0).toFixed(2)}% return`;
+  els.demoCash.textContent = demoUsd(account.cash);
+  els.demoInvested.textContent = demoUsd(account.investedValue);
+  els.demoCollateral.textContent = demoUsd(account.shortCollateral);
+  els.demoUnrealized.textContent = demoUsd(account.unrealizedPnl, true);
+  setTone(els.demoUnrealized, Number(account.unrealizedPnl) > 0 ? "positive" : Number(account.unrealizedPnl) < 0 ? "negative" : "neutral");
+  els.demoRealizedGross.textContent = demoUsd(account.realizedGrossPnl, true);
+  els.demoCommissions.textContent = demoUsd(account.commissions);
+  els.demoTaxes.textContent = demoUsd(account.taxes);
+  els.demoDrawdown.textContent = `${Number(account.maxDrawdownPct || 0).toFixed(2)}%`;
+  els.demoWinRecord.textContent = `${Number(account.wins || 0)}W · ${Number(account.losses || 0)}L`;
+  els.demoWinRate.textContent = account.winRate != null && Number.isFinite(Number(account.winRate)) ? `${Number(account.winRate).toFixed(1)}% win rate` : "Building";
+  els.demoTradeCount.textContent = `${Number(account.closedTrades || 0)} closed`;
+
+  const positions = data?.openPositions || [];
+  els.demoOpenCount.textContent = `${positions.length} open`;
+  els.demoOpenEmpty.hidden = positions.length > 0;
+  els.demoOpenPositions.innerHTML = positions.map((position) => {
+    const pnl = Number(position.unrealizedPnl || 0);
+    return `<article class="demo-position ${escapeHtml(position.direction)}">
+      <header><strong>${escapeHtml(position.symbol)} · ${escapeHtml(position.horizon)}</strong><span class="${position.direction === "long" ? "positive" : "negative"}">${escapeHtml(position.direction.toUpperCase())}</span></header>
+      <p>${escapeHtml(position.setup)} · score ${Number(position.score || 0)}/100</p>
+      <div class="demo-position-levels">
+        <div><span>Entry</span><strong>${demoPrice(position, position.entryPrice)}</strong></div>
+        <div><span>Current</span><strong>${demoPrice(position, position.lastPrice)}</strong></div>
+        <div><span>Stop</span><strong>${demoPrice(position, position.stop)}</strong></div>
+        <div><span>Target 1</span><strong>${demoPrice(position, position.target1)}</strong></div>
+        <div><span>Target 2</span><strong>${demoPrice(position, position.target2)}</strong></div>
+        <div><span>Unrealized</span><strong class="${pnl > 0 ? "positive" : pnl < 0 ? "negative" : ""}">${demoUsd(pnl, true)}</strong></div>
+      </div>
+      <footer><span>${Number(position.remainingQuantity).toLocaleString()} units</span><span>Opened ${demoDate(position.openedAt)}</span></footer>
+    </article>`;
+  }).join("");
+
+  const pending = data?.pendingOrders || [];
+  els.demoPendingCount.textContent = `${pending.length} pending`;
+  els.demoPendingEmpty.hidden = pending.length > 0;
+  els.demoPendingRows.innerHTML = pending.map((order) => `<tr>
+    <td data-label="Market">${escapeHtml(order.symbol)}<br><small>${escapeHtml(order.executionSymbol)}</small></td>
+    <td data-label="Horizon">${escapeHtml(order.horizon)} · ${order.timeframe === 1440 ? "1D" : `${order.timeframe}m`}</td>
+    <td data-label="Side" class="${order.direction === "long" ? "positive" : "negative"}">${escapeHtml(order.direction.toUpperCase())}</td>
+    <td data-label="Setup">${escapeHtml(order.setup || "Momentum setup")}</td>
+    <td data-label="Eligible">${demoDate(order.eligibleAt)}</td>
+    <td data-label="Risk">${demoUsd(order.plannedRisk)}</td>
+    <td data-label="Max value">${demoUsd(order.maxNotional)}</td>
+  </tr>`).join("");
+
+  const history = data?.tradeHistory || [];
+  els.demoHistoryEmpty.hidden = history.length > 0;
+  els.demoHistoryRows.innerHTML = history.map((trade) => `<tr>
+    <td data-label="Closed">${demoDate(trade.closedAt)}</td>
+    <td data-label="Market">${escapeHtml(trade.symbol)}</td>
+    <td data-label="Horizon">${escapeHtml(trade.horizon)}</td>
+    <td data-label="Side" class="${trade.direction === "long" ? "positive" : "negative"}">${escapeHtml(trade.direction.toUpperCase())}</td>
+    <td data-label="Entry">${demoPrice(trade, trade.entryPrice)}</td>
+    <td data-label="Exit state">${escapeHtml(String(trade.closeReason || "closed").replaceAll("_", " "))}</td>
+    <td data-label="Gross">${demoUsd(trade.realizedGrossPnl, true)}</td>
+    <td data-label="Fees">${demoUsd(trade.commissions)}</td>
+    <td data-label="Tax">${demoUsd(trade.taxes)}</td>
+    <td data-label="Net" class="${Number(trade.netPnl) > 0 ? "positive" : "negative"}">${demoUsd(trade.netPnl, true)}</td>
+  </tr>`).join("");
+
+  const breakdown = data?.breakdown || [];
+  els.demoBreakdownEmpty.hidden = breakdown.length > 0;
+  els.demoBreakdown.innerHTML = breakdown.map((row) => `<div class="demo-breakdown-row">
+    <strong>${escapeHtml(row.symbol)} · ${escapeHtml(row.horizon)}</strong>
+    <span>${row.winRate != null && Number.isFinite(Number(row.winRate)) ? `${Number(row.winRate).toFixed(1)}%` : "--"}</span>
+    <strong class="${Number(row.netPnl) > 0 ? "positive" : Number(row.netPnl) < 0 ? "negative" : ""}">${demoUsd(row.netPnl, true)}</strong>
+    <small>${Number(row.wins || 0)} wins · ${Number(row.losses || 0)} losses · ${Number(row.trades || 0)} trades</small>
+  </div>`).join("");
+  const learning = data?.learning || {};
+  const proposals = learning.proposals || [];
+  els.demoLearningState.textContent = proposals.length
+    ? `${proposals.length} policy change${proposals.length === 1 ? "" : "s"} ready for shadow validation. No change is applied automatically.`
+    : `${Number(learning.resolvedSamples || 0)} completed trades in learning · ${Number(learning.minimumCohortSamples || 50)} outcomes required per comparable cohort before policy review.`;
+  els.demoEquityEmpty.hidden = (data?.equityCurve || []).length > 0;
+  drawDemoEquityCurve(data?.equityCurve || []);
+}
+
+async function refreshDemoTrading() {
+  try {
+    const response = await fetch(`/api/demo-trading?t=${Date.now()}`);
+    if (!response.ok) throw new Error(`demo trading failed: ${response.status}`);
+    renderDemoTrading(await response.json());
+  } catch (error) {
+    els.demoEngineBadge.textContent = "Unavailable";
+    setTone(els.demoEngineBadge, "negative");
+    console.info("Demo trading account unavailable.", error);
+  }
+}
+
 function activateHorizon(horizon, { persist = true, scroll = true } = {}) {
-  const normalized = new Set(["day", "swing", "context", "journal"]).has(horizon) ? horizon : "day";
+  const normalized = new Set(["day", "swing", "context", "journal", "demo"]).has(horizon) ? horizon : "day";
   const buttons = {
     day: els.dayTradeView,
     swing: els.swingTradeView,
     context: els.contextView,
     journal: els.journalView,
+    demo: els.demoTradingView,
   };
   Object.entries(buttons).forEach(([name, item]) => {
     const active = name === normalized;
@@ -4903,8 +5107,9 @@ function activateHorizon(horizon, { persist = true, scroll = true } = {}) {
     item.tabIndex = active ? 0 : -1;
   });
   document.body.dataset.horizon = normalized;
-  els.marketWorkspace.hidden = normalized === "journal";
+  els.marketWorkspace.hidden = new Set(["journal", "demo"]).has(normalized);
   els.journalViewPanel.hidden = normalized !== "journal";
+  els.demoTradingPanel.hidden = normalized !== "demo";
   state.settings.ui = { ...(state.settings.ui || {}), horizon: normalized };
   closeMobilePlan();
 
@@ -4927,7 +5132,8 @@ function activateHorizon(horizon, { persist = true, scroll = true } = {}) {
   }
   if (persist) saveSettings();
   if (!scroll) return;
-  const target = normalized === "journal" ? els.journalViewPanel : document.querySelector(".workspace");
+  if (normalized === "demo") refreshDemoTrading();
+  const target = normalized === "journal" ? els.journalViewPanel : normalized === "demo" ? els.demoTradingPanel : document.querySelector(".workspace");
   target?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
@@ -4948,6 +5154,7 @@ els.dayTradeView.addEventListener("click", () => activateHorizon("day"));
 els.swingTradeView.addEventListener("click", () => activateHorizon("swing"));
 els.contextView.addEventListener("click", () => activateHorizon("context"));
 els.journalView.addEventListener("click", () => activateHorizon("journal"));
+els.demoTradingView.addEventListener("click", () => activateHorizon("demo"));
 
 els.insightTabs.forEach((button) => {
   button.addEventListener("click", () => activateInsightGroup(button.dataset.insightGroup));
@@ -4970,7 +5177,7 @@ function enableTabKeyboard(buttons) {
 }
 
 enableTabKeyboard(els.timeframeButtons);
-enableTabKeyboard([els.dayTradeView, els.swingTradeView, els.contextView, els.journalView]);
+enableTabKeyboard([els.dayTradeView, els.swingTradeView, els.contextView, els.journalView, els.demoTradingView]);
 enableTabKeyboard(els.insightTabs);
 
 els.alertCenterButton.addEventListener("click", () => {
@@ -5028,12 +5235,14 @@ els.feedbackBad.addEventListener("click", () => sendFeedback("bad"));
 
 window.addEventListener("resize", () => {
   syncMobilePlanAccessibility();
+  if (state.demoTrading) drawDemoEquityCurve(state.demoTrading.equityCurve || []);
   refresh();
 });
 window.addEventListener("online", () => {
   fetchLatestCandle();
   syncIntradayHistory();
   fetchFearGreed();
+  refreshDemoTrading();
 });
 window.addEventListener("pageshow", () => {
   fetchLatestCandle();
@@ -5063,8 +5272,10 @@ loadSettings().then(() => {
   refreshScanner();
   refreshRecommendationScoreboard();
   refreshSystemHealth();
+  refreshDemoTrading();
   state.scannerTimer = setInterval(refreshScanner, 30_000);
   state.scoreboardTimer = setInterval(refreshRecommendationScoreboard, 60_000);
+  state.demoTradingTimer = setInterval(refreshDemoTrading, 15_000);
   setInterval(refreshSystemHealth, 60_000);
   setInterval(refreshPatternStats, 5 * 60_000);
   fetchFearGreed();

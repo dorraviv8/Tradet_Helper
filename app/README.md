@@ -1,6 +1,6 @@
 # Multi-Market Trader Alert Helper
 
-Alert-only technical-analysis helper for QQQ, SPY, BTC-USD, and TA-125. It does not import order APIs and cannot place trades.
+Technical-analysis helper for QQQ, SPY, BTC-USD, and TA-125. It does not import broker order APIs and cannot place real trades. Its Demo Auto Trading account executes simulations only.
 
 ## Local Run
 
@@ -16,6 +16,18 @@ Yahoo Finance chart data is used by default without an account or API key. It is
 The market-context area also shows CNN's Fear & Greed Index. The server retrieves the public CNN reading, caches it for five minutes, and can serve the last cached reading as stale if CNN is temporarily unavailable. This broad-market sentiment is contextual only and does not currently change trade scores, entries, targets, or stops.
 
 Synthetic demo prices are not used. Provider failure is shown as unavailable.
+
+## Demo Auto Trading
+
+The forward-only demo account starts once with $20,000 and has no reset or manual-order endpoint. A dedicated background worker can hold day, swing, and long-horizon positions simultaneously. Day setups favor the 5m analysis; swing and long setups use closed daily momentum. Only qualified system signals can create orders.
+
+Entries fill at the next eligible candle open with adverse asset-specific slippage. QQQ and SPY use whole ETF shares, BTC-USD supports fractional units, and TA-125 signals execute through the `IBI-F42.TA` tracking ETF. Yahoo quotes that ETF in agorot, so prices are divided by 100 and converted into account USD using `ILS=X`. A missing ETF or FX quote blocks TA-125 execution.
+
+The account has no leverage. Long purchases consume cash, while shorts reserve 100% of entry notional as collateral. Every entry, partial exit, and final exit costs $5. A profitable completed trade pays 25% tax on positive gross P&L after its commissions; losing trades receive no tax credit. Position sizing is rechecked at fill time against cash, a 40% per-market exposure cap, 90% total exposure cap, and 4% total open stop-risk cap.
+
+SQLite stores the permanent account, orders, fills, positions, cash ledger, and five-minute equity snapshots. `GET /api/demo-trading` is read-only and returns the account, open positions, pending orders, completed trades, performance cohorts, equity curve, and learning state. Every completed trade enters forward cohort analysis. Policy proposals remain unapplied until at least 50 comparable outcomes are available and the existing shadow-validation process supports a reviewed strategy change.
+
+Prometheus exports demo equity, net P&L, open positions, pending orders, completed trades, and maximum drawdown. Monitoring raises incidents for worker failures and accounting invariants.
 
 ### Interactive Brokers TWS
 
