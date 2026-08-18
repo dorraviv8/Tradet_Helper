@@ -5,7 +5,7 @@ import sqlite3
 import time
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ACCOUNT_ID = "primary"
 STARTING_CASH_CENTS = 2_000_000
 COMMISSION_CENTS = 500
@@ -13,12 +13,19 @@ TAX_RATE = 0.25
 DAY_MS = 86_400_000
 MINIMUM_DAY_TRADES_24H = 2
 ACTIVE_DAY_MINIMUM_SCORE = 50
+MINIMUM_GROSS_STOP_CENTS = COMMISSION_CENTS * 2 * 3
+
+STOP_POLICY = {
+  "day": {"minimum_atr": 0.60, "minimum_pct": 0.0030, "maximum_pct": 0.0080, "minimum_target_r": 1.15},
+  "swing": {"minimum_atr": 0.80, "minimum_pct": 0.0080, "maximum_pct": 0.0600, "minimum_target_r": 1.20},
+  "long": {"minimum_atr": 1.20, "minimum_pct": 0.0200, "maximum_pct": 0.1200, "minimum_target_r": 1.35},
+}
 
 HORIZON_POLICY = {
   "day": {
     "minimum_score": 58,
     "risk_pct": 0.75,
-    "max_position_pct": 25.0,
+    "max_position_pct": 40.0,
     "entry_expiry_ms": 35 * 60_000,
     "max_holding_ms": 4 * 60 * 60_000,
   },
@@ -331,6 +338,7 @@ def _candidate_row(symbol, horizon, timeframe, signal, candidate, timestamp):
     "stop_reference": float(candidate.get("stop") or 0),
     "target1_reference": float(candidate.get("target") or candidate.get("target1") or 0),
     "target2_reference": float(candidate.get("target2") or 0),
+    "atr": float(candidate.get("atr") or 0),
     "strategy_version": str(candidate.get("strategyVersion") or "unknown"),
     "reasons": list(candidate.get("reasons") or [])[:8],
   }
@@ -427,6 +435,7 @@ def create_entry_orders(connection, symbol, recommendations, timestamp=None):
       "referenceStop": candidate["stop_reference"],
       "referenceTarget1": candidate["target1_reference"],
       "referenceTarget2": candidate["target2_reference"],
+      "atrAtSignal": candidate["atr"],
       "strategyVersion": candidate["strategy_version"],
       "reasons": candidate["reasons"],
       "selectionMode": candidate.get("selection_mode") or "qualified",
@@ -466,6 +475,48 @@ def _first_bar_after(bars, eligible_at, expires_at=None):
   return next((bar for bar in bars if int(bar.get("time") or 0) >= eligible_at and (expires_at is None or int(bar.get("time") or 0) <= expires_at)), None)
 
 
+def _cost_aware_fill_levels(details, direction, horizon, fill_price, max_notional_cents):
+  reference_entry = float(details.get("referenceEntry") or 0)
+  if reference_entry <= 0 or fill_price <= 0 or max_notional_cents <= 0:
+    return None
+  ratio = fill_price / reference_entry
+  reference_stop = float(details.get("referenceStop") or 0)
+  reference_target1 = float(details.get("referenceTarget1") or 0)
+  reference_target2 = float(details.get("referenceTarget2") or 0)
+  original_stop = reference_stop * ratio
+  original_target1 = reference_target1 * ratio
+  original_target2 = reference_target2 * ratio
+  if min(original_stop, original_target1, original_target2) <= 0:
+    return None
+
+  policy = STOP_POLICY[horizon]
+  original_stop_distance = abs(fill_price - original_stop)
+  atr_distance = max(0.0, float(details.get("atrAtSignal") or 0) * ratio) * policy["minimum_atr"]
+  percentage_distance = fill_price * policy["minimum_pct"]
+  economic_distance = fill_price * MINIMUM_GROSS_STOP_CENTS / max_notional_cents
+  stop_distance = max(original_stop_distance, atr_distance, percentage_distance, economic_distance)
+  stop_was_widened = stop_distance > original_stop_distance + 1e-9
+  if stop_was_widened and stop_distance / fill_price > policy["maximum_pct"]:
+    return None
+
+  target1_distance = max(abs(original_target1 - fill_price), stop_distance * policy["minimum_target_r"])
+  target2_distance = max(abs(original_target2 - fill_price), target1_distance * 1.35, stop_distance * 1.70)
+  sign = 1 if direction == "long" else -1
+  stop_price = fill_price - sign * stop_distance
+  target1_price = fill_price + sign * target1_distance
+  target2_price = fill_price + sign * target2_distance
+  if min(stop_price, target1_price, target2_price) <= 0:
+    return None
+  return {
+    "stop": stop_price,
+    "target1": target1_price,
+    "target2": target2_price,
+    "stopDistancePct": stop_distance / fill_price,
+    "stopAdjusted": stop_was_widened,
+    "minimumGrossStopCents": MINIMUM_GROSS_STOP_CENTS,
+  }
+
+
 def fill_pending_entries(connection, symbol, bars, fx_rate=1.0, timestamp=None, horizons=None, session_regular=None):
   timestamp = int(timestamp or now_ms())
   rows = connection.execute("""
@@ -499,12 +550,11 @@ def fill_pending_entries(connection, symbol, bars, fx_rate=1.0, timestamp=None, 
       max(0, round(equity * 0.40) - _open_exposure_cents(connection, symbol)),
     )
     details = _json(order["details_json"])
-    reference_entry = float(details.get("referenceEntry") or order["reference_price"] or 0)
-    reference_stop = float(details.get("referenceStop") or 0)
-    stop_pct = abs(reference_entry - reference_stop) / reference_entry if reference_entry > 0 else 0
-    if stop_pct <= 0:
-      connection.execute("UPDATE demo_orders SET status = 'rejected', reason = 'invalid_stop_distance', updated_at = ? WHERE id = ?", (timestamp, order["id"]))
+    levels = _cost_aware_fill_levels(details, order["direction"], order["horizon"], fill_price, max_notional)
+    if not levels:
+      connection.execute("UPDATE demo_orders SET status = 'rejected', reason = 'uneconomic_stop_distance', updated_at = ? WHERE id = ?", (timestamp, order["id"]))
       continue
+    stop_pct = levels["stopDistancePct"]
     portfolio_risk_room = max(0, round(equity * 0.04) - _open_risk_cents(connection))
     risk_notional = int(min(int(order["planned_risk_cents"]), portfolio_risk_room) / stop_pct)
     notional_budget = min(max_notional, risk_notional)
@@ -517,10 +567,22 @@ def fill_pending_entries(connection, symbol, bars, fx_rate=1.0, timestamp=None, 
     if quantity <= 0 or notional_cents + COMMISSION_CENTS > int(account["cash_cents"]):
       connection.execute("UPDATE demo_orders SET status = 'rejected', reason = 'insufficient_cash', updated_at = ? WHERE id = ?", (timestamp, order["id"]))
       continue
-    ratio = fill_price / reference_entry
-    stop_price = reference_stop * ratio
-    target1_price = float(details.get("referenceTarget1") or 0) * ratio
-    target2_price = float(details.get("referenceTarget2") or 0) * ratio
+    levels = _cost_aware_fill_levels(details, order["direction"], order["horizon"], fill_price, notional_cents)
+    if not levels:
+      connection.execute("UPDATE demo_orders SET status = 'rejected', reason = 'uneconomic_stop_distance', updated_at = ? WHERE id = ?", (timestamp, order["id"]))
+      continue
+    stop_pct = levels["stopDistancePct"]
+    stop_price = levels["stop"]
+    target1_price = levels["target1"]
+    target2_price = levels["target2"]
+    details["executionStopPolicy"] = {
+      "version": VERSION,
+      "adjusted": levels["stopAdjusted"],
+      "stopDistancePct": round(stop_pct, 6),
+      "minimumGrossStopRisk": _money(levels["minimumGrossStopCents"]),
+      "roundTripCommission": _money(COMMISSION_CENTS * 2),
+    }
+    position_details_json = json.dumps(details)
     position_id = _hash_id("demo-position", order["id"])
     fill_id = _hash_id("demo-fill", order["id"])
     event_at = int(bar["time"])
@@ -541,7 +603,7 @@ def fill_pending_entries(connection, symbol, bars, fx_rate=1.0, timestamp=None, 
       str(details.get("setupType") or "momentum"), int(details.get("score") or 0), order["signal_at"], event_at,
       quantity, quantity, fill_price, fx_rate, notional_cents, notional_cents, stop_price, target1_price,
       target2_price, fill_price, fx_rate, event_at, event_at, COMMISSION_CENTS,
-      str(details.get("strategyVersion") or "unknown"), order["details_json"],
+      str(details.get("strategyVersion") or "unknown"), position_details_json,
     ))
     connection.execute("""
       INSERT INTO demo_fills (
@@ -551,8 +613,8 @@ def fill_pending_entries(connection, symbol, bars, fx_rate=1.0, timestamp=None, 
     """, (fill_id, order["id"], position_id, symbol, order["horizon"], order["direction"], quantity, fill_price, fx_rate, notional_cents, COMMISSION_CENTS, event_at, order["reason"]))
     connection.execute("""
       UPDATE demo_orders SET position_id = ?, quantity = ?, status = 'filled', fill_price = ?,
-        fill_fx_rate = ?, filled_at = ?, commission_cents = ?, updated_at = ? WHERE id = ?
-    """, (position_id, quantity, fill_price, fx_rate, event_at, COMMISSION_CENTS, event_at, order["id"]))
+        fill_fx_rate = ?, filled_at = ?, commission_cents = ?, details_json = ?, updated_at = ? WHERE id = ?
+    """, (position_id, quantity, fill_price, fx_rate, event_at, COMMISSION_CENTS, position_details_json, event_at, order["id"]))
     filled += 1
   return filled
 

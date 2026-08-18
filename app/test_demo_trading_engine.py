@@ -125,6 +125,35 @@ class DemoTradingEngineTests(unittest.TestCase):
     self.assertEqual(learning["resolvedSamples"], 1)
     self.assertFalse(learning["automaticChangesApplied"])
 
+  def test_narrow_stop_is_widened_beyond_fee_dominated_noise(self):
+    signal = recommendations()[5]
+    signal.update({"stop": 99.90, "target": 100.30, "target2": 100.60, "atr": 0.25})
+    engine.create_entry_orders(self.connection, "QQQ", {5: signal}, 500_000)
+    engine.fill_pending_entries(self.connection, "QQQ", [candle(400_000, 100)], 1, 500_000, {"day"})
+
+    position = self.connection.execute("SELECT * FROM demo_positions").fetchone()
+    self.assertIsNotNone(position)
+    stop_pct = abs(position["entry_price"] - position["stop_price"]) / position["entry_price"]
+    gross_stop_cents = round(position["entry_value_cents"] * stop_pct)
+    target_r = abs(position["target1_price"] - position["entry_price"]) / abs(position["entry_price"] - position["stop_price"])
+    details = engine._json(position["details_json"])["executionStopPolicy"]
+
+    self.assertGreaterEqual(gross_stop_cents, engine.MINIMUM_GROSS_STOP_CENTS)
+    self.assertGreaterEqual(stop_pct, engine.STOP_POLICY["day"]["minimum_pct"])
+    self.assertGreaterEqual(target_r, engine.STOP_POLICY["day"]["minimum_target_r"] - 1e-9)
+    self.assertTrue(details["adjusted"])
+    self.assertEqual(details["roundTripCommission"], 10.0)
+
+  def test_valid_wider_structural_stop_is_preserved(self):
+    recs = {5: recommendations()[5]}
+    engine.create_entry_orders(self.connection, "QQQ", recs, 500_000)
+    engine.fill_pending_entries(self.connection, "QQQ", [candle(400_000, 100)], 1, 500_000, {"day"})
+    position = self.connection.execute("SELECT * FROM demo_positions").fetchone()
+    details = engine._json(position["details_json"])["executionStopPolicy"]
+
+    self.assertAlmostEqual(position["stop_price"], 98.0098, places=4)
+    self.assertFalse(details["adjusted"])
+
   def test_short_trade_is_fully_cash_collateralized(self):
     recs = {5: recommendations("short")[5]}
     engine.create_entry_orders(self.connection, "SPY", recs, 500_000)
